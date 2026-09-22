@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>FrameFlow — AI视频 → 游戏帧动画</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">FrameFlow <span class="sub">AI视频 → 拆帧 → 抠图 → 游戏帧动画</span></div>
+  <input id="charId" value="hero_v01" title="角色ID(用于导出文件名)" size="10">
+  <button id="importBtn">导入视频</button>
+  <input type="file" id="fileInput" accept="video/mp4,video/webm,video/*" hidden>
+  <label>拆帧fps <input id="extractFps" type="number" value="10" min="1" max="30" class="num"></label>
+  <span id="videoInfo" class="muted"></span>
+  <span class="spacer"></span>
+  <button id="btnSpine" class="primary">导出 Spine 三件套 ZIP</button>
+  <button id="btnSheet">精灵图集</button>
+  <button id="btnFrames">序列帧 ZIP</button>
+</header>
+
+<main>
+  <aside id="left">
+    <section>
+      <h3>① 生视频(可灵 · ApiRouter)</h3>
+      <div class="row">
+        <button id="genRefBtn" class="wide">选择首帧图(角色定稿图)</button>
+        <input type="file" id="genRefInput" accept="image/png,image/jpeg,image/webp" hidden>
+      </div>
+      <div class="row"><img id="genRefThumb" class="refthumb" alt="" hidden></div>
+      <div class="row"><textarea id="genPrompt" rows="3" placeholder="只写运动,不复述外观(图管长相,词管动作)。例:角色原地轻轻呼吸,尾巴缓慢摆动"></textarea></div>
+      <div class="row inline">
+        <label>模型
+          <select id="genModel">
+            <option value="kwaivgi/kling-v3.0-pro">kling-v3.0-pro($0.84/条)</option>
+            <option value="kwaivgi/kling-v3.0-std">kling-v3.0-std</option>
+          </select>
+        </label>
+      </div>
+      <div class="row inline">
+        <label>分辨率
+          <select id="genRes"><option value="720p">720p</option><option value="1080p">1080p</option></select>
+        </label>
+        <label>循环
+          <select id="genLoop"><option value="pingpong">pingpong(推荐)</option><option value="raw">raw</option><option value="off">off</option></select>
+        </label>
+        <label>候选 <input id="genCandidates" type="number" value="1" min="1" max="4" class="num"></label>
+      </div>
+      <div class="row">
+        <button id="genDryBtn">dry-run 看最终提示词</button>
+        <button id="genStartBtn" class="primary">▶ 生成视频(约5分钟/条)</button>
+      </div>
+      <pre id="genLog" class="genlog" hidden></pre>
+      <div id="genResults"></div>
+    </section>
+
+    <section>
+      <h3>② 抠图</h3>
+      <div class="row">
+        <label>键色模式
+          <select id="keyMode">
+            <option value="green">绿幕</option>
+            <option value="white">白底</option>
+            <option value="black">黑底</option>
+            <option value="custom">取样(Alt+点击画面)</option>
+          </select>
+        </label>
+        <span id="keySwatch" class="swatch" title="当前键色"></span>
+      </div>
+      <div class="row"><label>容差 <span id="keyTolVal">0.30</span></label><input id="keyTol" type="range" min="0.05" max="0.8" step="0.01" value="0.30"></div>
+      <div class="row"><label>溢出抑制 <span id="keySpillVal">0.70</span></label><input id="keySpill" type="range" min="0" max="1" step="0.05" value="0.70"></div>
+      <div class="row"><label><input id="keyEdges" type="checkbox"> 边缘泛洪(白底/纯色背景更稳)</label></div>
+      <button id="rekeyBtn">重新抠图(全部帧)</button>
+    </section>
+
+    <section>
+      <h3>③ 减帧</h3>
+      <div class="row"><label>相似阈值 <span id="dedupeThrVal">2</span></label><input id="dedupeThr" type="range" min="0" max="12" step="1" value="2"></div>
+      <button id="autoDropBtn">自动剔除过近帧</button>
+      <div class="hint">也可用缩略图下方的勾选框手动剔除。</div>
+    </section>
+
+    <section>
+      <h3>④ 循环检测</h3>
+      <button id="detectBtn">自动找循环帧</button>
+      <div id="loopCandidates"></div>
+      <div class="row inline">
+        <label>起 <input id="selStart" type="number" class="num" value="0"></label>
+        <label>止 <input id="selEnd" type="number" class="num" value="0"></label>
+        <button id="playBtn">▶ 预览选段</label>
+      </div>
+      <div class="row inline">
+        <label>预览fps <input id="previewFps" type="number" value="10" min="1" max="30" class="num"></label>
+      </div>
+    </section>
+
+    <section>
+      <h3>⑤ 添加为动画</h3>
+      <div class="row inline">
+        <label>名称 <input id="loopName" value="idle" class="txt" title="如 idle / attack / hit"></label>
+        <label>fps <input id="loopFps" type="number" value="10" min="1" max="30" class="num"></label>
+        <label><input id="loopFlag" type="checkbox" checked> 循环</label>
+      </div>
+      <button id="addLoopBtn">添加当前选段</button>
+      <div id="loopList"></div>
+    </section>
+
+    <section>
+      <h3>⑥ 导出</h3>
+      <div class="row"><label>导出缩放 <span id="exportScaleVal">1</span></label><input id="exportScale" type="range" min="0.25" max="2" step="0.05" value="1"></div>
+      <div class="hint">角色ID同时用于 Spine 文件名与图集页名。</div>
+    </section>
+  </aside>
+
+  <div id="center">
+    <canvas id="view" width="860" height="560"></canvas>
+    <div class="row" id="brushBar">
+      <label>画笔
+        <select id="brushMode">
+          <option value="erase">擦除</option>
+          <option value="restore">恢复(从原图)</option>
+        </select>
+      </label>
+      <label>半径 <span id="brushRVal">18</span></label>
+      <input id="brushR" type="range" min="4" max="80" step="1" value="18">
+      <button id="undoStroke">撤销本帧画笔</button>
+      <button id="clearStrokes">清空本帧画笔</button>
+      <label><input id="showBBox" type="checkbox"> 显示对齐框</label>
+      <button id="recomputeBBox">重算对齐框</button>
+    </div>
+    <div id="strip"></div>
+  </div>
+</main>
+
+<footer><span id="status">就绪。流程:导入视频 → 重新抠图 → 修边 → 自动找循环 → 添加动画 → 导出 Spine 三件套。</span></footer>
+
+<script src="js/util.js"></script>
+<script src="js/pipeline.js"></script>
+<script src="js/exporter.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
