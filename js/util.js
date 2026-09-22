@@ -158,4 +158,111 @@
     }
     return d;
   };
+
+  // ---------- PNG 压缩:调色板量化(中位切分) ----------
+  // imgData: ImageData;maxColors: 2..256;dither: Floyd–Steinberg 抖动
+  // 只量化 RGB,alpha 保留连续值(抗锯齿边缘不发硬);色数减少后 DEFLATE 体积显著下降
+  FS.quantizeImageData = function (imgData, maxColors, dither) {
+    const d = imgData.data;
+    const N = d.length / 4;
+    const samples = [];
+    const step = Math.max(1, Math.floor(N / 60000));
+    for (let i = 0; i < N; i += step) {
+      if (d[i * 4 + 3] > 8) samples.push([d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]);
+    }
+    if (!samples.length) return imgData;
+    const bucketRange = function (b) {
+      let rmin = 255, rmax = 0, gmin = 255, gmax = 0, bmin = 255, bmax = 0;
+      for (const p of b) {
+        if (p[0] < rmin) rmin = p[0]; if (p[0] > rmax) rmax = p[0];
+        if (p[1] < gmin) gmin = p[1]; if (p[1] > gmax) gmax = p[1];
+        if (p[2] < bmin) bmin = p[2]; if (p[2] > bmax) bmax = p[2];
+      }
+      const rr = rmax - rmin, gr = (gmax - gmin) * 1.2, bb = (bmax - bmin) * 0.8;
+      return { range: Math.max(rr, gr, bb), ch: rr >= gr && rr >= bb ? 0 : (gr >= bb ? 1 : 2) };
+    };
+    let buckets = [samples];
+    while (buckets.length < maxColors) {
+      let bi = -1, br = -1, bch = 0;
+      for (let k = 0; k < buckets.length; k++) {
+        if (buckets[k].length < 2) continue;
+        const q = bucketRange(buckets[k]);
+        if (q.range > br) { br = q.range; bi = k; bch = q.ch; }
+      }
+      if (bi < 0) break;
+      const bucket = buckets[bi];
+      bucket.sort(function (a, b) { return a[bch] - b[bch]; });
+      const mid = bucket.length >> 1;
+      buckets.splice(bi, 1, bucket.slice(0, mid), bucket.slice(mid));
+    }
+    const palette = buckets.map(function (b) {
+      let r = 0, g = 0, bl = 0;
+      b.forEach(function (p) { r += p[0]; g += p[1]; bl += p[2]; });
+      const n = b.length || 1;
+      return [Math.round(r / n), Math.round(g / n), Math.round(bl / n)];
+    });
+    const cache = new Map();
+    const nearest = function (r, g, b) {
+      const key = ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2);
+      let hit = cache.get(key);
+      if (hit !== undefined) return hit;
+      let best = 0, bd = Infinity;
+      for (let k = 0; k < palette.length; k++) {
+        const dr = r - palette[k][0], dg = g - palette[k][1], db = b - palette[k][2];
+        const dist = dr * dr + dg * dg + db * db;
+        if (dist < bd) { bd = dist; best = k; }
+      }
+      cache.set(key, best);
+      return best;
+    };
+    if (!dither) {
+      for (let i = 0; i < N; i++) {
+        if (d[i * 4 + 3] <= 8) continue;
+        const p = palette[nearest(d[i * 4], d[i * 4 + 1], d[i * 4 + 2])];
+        d[i * 4] = p[0]; d[i * 4 + 1] = p[1]; d[i * 4 + 2] = p[2];
+      }
+      return imgData;
+    }
+    // Floyd–Steinberg(只扩散 RGB 误差)
+    const buf = new Float32Array(N * 3);
+    for (let i = 0; i < N; i++) {
+      buf[i * 3] = d[i * 4]; buf[i * 3 + 1] = d[i * 4 + 1]; buf[i * 3 + 2] = d[i * 4 + 2];
+    }
+    const w = imgData.width, h = imgData.height;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        if (d[i * 4 + 3] <= 8) continue;
+        const o = i * 3;
+        const r = FS.clamp(Math.round(buf[o]), 0, 255);
+        const g = FS.clamp(Math.round(buf[o + 1]), 0, 255);
+        const b = FS.clamp(Math.round(buf[o + 2]), 0, 255);
+        const p = palette[nearest(r, g, b)];
+        const er = buf[o] - p[0], eg = buf[o + 1] - p[1], eb = buf[o + 2] - p[2];
+        d[i * 4] = p[0]; d[i * 4 + 1] = p[1]; d[i * 4 + 2] = p[2];
+        const push = function (xx, yy, f) {
+          if (xx < 0 || xx >= w || yy >= h) return;
+          const q = (yy * w + xx) * 3;
+          buf[q] += er * f; buf[q + 1] += eg * f; buf[q + 2] += eb * f;
+        };
+        push(x + 1, y, 7 / 16); push(x - 1, y + 1, 3 / 16); push(x, y + 1, 5 / 16); push(x + 1, y + 1, 1 / 16);
+      }
+    }
+    return imgData;
+  };
+
+  FS.quantizeCanvas = function (canvas, maxColors, dither) {
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    FS.quantizeImageData(img, maxColors, dither);
+    ctx.putImageData(img, 0, 0);
+    return canvas;
+  };
+
+  FS.canvasToBlobPng = function (canvas) {
+    return new Promise(function (r) { canvas.toBlob(r, 'image/png'); });
+  };
+  FS.canvasToBlobWebp = function (canvas, quality) {
+    return new Promise(function (r) { canvas.toBlob(r, 'image/webp', quality); });
+  };
 })();

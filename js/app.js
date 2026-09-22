@@ -11,13 +11,14 @@
     loops: [],
     selection: { start: 0, end: 0 },
     charId: 'hero_v01',
-    key: { mode: 'green', color: [0, 255, 70], tol: 0.3, spill: 0.7, edges: false },
+    key: { mode: 'green', color: [0, 255, 70], tol: 0.3, spill: 0.7, edges: false, edgeMode: 'none' },
     dedupeThreshold: 2,
     exportScale: 1,
     maxWidth: 2048,
+    compress: { colors: 0, dither: false },
     showBBox: false,
     bbox: null,
-    brush: { mode: 'erase', r: 18 },
+    brush: { mode: 'erase', r: 18, tol: 0.15 },
     currentFrame: 0,
     playing: false,
   };
@@ -60,6 +61,58 @@
       renderAll();
     } catch (e) {
       status('导入失败:' + e.message, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // ---------- 切图:雪碧图/大图 → 帧 ----------
+  async function importImageSlices(file) {
+    if (!file) return;
+    setBusy(true);
+    try {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = function () { URL.revokeObjectURL(url); };
+      img.src = url;
+      await new Promise(function (resolve, reject) {
+        img.onload = resolve;
+        img.onerror = function () { reject(new Error('图片无法解码')); };
+      });
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      canvas.getContext('2d').drawImage(img, 0, 0);
+      const mode = $('#sliceMode').value;
+      let result;
+      if (mode === 'grid') {
+        result = FS.gridSliceImage(canvas, FS.clamp(parseInt($('#sliceCols').value) || 4, 1, 32), FS.clamp(parseInt($('#sliceRows').value) || 2, 1, 32));
+      } else if (mode === 'single') {
+        result = { rects: [{ x: 0, y: 0, w: canvas.width, h: canvas.height }] };
+      } else {
+        result = FS.autoSliceImage(canvas, FS.clamp(parseInt($('#sliceMin').value) || 12, 2, 256));
+        if (result.error) throw new Error(result.error);
+      }
+      if (!result.rects.length) throw new Error('没有切出任何帧(检查最小块设置或图片是否有透明内容)');
+      const rects = result.rects.slice(0, 200);
+      state.frames = rects.map(function (r, i) {
+        const orig = document.createElement('canvas');
+        orig.width = r.w; orig.height = r.h;
+        orig.getContext('2d').drawImage(canvas, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+        const proc = document.createElement('canvas');
+        proc.width = r.w; proc.height = r.h;
+        proc.getContext('2d', { willReadFrequently: true }).drawImage(orig, 0, 0);
+        return { id: i, orig: orig, proc: proc, strokes: [], dropped: false, hash: null };
+      });
+      state.loops = [];
+      state.bbox = null;
+      state.selection = { start: 0, end: state.frames.length - 1 };
+      $('#videoInfo').textContent = file.name + ' · ' + canvas.width + '×' + canvas.height + ' · 切出 ' + state.frames.length + ' 帧';
+      computeBBox();
+      renderAll();
+      status('切图完成:' + state.frames.length + ' 帧。' + (mode === 'auto' ? '' : '(非透明图可再走③抠图)'));
+    } catch (e) {
+      status('切图失败:' + e.message, true);
     } finally {
       setBusy(false);
     }
@@ -329,9 +382,19 @@
       }
       const p = viewToFrame(e);
       if (!p) return;
+      const f = state.frames[state.currentFrame];
+      if (state.brush.mode === 'wand') {
+        // 魔棒:单击清除同色连通区
+        const stroke = { mode: 'wand', tol: state.brush.tol, pts: [p] };
+        const n = FS.wandRemove(f, p[0], p[1], state.brush.tol);
+        f.strokes.push(stroke);
+        drawCenter();
+        computeBBox();
+        status('魔棒清除了 ' + n + ' 个像素。');
+        return;
+      }
       view.setPointerCapture(e.pointerId);
       painting = { mode: state.brush.mode, r: state.brush.r, pts: [p] };
-      const f = state.frames[state.currentFrame];
       FS.applyStroke(f, { mode: painting.mode, r: painting.r, pts: painting.pts });
       drawCenter();
     });
@@ -368,25 +431,80 @@
 
   async function exportSpritesheet() {
     const loops = exportLoops();
-    const r = await FS.exportSpritesheet(loops, state.bbox, state.exportScale, state.maxWidth);
+    const r = await FS.exportSpritesheet(loops, state.bbox, state.exportScale, state.maxWidth, state.compress);
     FS.downloadBlob(r.pngBlob, state.charId + '_sheet.png');
     FS.downloadBlob(FS.makeTextBlob(r.metaText), state.charId + '_sheet_meta.json');
-    status('已导出精灵图集 ' + r.width + '×' + r.height + '(PNG+描述文件)。');
+    status('已导出精灵图集 ' + r.width + '×' + r.height + ' ' + FS.formatBytes(r.pngBlob.size) + '(PNG+描述文件)。');
   }
 
   async function exportFramesZip() {
     const loops = exportLoops();
-    const zip = await FS.exportFramesZip(state.charId, loops, state.bbox, state.exportScale);
+    const zip = await FS.exportFramesZip(state.charId, loops, state.bbox, state.exportScale, state.compress);
     FS.downloadBlob(zip, state.charId + '_frames.zip');
-    status('已导出序列帧 ZIP。');
+    status('已导出序列帧 ZIP ' + FS.formatBytes(zip.size) + '。');
   }
 
   async function exportSpineZip() {
     const loops = exportLoops();
-    const r = await FS.exportSpine(state.charId, loops, state.bbox, state.exportScale, state.maxWidth);
+    const r = await FS.exportSpine(state.charId, loops, state.bbox, state.exportScale, state.maxWidth, state.compress);
     const zip = await FS.exportSpineZip(r, state.charId);
     FS.downloadBlob(zip, state.charId + '_spine.zip');
-    status('已导出 Spine 三件套 ZIP:' + state.charId + '.json / .atlas.txt / .png + meta.json。');
+    status('已导出 Spine 三件套 ZIP ' + FS.formatBytes(zip.size) + ':' + state.charId + '.json / .atlas.txt / .png + meta.json(图集 ' + FS.formatBytes(r.pngBlob.size) + ')。');
+  }
+
+  // ---------- 图片压缩工具(单图) ----------
+  const czip = { canvas: null, name: '' };
+
+  function czipLoad(file) {
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = function () {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      canvas.getContext('2d').drawImage(img, 0, 0);
+      czip.canvas = canvas;
+      czip.name = file.name.replace(/\.[^.]+$/, '');
+      $('#czipInfo').textContent = file.name + ' · ' + canvas.width + '×' + canvas.height + ' · 原文件 ' + FS.formatBytes(file.size);
+      $('#czipPngBtn').disabled = false;
+      $('#czipWebpBtn').disabled = false;
+      status('已加载待压缩图片 ' + file.name + '(' + FS.formatBytes(file.size) + ')。');
+    };
+    img.onerror = function () { status('图片无法解码:' + file.name, true); };
+    img.src = url;
+  }
+
+  async function czipPng() {
+    if (!czip.canvas) return;
+    setBusy(true);
+    try {
+      const colors = parseInt($('#czipColors').value) || 0;
+      const work = document.createElement('canvas');
+      work.width = czip.canvas.width; work.height = czip.canvas.height;
+      work.getContext('2d').drawImage(czip.canvas, 0, 0);
+      if (colors >= 2) FS.quantizeCanvas(work, colors, $('#czipDither').checked);
+      const blob = await FS.canvasToBlobPng(work);
+      FS.downloadBlob(blob, czip.name + '_compressed.png');
+      $('#czipInfo').textContent = czip.name + ' · ' + czip.canvas.width + '×' + czip.canvas.height + ' → PNG ' + FS.formatBytes(blob.size) + (colors >= 2 ? '(' + colors + ' 色' + ($('#czipDither').checked ? '+抖动' : '') + ')' : '(未量化)');
+      status('压缩 PNG 已下载:' + FS.formatBytes(blob.size) + '。');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function czipWebp() {
+    if (!czip.canvas) return;
+    setBusy(true);
+    try {
+      const q = FS.clamp((parseInt($('#czipWebpQ').value) || 85) / 100, 0.1, 1);
+      const blob = await FS.canvasToBlobWebp(czip.canvas, q);
+      FS.downloadBlob(blob, czip.name + '.webp');
+      $('#czipInfo').textContent = czip.name + ' · WebP ' + FS.formatBytes(blob.size) + '(q' + Math.round(q * 100) + ')';
+      status('WebP 已下载:' + FS.formatBytes(blob.size) + '(注意:Spine 图集请仍用 PNG,WebP 适合通用素材)。');
+    } finally {
+      setBusy(false);
+    }
   }
 
   // ---------- 生视频(桥接 miniapp-kit anim/gen.mjs) ----------
@@ -561,6 +679,22 @@
     $('#keyTol').addEventListener('input', function () { state.key.tol = parseFloat($('#keyTol').value); $('#keyTolVal').textContent = state.key.tol.toFixed(2); });
     $('#keySpill').addEventListener('input', function () { state.key.spill = parseFloat($('#keySpill').value); $('#keySpillVal').textContent = state.key.spill.toFixed(2); });
     $('#keyEdges').addEventListener('change', function () { state.key.edges = $('#keyEdges').checked; });
+    $('#edgeMode').addEventListener('change', function () { state.key.edgeMode = $('#edgeMode').value; });
+    $('#sliceBtn').addEventListener('click', function () { $('#sliceInput').click(); });
+    $('#sliceInput').addEventListener('change', function (e) {
+      if (e.target.files[0]) importImageSlices(e.target.files[0]);
+      e.target.value = '';
+    });
+    $('#czipBtn').addEventListener('click', function () { $('#czipInput').click(); });
+    $('#czipInput').addEventListener('change', function (e) {
+      if (e.target.files[0]) czipLoad(e.target.files[0]);
+      e.target.value = '';
+    });
+    $('#czipPngBtn').addEventListener('click', czipPng);
+    $('#czipWebpBtn').addEventListener('click', czipWebp);
+    $('#quantColors').addEventListener('change', function () { state.compress.colors = parseInt($('#quantColors').value) || 0; });
+    $('#quantDither').addEventListener('change', function () { state.compress.dither = $('#quantDither').checked; });
+    $('#wandTol').addEventListener('input', function () { state.brush.tol = parseFloat($('#wandTol').value); $('#wandTolVal').textContent = state.brush.tol.toFixed(2); });
     $('#charId').addEventListener('change', function () { state.charId = FS.sanitizeName($('#charId').value, 'hero_v01'); $('#charId').value = state.charId; });
     $('#detectBtn').addEventListener('click', detectLoops);
     $('#selStart').addEventListener('change', function () { state.selection.start = FS.clamp(parseInt($('#selStart').value) || 0, 0, state.frames.length - 1); });

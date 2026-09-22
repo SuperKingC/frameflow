@@ -139,13 +139,18 @@
       d[i * 4 + 3] = a;
     }
     out.putImageData(img, 0, 0);
+    FS.edgeProcess(frame, key.edgeMode);
     replayStrokes(frame);
   };
 
   // ---------- 画笔修擦 ----------
-  // stroke: {mode:'erase'|'restore', r:半径(px), pts:[[x,y],...]}
-  // erase: 处理图 alpha 清 0;restore: 从原图复制像素
+  // stroke: {mode:'erase'|'restore'|'wand', r:半径(px), tol:魔棒容差, pts:[[x,y],...]}
+  // erase: 处理图 alpha 清 0;restore: 从原图复制像素;wand: 从点击点泛洪清除同色连通区
   FS.applyStroke = function (frame, stroke) {
+    if (stroke.mode === 'wand') {
+      stroke.pts.forEach(function (p) { FS.wandRemove(frame, p[0], p[1], stroke.tol); });
+      return;
+    }
     const ctx = frame.proc.getContext('2d', { willReadFrequently: true });
     const w = frame.proc.width, h = frame.proc.height;
     const img = ctx.getImageData(0, 0, w, h);
@@ -168,6 +173,145 @@
       }
     });
     ctx.putImageData(img, 0, 0);
+  };
+
+  // 魔棒:点击点为种子,RGB 距离容差内的连通区域 alpha 清 0
+  FS.wandRemove = function (frame, x, y, tol) {
+    const ctx = frame.proc.getContext('2d', { willReadFrequently: true });
+    const w = frame.proc.width, h = frame.proc.height;
+    const img = ctx.getImageData(0, 0, w, h);
+    const d = img.data;
+    const idx = (y * w + x) * 4;
+    const kr = d[idx], kg = d[idx + 1], kb = d[idx + 2];
+    const t = Math.max(0.02, tol || 0.15);
+    const visited = new Uint8Array(w * h);
+    const stack = [y * w + x];
+    let count = 0;
+    while (stack.length) {
+      const p = stack.pop();
+      if (visited[p]) continue;
+      visited[p] = 1;
+      const i = p * 4;
+      const dr = (d[i] - kr) / 255, dg = (d[i + 1] - kg) / 255, db = (d[i + 2] - kb) / 255;
+      if (Math.sqrt(dr * dr + dg * dg + db * db) / Math.sqrt(3) > t) continue;
+      d[i + 3] = 0;
+      count++;
+      const px = p % w;
+      if (px > 0) stack.push(p - 1);
+      if (px < w - 1) stack.push(p + 1);
+      if (p >= w) stack.push(p - w);
+      if (p < w * (h - 1)) stack.push(p + w);
+    }
+    ctx.putImageData(img, 0, 0);
+    return count;
+  };
+
+  // 边缘处理:key 设置的一部分,重抠时按模式统一应用
+  // feather=羽化(3x3 alpha 均值), erode=收缩(3x3 alpha 最小值,去毛边), dilate=扩张(3x3 alpha 最大值)
+  FS.edgeProcess = function (frame, mode) {
+    if (!mode || mode === 'none') return;
+    const ctx = frame.proc.getContext('2d', { willReadFrequently: true });
+    const w = frame.proc.width, h = frame.proc.height;
+    const img = ctx.getImageData(0, 0, w, h);
+    const d = img.data;
+    const src = new Uint8ClampedArray(d);
+    const A = function (x, y) { return src[(y * w + x) * 4 + 3]; };
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let sum = 0, n = 0, mn = 255, mx = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= h) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= w) continue;
+            const a = A(xx, yy);
+            sum += a; n++;
+            if (a < mn) mn = a;
+            if (a > mx) mx = a;
+          }
+        }
+        const i = (y * w + x) * 4 + 3;
+        if (mode === 'feather') d[i] = sum / n;
+        else if (mode === 'erode') d[i] = mn;
+        else d[i] = mx;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  };
+
+  // ---------- 切图:雪碧图/大图 → 帧 ----------
+  // 自动空白切图:8 连通域标记 alpha 非零区域,输出每个连通域包围盒(任意布局都能分开)
+  FS.autoSliceImage = function (canvas, minSize) {
+    const w = canvas.width, h = canvas.height;
+    const d = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+    const N = w * h;
+    const solid = new Uint8Array(N);
+    let any = false;
+    for (let i = 0; i < N; i++) {
+      if (d[i * 4 + 3] > 0) { solid[i] = 1; any = true; }
+    }
+    if (!any) return { error: '图片没有透明内容,请先抠图或用网格切分' };
+    const label = new Int32Array(N).fill(-1);
+    const rects = [];
+    const stack = [];
+    for (let s = 0; s < N; s++) {
+      if (!solid[s] || label[s] >= 0) continue;
+      const id = rects.length;
+      let minX = w, minY = h, maxX = -1, maxY = -1, count = 0;
+      stack.push(s);
+      label[s] = id;
+      while (stack.length) {
+        const p = stack.pop();
+        const px = p % w, py = (p / w) | 0;
+        count++;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = py + dy;
+          if (yy < 0 || yy >= h) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = px + dx;
+            if (xx < 0 || xx >= w) continue;
+            const q = yy * w + xx;
+            if (solid[q] && label[q] < 0) { label[q] = id; stack.push(q); }
+          }
+        }
+      }
+      rects.push({ x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1, pixels: count });
+    }
+    // 过滤:包围盒或像素数太小的碎片丢弃(如抗锯齿噪点、小飘字)
+    const min = Math.max(2, minSize || 2);
+    const kept = rects.filter(function (r) { return r.w >= min && r.h >= min; });
+    return { rects: kept };
+  };
+
+  // 网格切图:cols×rows 均分,非空格裁到内容包围盒
+  FS.gridSliceImage = function (canvas, cols, rows) {
+    const cw = Math.floor(canvas.width / cols), ch = Math.floor(canvas.height / rows);
+    const rects = [];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const x = c * cw, y = r * ch;
+        const cell = canvas.getContext('2d', { willReadFrequently: true }).getImageData(x, y, cw, ch);
+        const d = cell.data;
+        let minX = cw, minY = ch, maxX = -1, maxY = -1;
+        for (let yy = 0; yy < ch; yy++) {
+          for (let xx = 0; xx < cw; xx++) {
+            if (d[(yy * cw + xx) * 4 + 3] > 0) {
+              if (xx < minX) minX = xx;
+              if (xx > maxX) maxX = xx;
+              if (yy < minY) minY = yy;
+              if (yy > maxY) maxY = yy;
+            }
+          }
+        }
+        if (maxX >= 0) rects.push({ x: x + minX, y: y + minY, w: maxX - minX + 1, h: maxY - minY + 1 });
+      }
+    }
+    return { rects: rects };
   };
 
   function replayStrokes(frame) {

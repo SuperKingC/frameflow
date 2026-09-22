@@ -61,8 +61,17 @@
     return entries;
   }
 
+  // 压缩选项 compress: {colors: 0=不压缩|64|128|256, dither: bool}
+  // 作用于最终 PNG(图集页/雪碧图/序列帧):调色板量化降低色数 → DEFLATE 体积下降
+  function maybeQuantize(canvas, compress) {
+    if (compress && compress.colors >= 2) {
+      return FS.quantizeCanvas(canvas, compress.colors, !!compress.dither);
+    }
+    return canvas;
+  }
+
   // ---------- 精灵图集(直通 alpha,通用用途) ----------
-  FS.exportSpritesheet = async function (loops, bbox, scale, maxWidth) {
+  FS.exportSpritesheet = async function (loops, bbox, scale, maxWidth, compress) {
     const entries = [];
     loops.forEach(function (loop) {
       loop.frames.forEach(function (f, idx) {
@@ -97,13 +106,13 @@
       }),
       regions: entries.map(function (e) { return { name: e.name, rect: pack.placements.get(e.key), w: e.canvas.width, h: e.canvas.height }; }),
     };
-    const pngBlob = await new Promise(function (r) { sheet.toBlob(r, 'image/png'); });
+    const pngBlob = await FS.canvasToBlobPng(maybeQuantize(sheet, compress));
     return { pngBlob: pngBlob, metaText: JSON.stringify(meta, null, 2), width: pack.width, height: pack.height };
   };
 
   // ---------- Spine 4.3 三件套 ----------
   // skeleton: root 骨架; slot "body" 帧换附件时间线; slot "fx" point 锚点(底部中心为原点,y 向上)
-  FS.exportSpine = async function (charId, loops, bbox, scale, maxWidth) {
+  FS.exportSpine = async function (charId, loops, bbox, scale, maxWidth, compress) {
     const entries = collectEntries(loops, bbox, scale);
     const pack = packCanvases(entries, maxWidth);
     const sheet = document.createElement('canvas');
@@ -176,7 +185,7 @@
       note: '帧换附件时间线;loop 标志由运行时(SpineCharacterAnimator)控制,见 meta.animations.loop',
     };
 
-    const pngBlob = await new Promise(function (r) { sheet.toBlob(r, 'image/png'); });
+    const pngBlob = await FS.canvasToBlobPng(maybeQuantize(sheet, compress));
     return {
       jsonText: JSON.stringify(skeleton, null, 1),
       atlasText: atlasText,
@@ -187,7 +196,7 @@
   };
 
   // ---------- 序列帧 ZIP(直通 alpha PNG) ----------
-  FS.exportFramesZip = async function (charId, loops, bbox, scale) {
+  FS.exportFramesZip = async function (charId, loops, bbox, scale, compress) {
     const files = [];
     for (const loop of loops) {
       for (let i = 0; i < loop.frames.length; i++) {
@@ -197,7 +206,7 @@
         const ctx = c.getContext('2d');
         ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(loop.frames[i].proc, bbox.x, bbox.y, bbox.w, bbox.h, 0, 0, c.width, c.height);
-        const blob = await new Promise(function (r) { c.toBlob(r, 'image/png'); });
+        const blob = await FS.canvasToBlobPng(maybeQuantize(c, compress));
         files.push({
           name: charId + '_' + loop.name + '_f' + String(i).padStart(2, '0') + '.png',
           data: await FS.blobToUint8(blob),
