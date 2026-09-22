@@ -452,60 +452,7 @@
     status('已导出 Spine 三件套 ZIP ' + FS.formatBytes(zip.size) + ':' + state.charId + '.json / .atlas.txt / .png + meta.json(图集 ' + FS.formatBytes(r.pngBlob.size) + ')。');
   }
 
-  // ---------- 图片压缩工具(单图) ----------
-  const czip = { canvas: null, name: '' };
-
-  function czipLoad(file) {
-    if (!file) return;
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = function () {
-      const canvas = document.createElement('canvas');
-      canvas.width = img.naturalWidth;
-      canvas.height = img.naturalHeight;
-      canvas.getContext('2d').drawImage(img, 0, 0);
-      czip.canvas = canvas;
-      czip.name = file.name.replace(/\.[^.]+$/, '');
-      $('#czipInfo').textContent = file.name + ' · ' + canvas.width + '×' + canvas.height + ' · 原文件 ' + FS.formatBytes(file.size);
-      $('#czipPngBtn').disabled = false;
-      $('#czipWebpBtn').disabled = false;
-      status('已加载待压缩图片 ' + file.name + '(' + FS.formatBytes(file.size) + ')。');
-    };
-    img.onerror = function () { status('图片无法解码:' + file.name, true); };
-    img.src = url;
-  }
-
-  async function czipPng() {
-    if (!czip.canvas) return;
-    setBusy(true);
-    try {
-      const colors = parseInt($('#czipColors').value) || 0;
-      const work = document.createElement('canvas');
-      work.width = czip.canvas.width; work.height = czip.canvas.height;
-      work.getContext('2d').drawImage(czip.canvas, 0, 0);
-      if (colors >= 2) FS.quantizeCanvas(work, colors, $('#czipDither').checked);
-      const blob = await FS.canvasToBlobPng(work);
-      FS.downloadBlob(blob, czip.name + '_compressed.png');
-      $('#czipInfo').textContent = czip.name + ' · ' + czip.canvas.width + '×' + czip.canvas.height + ' → PNG ' + FS.formatBytes(blob.size) + (colors >= 2 ? '(' + colors + ' 色' + ($('#czipDither').checked ? '+抖动' : '') + ')' : '(未量化)');
-      status('压缩 PNG 已下载:' + FS.formatBytes(blob.size) + '。');
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function czipWebp() {
-    if (!czip.canvas) return;
-    setBusy(true);
-    try {
-      const q = FS.clamp((parseInt($('#czipWebpQ').value) || 85) / 100, 0.1, 1);
-      const blob = await FS.canvasToBlobWebp(czip.canvas, q);
-      FS.downloadBlob(blob, czip.name + '.webp');
-      $('#czipInfo').textContent = czip.name + ' · WebP ' + FS.formatBytes(blob.size) + '(q' + Math.round(q * 100) + ')';
-      status('WebP 已下载:' + FS.formatBytes(blob.size) + '(注意:Spine 图集请仍用 PNG,WebP 适合通用素材)。');
-    } finally {
-      setBusy(false);
-    }
-  }
+  // ---------- 生视频(桥接 miniapp-kit anim/gen.mjs) ----------
 
   // ---------- 生视频(桥接 miniapp-kit anim/gen.mjs) ----------
   const gen = { refDataUrl: null, refName: '', jobId: null, pollTimer: null, busy: false };
@@ -685,13 +632,6 @@
       if (e.target.files[0]) importImageSlices(e.target.files[0]);
       e.target.value = '';
     });
-    $('#czipBtn').addEventListener('click', function () { $('#czipInput').click(); });
-    $('#czipInput').addEventListener('change', function (e) {
-      if (e.target.files[0]) czipLoad(e.target.files[0]);
-      e.target.value = '';
-    });
-    $('#czipPngBtn').addEventListener('click', czipPng);
-    $('#czipWebpBtn').addEventListener('click', czipWebp);
     $('#quantColors').addEventListener('change', function () { state.compress.colors = parseInt($('#quantColors').value) || 0; });
     $('#quantDither').addEventListener('change', function () { state.compress.dither = $('#quantDither').checked; });
     $('#wandTol').addEventListener('input', function () { state.brush.tol = parseFloat($('#wandTol').value); $('#wandTolVal').textContent = state.brush.tol.toFixed(2); });

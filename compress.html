@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>图片压缩 — FrameFlow</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="backlink" href="index.html">← 工具箱</a>
+  <div class="brand"><span class="logo">F</span> FrameFlow <span class="ver">v0.2</span></div>
+  <span class="pagetitle">图片压缩</span>
+</header>
+
+<main class="czip-main">
+  <div class="czip-grid">
+    <div class="czip-panel">
+      <h3>参数</h3>
+      <div class="dropzone" id="dropzone">
+        <div style="font-size:15px;margin-bottom:4px">拖图片到这里,或点击选择</div>
+        <div style="font-size:11px;color:var(--text-3)">PNG / JPEG / WebP · 不上传,纯本地</div>
+      </div>
+      <input type="file" id="czipInput" accept="image/png,image/jpeg,image/webp" hidden>
+      <div class="row">
+        <label>量化色数
+          <select id="czipColors">
+            <option value="256">256 色</option>
+            <option value="128" selected>128 色</option>
+            <option value="64">64 色</option>
+            <option value="0">不量化</option>
+          </select>
+        </label>
+        <label><input id="czipDither" type="checkbox"> 抖动</label>
+      </div>
+      <div class="row"><label>WebP质量 <input id="czipWebpQ" type="number" value="85" min="10" max="100" class="num"></label></div>
+      <div class="row">
+        <button id="czipPngBtn" class="btn primary" disabled>下载压缩 PNG</button>
+      </div>
+      <div class="row">
+        <button id="czipWebpBtn" class="btn" disabled>下载 WebP</button>
+      </div>
+      <div class="hint">量化只压缩 RGB、保留 alpha 渐变,抗锯齿边缘不会发硬;抖动适合渐变图,纯色图慎用(体积反而变大)。WebP 适合通用素材,Spine 图集请仍用 PNG。</div>
+    </div>
+
+    <div class="czip-stage">
+      <div class="czip-empty" id="czipEmpty">
+        <div style="font-size:26px">🗜️</div>
+        <div>拖入一张图,这里会出现 原图 vs 压缩后 的对比</div>
+      </div>
+      <div class="compare" id="czipCompare" hidden>
+        <div class="cell">
+          <h4>原图 <span class="size" id="origSize"></span></h4>
+          <div class="pvwrap"><canvas id="pvOrig"></canvas></div>
+        </div>
+        <div class="cell">
+          <h4>压缩后 <span class="size" id="compSize"></span></h4>
+          <div class="pvwrap"><canvas id="pvComp"></canvas></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<footer class="statusbar"><span id="status">把图片拖进左侧区域开始。</span></footer>
+
+<script src="js/util.js"></script>
+<script src="js/compress.js"></script>
+</body>
+</html>

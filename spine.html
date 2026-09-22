@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Spine 帧动画工作流 — FrameFlow</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="backlink" href="index.html">← 工具箱</a>
+  <div class="brand"><span class="logo">F</span> FrameFlow <span class="ver">v0.2</span></div>
+  <span class="pagetitle">Spine 帧动画工作流</span>
+  <span class="spacer"></span>
+  <input id="charId" value="hero_v01" title="角色ID(用于导出文件名)" size="9">
+  <button id="importBtn" class="btn">导入视频</button>
+  <input type="file" id="fileInput" accept="video/mp4,video/webm,video/*" hidden>
+  <label style="color:var(--text-2);font-size:12px">拆帧fps <input id="extractFps" type="number" value="10" min="1" max="30" class="num"></label>
+  <span id="videoInfo" class="muted"></span>
+  <button id="btnSpine" class="btn primary">导出 Spine 三件套 ZIP</button>
+  <button id="btnSheet" class="btn">精灵图集</button>
+  <button id="btnFrames" class="btn">序列帧 ZIP</button>
+</header>
+
+<main class="page-main">
+  <aside id="left">
+    <section>
+      <h3>① 生视频(可灵 · ApiRouter)</h3>
+      <div class="row">
+        <button id="genRefBtn" class="btn wide">选择首帧图(角色定稿图)</button>
+        <input type="file" id="genRefInput" accept="image/png,image/jpeg,image/webp" hidden>
+      </div>
+      <div class="row"><img id="genRefThumb" class="refthumb" alt="" hidden></div>
+      <div class="row"><textarea id="genPrompt" rows="3" placeholder="只写运动,不复述外观(图管长相,词管动作)。例:角色原地轻轻呼吸,尾巴缓慢摆动"></textarea></div>
+      <div class="row inline">
+        <label>模型
+          <select id="genModel">
+            <option value="kwaivgi/kling-v3.0-pro">kling-v3.0-pro($0.84/条)</option>
+            <option value="kwaivgi/kling-v3.0-std">kling-v3.0-std</option>
+          </select>
+        </label>
+      </div>
+      <div class="row inline">
+        <label>分辨率
+          <select id="genRes"><option value="720p">720p</option><option value="1080p">1080p</option></select>
+        </label>
+        <label>循环
+          <select id="genLoop"><option value="pingpong">pingpong(推荐)</option><option value="raw">raw</option><option value="off">off</option></select>
+        </label>
+        <label>候选 <input id="genCandidates" type="number" value="1" min="1" max="4" class="num"></label>
+      </div>
+      <div class="row">
+        <button id="genDryBtn" class="btn">dry-run 看最终提示词</button>
+        <button id="genStartBtn" class="btn primary">▶ 生成视频(约5分钟/条)</button>
+      </div>
+      <pre id="genLog" class="genlog" hidden></pre>
+      <div id="genResults"></div>
+    </section>
+
+    <section>
+      <h3>② 切图(雪碧图/大图 → 帧)</h3>
+      <div class="row">
+        <button id="sliceBtn" class="btn wide">选择图片切成帧</button>
+        <input type="file" id="sliceInput" accept="image/png,image/webp,image/jpeg" hidden>
+      </div>
+      <div class="row">
+        <label>切分方式
+          <select id="sliceMode">
+            <option value="auto">自动空白切帧(需透明通道)</option>
+            <option value="grid">网格均分</option>
+            <option value="single">单图单帧</option>
+          </select>
+        </label>
+      </div>
+      <div class="row inline">
+        <label>列 <input id="sliceCols" type="number" value="4" min="1" max="32" class="num"></label>
+        <label>行 <input id="sliceRows" type="number" value="2" min="1" max="32" class="num"></label>
+        <label>最小块 <input id="sliceMin" type="number" value="12" min="2" max="256" class="num" title="小于此尺寸(px)的块丢弃"></label>
+      </div>
+      <div class="hint">切完的帧进入同一流程(可再抠图/减帧/找循环/导出)。</div>
+    </section>
+
+    <section>
+      <h3>③ 抠图</h3>
+      <div class="row">
+        <label>键色模式
+          <select id="keyMode">
+            <option value="green">绿幕</option>
+            <option value="white">白底</option>
+            <option value="black">黑底</option>
+            <option value="custom">取样(Alt+点击画面)</option>
+          </select>
+        </label>
+        <span id="keySwatch" class="swatch" title="当前键色"></span>
+      </div>
+      <div class="row"><label>容差 <span id="keyTolVal">0.30</span></label><input id="keyTol" type="range" min="0.05" max="0.8" step="0.01" value="0.30"></div>
+      <div class="row"><label>溢出抑制 <span id="keySpillVal">0.70</span></label><input id="keySpill" type="range" min="0" max="1" step="0.05" value="0.70"></div>
+      <div class="row"><label><input id="keyEdges" type="checkbox"> 边缘泛洪(白底/纯色背景更稳)</label></div>
+      <div class="row">
+        <label>边缘处理
+          <select id="edgeMode">
+            <option value="none">无</option>
+            <option value="feather">羽化 1px</option>
+            <option value="erode">收缩 1px(去毛边)</option>
+            <option value="dilate">扩张 1px(补缺口)</option>
+          </select>
+        </label>
+      </div>
+      <button id="rekeyBtn" class="btn">重新抠图(全部帧)</button>
+    </section>
+
+    <section>
+      <h3>④ 减帧</h3>
+      <div class="row"><label>相似阈值 <span id="dedupeThrVal">2</span></label><input id="dedupeThr" type="range" min="0" max="12" step="1" value="2"></div>
+      <button id="autoDropBtn" class="btn">自动剔除过近帧</button>
+      <div class="hint">也可用缩略图下方的勾选框手动剔除。</div>
+    </section>
+
+    <section>
+      <h3>⑤ 循环检测</h3>
+      <button id="detectBtn" class="btn">自动找循环帧</button>
+      <div id="loopCandidates"></div>
+      <div class="row inline">
+        <label>起 <input id="selStart" type="number" class="num" value="0"></label>
+        <label>止 <input id="selEnd" type="number" class="num" value="0"></label>
+        <button id="playBtn" class="btn">▶ 预览选段</label>
+      </div>
+      <div class="row inline">
+        <label>预览fps <input id="previewFps" type="number" value="10" min="1" max="30" class="num"></label>
+      </div>
+    </section>
+
+    <section>
+      <h3>⑥ 添加为动画</h3>
+      <div class="row inline">
+        <label>名称 <input id="loopName" value="idle" class="txt" title="如 idle / attack / hit"></label>
+        <label>fps <input id="loopFps" type="number" value="10" min="1" max="30" class="num"></label>
+        <label><input id="loopFlag" type="checkbox" checked> 循环</label>
+      </div>
+      <button id="addLoopBtn" class="btn">添加当前选段</button>
+      <div id="loopList"></div>
+    </section>
+
+    <section>
+      <h3>⑦ 导出</h3>
+      <div class="row"><label>导出缩放 <span id="exportScaleVal">1</span></label><input id="exportScale" type="range" min="0.25" max="2" step="0.05" value="1"></div>
+      <div class="row inline">
+        <label>图片压缩
+          <select id="quantColors">
+            <option value="0">不压缩</option>
+            <option value="256">256 色</option>
+            <option value="128">128 色</option>
+            <option value="64">64 色</option>
+          </select>
+        </label>
+        <label><input id="quantDither" type="checkbox"> 抖动</label>
+      </div>
+      <div class="hint">压缩=调色板量化(alpha 保留渐变),作用于图集/雪碧图/序列帧 PNG;抖动适合渐变图,纯色图慎用。角色ID同时用于 Spine 文件名与图集页名。需要独立压缩单张图?工具箱里有「图片压缩」。</div>
+    </section>
+  </aside>
+
+  <div id="center">
+    <canvas id="view" width="860" height="560"></canvas>
+    <div class="row" id="brushBar">
+      <label>画笔
+        <select id="brushMode">
+          <option value="erase">擦除</option>
+          <option value="restore">恢复(从原图)</option>
+          <option value="wand">魔棒(点同色区域)</option>
+        </select>
+      </label>
+      <label>半径 <span id="brushRVal">18</span></label>
+      <input id="brushR" type="range" min="4" max="80" step="1" value="18">
+      <label>魔棒容差 <span id="wandTolVal">0.15</span></label>
+      <input id="wandTol" type="range" min="0.02" max="0.5" step="0.01" value="0.15">
+      <button id="undoStroke" class="btn">撤销本帧画笔</button>
+      <button id="clearStrokes" class="btn">清空本帧画笔</button>
+      <label><input id="showBBox" type="checkbox"> 显示对齐框</label>
+      <button id="recomputeBBox" class="btn">重算对齐框</button>
+    </div>
+    <div id="strip"></div>
+  </div>
+</main>
+
+<footer class="statusbar"><span id="status">就绪。生视频或导入视频/图片 → 抠图修边 → 减帧找循环 → 添加动画 → 导出 Spine 三件套。</span></footer>
+
+<script src="js/util.js"></script>
+<script src="js/pipeline.js"></script>
+<script src="js/exporter.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
