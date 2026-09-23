@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>图层分离 — FrameFlow</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="backlink" href="index.html">← 工具箱</a>
+  <div class="brand"><span class="logo">F</span> FrameFlow <span class="ver">v0.3</span></div>
+  <span class="pagetitle">图层分离(SAM2 点选)</span>
+</header>
+
+<main class="page-main">
+  <aside id="left">
+    <section>
+      <h3>① 设计图</h3>
+      <div class="row">
+        <button id="imgBtn" class="btn wide">选择设计图(或拖入右侧)</button>
+        <input type="file" id="imgInput" accept="image/png,image/jpeg,image/webp" hidden>
+      </div>
+      <div id="imgInfo" class="hint">设计图上每个元素用点标出来,SAM2 出精确边界。首次点击需加载模型(数秒)。</div>
+    </section>
+
+    <section>
+      <h3>② 抠取图层</h3>
+      <div class="row"><label>掩码颜色 <span id="maskSwatch" class="swatch"></span></label><input id="maskColor" type="color" value="#22d3ee" style="height:24px;padding:0;border:none;background:none"></div>
+      <div class="row">
+        <button id="clearPts" class="btn wide">清空本轮点</button>
+      </div>
+      <button id="keepBtn" class="btn primary wide" disabled>收下当前掩码为图层</button>
+      <div class="hint" style="margin-top:8px">左键点击 = 正点(元素上);<b>Shift+点击 或 右键 = 负点</b>(排除区,如相邻元素/背景)。每点一次自动重算掩码;掩码不满意就继续补点,score&lt;0.5 时会提示。满意后点「收下」。</div>
+    </section>
+
+    <section>
+      <h3>③ 图层(<span id="layerCount">0</span>)</h3>
+      <div id="layerList"></div>
+      <div class="hint">上移 = 更靠前的绘制顺序;导出按此顺序。</div>
+    </section>
+
+    <section>
+      <h3>④ 导出</h3>
+      <div class="row">
+        <button id="dlZip" class="btn primary wide" disabled>下载图层 ZIP(PNG+manifest)</button>
+      </div>
+      <div class="row">
+        <button id="dlOverlay" class="btn wide" disabled>下载叠加预览 PNG</button>
+      </div>
+      <div class="hint">ZIP 内容:每层一张整幅透明 PNG + manifest.json(名称/顺序/包围盒/面积)。</div>
+    </section>
+  </aside>
+
+  <div id="center">
+    <canvas id="view" width="900" height="600"></canvas>
+    <div class="hint" style="padding:0 4px">点击前先把掩码颜色选好;收下的图层以原图像素 + 掩码 alpha 输出。</div>
+  </div>
+</main>
+
+<footer class="statusbar"><span id="status">拖入设计图开始。需要本机 SAM2 环境(miniapp-kit 的 PYTHON_MATTING)。</span></footer>
+
+<script src="js/util.js"></script>
+<script src="js/layer.js"></script>
+</body>
+</html>

@@ -40,6 +40,84 @@ TINIFY_KEY_ENVS = ["TINYPNG_API_KEY", "TINYPNG_API_KEY_2", "TINYPNG_API_KEY_3", 
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
 
+# SAM2 worker(常驻子进程,模型驻留显存;协议见 sam_worker.py)
+_SAM = {"proc": None, "image_sig": None, "lock": threading.Lock()}
+_SAM_WORKER = ROOT / "sam_worker.py"
+
+
+def _sam_python():
+    _load_miniapp_env()
+    return (os.environ.get("FRAMEFLOW_SAM_PYTHON")
+            or os.environ.get("PYTHON_MATTING")
+            or "")
+
+
+def _sam_ask(proc, req, timeout_s):
+    """发送一行 JSON 请求并读取一行响应(看门狗超时,超时即杀进程)。"""
+    timer = threading.Timer(timeout_s, lambda: proc.kill())
+    timer.start()
+    try:
+        proc.stdin.write(json.dumps(req) + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+        if not line:
+            raise RuntimeError("SAM2 worker 无响应(可能已退出)")
+        return json.loads(line)
+    finally:
+        timer.cancel()
+
+
+def _sam_ensure(image_b64=None):
+    """确保 worker 就绪;image_b64 非空时保证模型已加载该图。返回 True 表示发生了新加载。"""
+    proc = _SAM["proc"]
+    if proc is None or proc.poll() is not None:
+        py = _sam_python()
+        if not py or not Path(py).exists():
+            raise RuntimeError("未找到 SAM2 python 环境:请设 PYTHON_MATTING(指向带 torch+sam2 的 python,见 miniapp-kit doctor)")
+        if not _SAM_WORKER.exists():
+            raise RuntimeError(f"缺少 worker: {_SAM_WORKER}")
+        _SAM["proc"] = subprocess.Popen(
+            [py, str(_SAM_WORKER)], cwd=str(ROOT),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace")
+        proc = _SAM["proc"]
+        _SAM["image_sig"] = None
+        hello = _sam_ask(proc, {"cmd": "ping"}, 30)
+        if not hello.get("ok"):
+            raise RuntimeError("SAM2 worker 握手失败: " + str(hello.get("error")))
+    if image_b64 is not None:
+        sig = str(len(image_b64))
+        if _SAM["image_sig"] != sig:
+            r = _sam_ask(proc, {"cmd": "load_image", "image_b64": image_b64}, 180)
+            if not r.get("ok"):
+                raise RuntimeError("SAM2 加载图片失败: " + str(r.get("error")))
+            _SAM["image_sig"] = sig
+            return True
+    return False
+
+
+def _sam_segment(points, labels, image_b64):
+    """点提示分割;worker 崩溃自动重启重试一次。返回 {"ok",score,area,mask_b64}。"""
+    with _SAM["lock"]:
+        for attempt in (1, 2):
+            try:
+                _sam_ensure(image_b64)
+                proc = _SAM["proc"]
+                r = _sam_ask(proc, {"cmd": "segment", "points": points, "labels": labels}, 120)
+                if not r.get("ok"):
+                    raise RuntimeError(r.get("error", "未知错误"))
+                return r
+            except Exception:
+                try:
+                    if _SAM["proc"]:
+                        _SAM["proc"].kill()
+                except Exception:
+                    pass
+                _SAM["proc"] = None
+                _SAM["image_sig"] = None
+                if attempt == 2:
+                    raise
+
 
 def _load_miniapp_env():
     """加载 miniapp-kit/.env 的 KEY=VALUE(进程环境优先);不记录值,仅注入 os.environ。"""
@@ -269,6 +347,25 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
 
     # ---------- API ----------
     def do_POST(self):
+        if self.path.rstrip("/") == "/api/sam/segment":
+            try:
+                params = self._read_json()
+                data_url = params.get("image") or ""
+                if "," in data_url:
+                    _, _, b64 = data_url.partition(",")
+                else:
+                    b64 = data_url
+                if len(b64) < 100:
+                    raise RuntimeError("图片数据为空")
+                points = params.get("points") or []
+                labels = params.get("labels") or []
+                if not points or len(points) != len(labels):
+                    raise RuntimeError("点集/标签为空或数量不一致")
+                r = _sam_segment(points, labels, b64)
+                self._json({"ok": True, **r})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)}, 400)
+            return
         if self.path.rstrip("/") == "/api/compress/tinypng":
             try:
                 params = self._read_json()
