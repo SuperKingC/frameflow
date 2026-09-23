@@ -2,42 +2,24 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>FrameFlow — AI 视频 / 图片 → 游戏帧动画 工具箱</title>
+<title>FrameFlow — 独立游戏素材工具箱</title>
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><span class="logo">F</span> FrameFlow <span class="ver">v0.2</span></div>
+  <div class="brand"><span class="logo">F</span> FrameFlow <span class="ver">v0.3</span></div>
   <span class="spacer"></span>
   <span class="pagetitle">本地处理 · 素材不出本机</span>
 </header>
 
 <main class="hub-main">
   <div class="hero">
-    <h1>把 <span class="grad">AI 视频</span> 与 <span class="grad">静态图片</span>,变成游戏可用的帧动画资产</h1>
-    <p>生视频(可灵)→ 拆帧 → 抠图 → 循环检测 → Spine 三件套 / 精灵图集,外加独立的小工具。所有像素处理都在你的浏览器里完成。</p>
+    <h1><span class="grad">FrameFlow</span> 游戏素材工具箱</h1>
+    <p>面向独立开发者的本地素材小工具集:压缩、抠图、切图、帧动画。像素处理全部在你的浏览器里完成,素材不上传。</p>
   </div>
 
   <div class="tool-grid">
-    <a class="tool-card" href="spine.html">
-      <span class="corner hl">主工作流</span>
-      <span class="icon g1">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="2" y="4" width="20" height="16" rx="2"/>
-          <path d="M7 4v16M17 4v16M2 9h5M2 15h5M17 9h5M17 15h5"/>
-        </svg>
-      </span>
-      <h2>Spine 帧动画工作流</h2>
-      <p>可灵生视频或导入视频/雪碧图切图 → 绿幕抠图、魔棒修边 → 自动找循环帧 → 一键导出 Spine 4.3 三件套(json + atlas + png),进 Unity/游戏引擎直接用。</p>
-      <div class="tags">
-        <span class="tag">可灵 · ApiRouter</span>
-        <span class="tag">Spine 4.3</span>
-        <span class="tag">切图 / 抠图 / 循环</span>
-      </div>
-    </a>
-
     <a class="tool-card" href="compress.html">
-      <span class="corner hl">快速</span>
       <span class="icon g2">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <rect x="3" y="3" width="18" height="18" rx="2"/>
@@ -45,36 +27,73 @@
         </svg>
       </span>
       <h2>图片压缩</h2>
-      <p>PNG 调色板量化(64/128/256 色 + 抖动)与 WebP 转换,拖进来即看压缩前后对比与体积,一键下载。独立工具,与帧动画流程无关。</p>
+      <p>TinyPNG 在线智能压缩(key 在本地配置)+ 本地无损重压(色彩不变)+ 可选调色板量化与 WebP,前后对比、体积一目了然。</p>
       <div class="tags">
-        <span class="tag">PNG 量化</span>
+        <span class="tag">TinyPNG</span>
+        <span class="tag">无损/有损</span>
         <span class="tag">WebP</span>
-        <span class="tag">前后对比</span>
+      </div>
+    </a>
+
+    <a class="tool-card" href="cutout.html">
+      <span class="icon g2">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6 3v14a2 2 0 0 0 2 2h3"/>
+          <path d="M18 21V7a2 2 0 0 0-2-2h-3"/>
+          <circle cx="18" cy="5" r="2"/><circle cx="6" cy="19" r="2"/>
+          <path d="M3 3l18 18"/>
+        </svg>
+      </span>
+      <h2>抠图</h2>
+      <p>绿幕/白底/纯色背景一键转透明,魔棒 + 擦除/恢复画笔修边,边缘羽化/收缩,导出透明 PNG / WebP。</p>
+      <div class="tags">
+        <span class="tag">键色抠图</span>
+        <span class="tag">魔棒</span>
+        <span class="tag">透明 PNG</span>
+      </div>
+    </a>
+
+    <a class="tool-card" href="spine.html">
+      <span class="corner hl">多步流程</span>
+      <span class="icon g1">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="4" width="20" height="16" rx="2"/>
+          <path d="M7 4v16M17 4v16M2 9h5M2 15h5M17 9h5M17 15h5"/>
+        </svg>
+      </span>
+      <h2>Spine 帧动画工作流</h2>
+      <p>可灵生视频或导入视频/雪碧图 → 拆帧、抠图 → 自动找循环 → 导出 Spine 4.3 三件套,进游戏引擎直接用。</p>
+      <div class="tags">
+        <span class="tag">可灵 · ApiRouter</span>
+        <span class="tag">Spine 4.3</span>
+        <span class="tag">切图 / 循环</span>
       </div>
     </a>
 
     <a class="tool-card disabled">
-      <span class="corner ghost">敬请期待</span>
-      <span class="icon g2">
+      <span class="corner ghost">规划中</span>
+      <span class="icon g1">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.2 2.2M15.9 15.9l2.1 2.1M18.4 5.6l-2.1 2.1M8.4 15.9l-2.5 2.5"/>
-          <circle cx="12" cy="12" r="4"/>
+          <rect x="3" y="3" width="7" height="7" rx="1"/>
+          <rect x="14" y="3" width="7" height="7" rx="1"/>
+          <rect x="3" y="14" width="7" height="7" rx="1"/>
+          <path d="M14 17.5h7M17.5 14v7"/>
         </svg>
       </span>
-      <h2>更多工具</h2>
-      <p>GIF 导出、在线调色、九宫格切片……按需补充。</p>
-      <div class="tags"><span class="tag">规划中</span></div>
+      <h2>图层分离</h2>
+      <p>把一张设计图按元素拆成独立图层(颜色聚类分块 → SAM2 点选精修)。方案设计见仓库 docs/layer-split.md。</p>
+      <div class="tags"><span class="tag">设计完成 · 待开发</span></div>
     </a>
   </div>
 
   <div class="hub-foot">
-    <span>FrameFlow 本地工作台 · 帧动画管线见仓库 README</span>
-    <span>生视频桥接 miniapp-kit(可灵 · ApiRouter,密钥只走环境变量)</span>
+    <span>FrameFlow 本地工作台 · v0.3</span>
+    <span>生视频桥接 miniapp-kit(可灵 · ApiRouter,TinyPNG key 同源,只走环境变量)</span>
     <span>推荐 Chrome / Edge 桌面版</span>
   </div>
 </main>
 
-<footer class="statusbar"><span>就绪。</span></footer>
+<footer class="statusbar"><span>就绪。点卡片进入工具。</span></footer>
 
 </body>
 </html>

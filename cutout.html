@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>抠图 — FrameFlow</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="backlink" href="index.html">← 工具箱</a>
+  <div class="brand"><span class="logo">F</span> FrameFlow <span class="ver">v0.3</span></div>
+  <span class="pagetitle">抠图(透明底)</span>
+</header>
+
+<main class="page-main">
+  <aside id="left">
+    <section>
+      <h3>导入图片</h3>
+      <div class="row">
+        <button id="cutBtn" class="btn wide">选择图片(或拖入右侧)</button>
+        <input type="file" id="cutInput" accept="image/png,image/jpeg,image/webp" hidden>
+      </div>
+      <div id="cutInfo" class="hint">支持 JPG/PNG/WebP;绿幕/纯色背景效果最好。</div>
+    </section>
+
+    <section>
+      <h3>键色抠图</h3>
+      <div class="row">
+        <label>键色模式
+          <select id="keyMode">
+            <option value="green">绿幕</option>
+            <option value="white">白底</option>
+            <option value="black">黑底</option>
+            <option value="custom">取样(Alt+点击画面)</option>
+          </select>
+        </label>
+        <span id="keySwatch" class="swatch" title="当前键色"></span>
+      </div>
+      <div class="row"><label>容差 <span id="keyTolVal">0.30</span></label><input id="keyTol" type="range" min="0.05" max="0.8" step="0.01" value="0.30"></div>
+      <div class="row"><label>溢出抑制 <span id="keySpillVal">0.70</span></label><input id="keySpill" type="range" min="0" max="1" step="0.05" value="0.70"></div>
+      <div class="row"><label><input id="keyEdges" type="checkbox"> 边缘泛洪(白底/纯色背景更稳)</label></div>
+      <div class="row">
+        <label>边缘处理
+          <select id="edgeMode">
+            <option value="none">无</option>
+            <option value="feather">羽化 1px</option>
+            <option value="erode">收缩 1px(去毛边)</option>
+            <option value="dilate">扩张 1px(补缺口)</option>
+          </select>
+        </label>
+      </div>
+      <button id="keyBtn" class="btn primary">抠图(重新执行)</button>
+    </section>
+
+    <section>
+      <h3>修边</h3>
+      <div class="row">
+        <label>画笔
+          <select id="brushMode">
+            <option value="erase">擦除</option>
+            <option value="restore">恢复(从原图)</option>
+            <option value="wand">魔棒(点同色区域)</option>
+          </select>
+        </label>
+      </div>
+      <div class="row"><label>半径 <span id="brushRVal">20</span></label><input id="brushR" type="range" min="4" max="90" step="1" value="20"></div>
+      <div class="row"><label>魔棒容差 <span id="wandTolVal">0.15</span></label><input id="wandTol" type="range" min="0.02" max="0.5" step="0.01" value="0.15"></div>
+      <div class="row">
+        <button id="undoStroke" class="btn">撤销一步</button>
+        <button id="clearStrokes" class="btn">清空修边</button>
+      </div>
+      <div class="hint">Alt+点击 = 取样键色。撤销/清空会按记录重放(抠图参数变化后仍然正确)。</div>
+    </section>
+
+    <section>
+      <h3>下载</h3>
+      <div class="row">
+        <button id="dlPng" class="btn primary wide" disabled>下载透明 PNG</button>
+      </div>
+      <div class="row">
+        <button id="dlWebp" class="btn wide" disabled>下载 WebP(透明)</button>
+      </div>
+      <div class="hint">透明 PNG 可直接进 Unity/Godot/网页;需要更小体积可去工具箱的「图片压缩」。</div>
+    </section>
+  </aside>
+
+  <div id="center">
+    <canvas id="view" width="860" height="560"></canvas>
+  </div>
+</main>
+
+<footer class="statusbar"><span id="status">选择图片后点「抠图」。绿幕/纯色背景一步到位,复杂背景用魔棒+擦除手动修。</span></footer>
+
+<script src="js/util.js"></script>
+<script src="js/pipeline.js"></script>
+<script src="js/cutout.js"></script>
+</body>
+</html>

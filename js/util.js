@@ -34,6 +34,15 @@
     return new Uint8Array(await blob.arrayBuffer());
   };
 
+  FS.blobToBase64 = function (blob) {
+    return new Promise(function (resolve, reject) {
+      const reader = new FileReader();
+      reader.onload = function () { resolve(reader.result.split(',')[1] || ''); };
+      reader.onerror = function () { reject(new Error('base64 编码失败')); };
+      reader.readAsDataURL(blob);
+    });
+  };
+
   FS.downloadBlob = function (blob, filename) {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);

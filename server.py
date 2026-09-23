@@ -18,7 +18,9 @@ import os
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 import webbrowser
 from pathlib import Path
@@ -26,14 +28,81 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DEFAULT_PORT = 8437
 DEFAULT_GENMJS = ROOT.parent / "miniapp-kit" / "anim" / "gen.mjs"
+MINIAPP_ENV = ROOT.parent / "miniapp-kit" / ".env"
 GEN_BASE_URL = "https://apirouter.zhiqiteai.cn/ApiRouterServ/v1"
 GEN_KEY_ENV = "CODEX_API_KEY"
 GEN_PROMPT_APPEND = "镜头固定,动作幅度小而柔和,不要镜头切换,不要新增元素"
 GEN_MODELS = ["kwaivgi/kling-v3.0-pro", "kwaivgi/kling-v3.0-std"]
 GENWORK = ROOT / "genwork"
+TINIFY_URL = "https://api.tinify.com/shrink"
+TINIFY_KEY_ENVS = ["TINYPNG_API_KEY", "TINYPNG_API_KEY_2", "TINYPNG_API_KEY_3", "TINYPNG_API_KEY_4", "TINYPNG_API_KEY_5"]
 
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
+
+
+def _load_miniapp_env():
+    """加载 miniapp-kit/.env 的 KEY=VALUE(进程环境优先);不记录值,仅注入 os.environ。"""
+    if not MINIAPP_ENV.exists():
+        return
+    try:
+        for line in MINIAPP_ENV.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k and os.environ.get(k) is None:
+                os.environ[k] = v
+    except Exception:
+        pass
+
+
+def _tinify_keys():
+    _load_miniapp_env()
+    return [os.environ[n].strip() for n in
+            ("TINYPNG_API_KEY", "TINYPNG_API_KEY_2", "TINYPNG_API_KEY_3", "TINYPNG_API_KEY_4", "TINYPNG_API_KEY_5")
+            if os.environ.get(n, "").strip()]
+
+
+def _tinify_compress(image_bytes):
+    """TinyPNG 智能压缩(视觉无差的 PNG 智能有损;彩度差异肉眼不可辨)。
+    多 key 轮换:401/429 换下一个。返回 (bytes, input_bytes, note)。"""
+    import base64
+    keys = _tinify_keys()
+    if not keys:
+        raise RuntimeError("未找到 TinyPNG key:请设置环境变量 TINYPNG_API_KEY,或确认 miniapp-kit/.env 存在")
+    dead = []
+    last_err = None
+    for key in keys:
+        if key in dead:
+            continue
+        auth = "Basic " + base64.b64encode(f"api:{key}".encode()).decode()
+        try:
+            req = urllib.request.Request(
+                TINIFY_URL, data=image_bytes, method="POST",
+                headers={"Authorization": auth, "Content-Type": "application/octet-stream"})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            out_url = body.get("output", {}).get("url")
+            if not out_url:
+                raise RuntimeError("TinyPNG 响应缺少 output.url")
+            with urllib.request.urlopen(urllib.request.Request(out_url, headers={"Authorization": auth}), timeout=120) as dl:
+                out = dl.read()
+            if len(out) >= len(image_bytes) * 0.98:
+                return image_bytes, len(image_bytes), "压缩收益<2%,保留原图"
+            return out, len(image_bytes), ""
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 429):
+                dead.append(key)
+                last_err = e
+                continue
+            raise RuntimeError(f"TinyPNG HTTP {e.code}")
+        except Exception as e:
+            last_err = e
+            break
+    raise RuntimeError(f"TinyPNG 压缩失败:{last_err}")
 
 
 def _genmjs_path(override=None):
@@ -200,6 +269,25 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
 
     # ---------- API ----------
     def do_POST(self):
+        if self.path.rstrip("/") == "/api/compress/tinypng":
+            try:
+                params = self._read_json()
+                data_url = params.get("image") or ""
+                if "," in data_url:
+                    _, _, b64 = data_url.partition(",")
+                else:
+                    b64 = data_url
+                import base64 as _b64
+                raw = _b64.b64decode(b64)
+                if len(raw) < 100:
+                    raise RuntimeError("图片数据为空")
+                out, in_bytes, note = _tinify_compress(raw)
+                b64out = _b64.b64encode(out).decode()
+                self._json({"ok": True, "image": "data:image/png;base64," + b64out,
+                            "inputBytes": in_bytes, "outputBytes": len(out), "note": note})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)}, 400)
+            return
         if self.path.rstrip("/") == "/api/gen/start":
             try:
                 params = self._read_json()
