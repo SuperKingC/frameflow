@@ -1,0 +1,936 @@
+{
+ "cost_total_usd": 16.8386,
+ "models": {
+  "nonexistent/fake-model-x1": {
+   "probe": "no",
+   "probe_detail": "400 | nonexistent/fake-model-x1 is not a valid model ID",
+   "video_test": {
+    "ok": false,
+    "note": "not_found: 400 | Model nonexistent/fake-model-x1 does not exist",
+    "cost": 0.0,
+    "done": true,
+    "control": true
+   }
+  },
+  "nonexistent/fake-model-y2": {
+   "probe": "no",
+   "probe_detail": "400 | nonexistent/fake-model-y2 is not a valid model ID"
+  },
+  "google/gemini-nano-banana-2.1": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 429 429 | Provider returned error",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 429 Provider returned error(3 次均限流,未出图)",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "tencent/hy-image-v3.5-preview": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | tencent/hy-image-v3.5-preview is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | tencent/hy-image-v3.5-preview is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "bytedance-seed/seedream-5-0-flash": {
+   "probe": "no",
+   "probe_detail": "400 | bytedance-seed/seedream-5.0-flash is not a valid model ID"
+  },
+  "black-forest-labs/flux-3-image": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | black-forest-labs/flux-3-image is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | black-forest-labs/flux-3-image is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "inclusionai/ming-image-0.1-design-layer": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | inclusionai/ming-image-0.1-design-layer is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | inclusionai/ming-image-0.1-design-layer is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4.1-flash": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/webp;base64,UklGRtx ~977KB",
+    "cost": 0.007,
+    "done": true
+   }
+  },
+  "inclusionai/ming-image-0.1-design": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | inclusionai/ming-image-0.1-design is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | inclusionai/ming-image-0.1-design is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "openai/gpt-image-2.5-sunburst": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | openai/gpt-image-2.5-sunburst is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | openai/gpt-image-2.5-sunburst is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "openai/gpt-image-2.5-flare": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | openai/gpt-image-2.5-flare is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | openai/gpt-image-2.5-flare is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "microsoft/mai-image-2.6": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png;base64,iVBORw0K ~842KB",
+    "cost": 0.038982,
+    "done": true
+   }
+  },
+  "microsoft/mai-image-2.6-flash": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png;base64,iVBORw0K ~1034KB",
+    "cost": 0.0194805,
+    "done": true
+   }
+  },
+  "meta/muse-image": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | meta/muse-image is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | meta/muse-image is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4-styles-pro": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | Provider returned error",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 400: 400 | Provider returned error",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4-styles-vector": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | Provider returned error",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 400: 400 | Provider returned error",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4-styles-pro-vector": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | Provider returned error",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 400: 400 | Provider returned error",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4-styles": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | Provider returned error",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 400: 400 | Provider returned error",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "bytedance-seed/seedream-5-0-lite": {
+   "probe": "no",
+   "probe_detail": "400 | bytedance-seed/seedream-5.0-lite is not a valid model ID"
+  },
+  "bytedance-seed/seedream-5-0-pro": {
+   "probe": "no",
+   "probe_detail": "400 | bytedance-seed/seedream-5.0-pro is not a valid model ID"
+  },
+  "x-ai/grok-imagine-image-2.0": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/jpeg;base64,/9j/4AA ~247KB",
+    "cost": 0.04,
+    "done": true
+   }
+  },
+  "qwen/qwen-image-3": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | qwen/qwen-image-3 is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | qwen/qwen-image-3 is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "qwen/qwen-image-3-pro": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | qwen/qwen-image-3-pro is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | qwen/qwen-image-3-pro is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "microsoft/mai-image-2.5-pro": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png;base64,iVBORw0K ~979KB",
+    "cost": 0.110667,
+    "done": true
+   }
+  },
+  "krea/krea-2-large": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | krea/krea-2-large is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | krea/krea-2-large is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "krea/krea-2-medium": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | krea/krea-2-medium is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | krea/krea-2-medium is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "krea/krea-2-medium-turbo": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | krea/krea-2-medium-turbo is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | krea/krea-2-medium-turbo is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "openrouter/auto-beta": {
+   "probe": "redirected",
+   "probe_detail": "echo=deepseek/deepseek-v4-flash"
+  },
+  "google/gemini-3.1-flash-lite-image": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/jpeg;base64,/9j/4AA ~53KB",
+    "cost": 0.033603,
+    "done": true
+   }
+  },
+  "openai/gpt-image-2": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | openai/gpt-image-2 is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | openai/gpt-image-2 is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "openai/gpt-image-1": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | openai/gpt-image-1 is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | openai/gpt-image-1 is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "openai/gpt-image-1-mini": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 404 404 | openai/gpt-image-1-mini is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+   "image_test": {
+    "ok": false,
+    "note": "HTTP 404: 404 | openai/gpt-image-1-mini is an image generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/images endpoint instead.",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "google/gemini-3.1-flash-image": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png;base64,iVBORw0K ~1027KB",
+    "cost": 0.067206,
+    "done": true
+   }
+  },
+  "google/gemini-3-pro-image": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png;base64,iVBORw0K ~794KB",
+    "cost": 0.136728,
+    "done": true
+   }
+  },
+  "sourceful/riverflow-v2.5-pro": {
+   "probe": "net",
+   "probe_detail": "NETWORK: The read operation timed out"
+  },
+  "sourceful/riverflow-v2.5-fast": {
+   "probe": "net",
+   "probe_detail": "NETWORK: The read operation timed out"
+  },
+  "microsoft/mai-image-2.5": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png;base64,iVBORw0K ~1009KB",
+    "cost": 0.048203,
+    "done": true
+   }
+  },
+  "x-ai/grok-imagine-image-quality": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/jpeg;base64,/9j/4AA ~123KB",
+    "cost": 0.05,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4.1-pro-vector": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/svg+xml;base64,PHN2 ~20KB",
+    "cost": 0.3,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4.1-vector": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/svg+xml;base64,PHN2 ~19KB",
+    "cost": 0.08,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4.1-utility-pro": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/webp;base64,UklGRuL ~2930KB",
+    "cost": 0.21,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4.1-utility": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/webp;base64,UklGRmR ~795KB",
+    "cost": 0.035,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4.1-pro": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/webp;base64,UklGR ~3200KB",
+    "cost": 0.21,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4.1": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/webp;base64,UklGRqK ~932KB",
+    "cost": 0.035,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4-pro-vector": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/svg+xml;base64,PHN2 ~23KB",
+    "cost": 0.3,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4-vector": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/svg+xml;base64,PHN2 ~31KB",
+    "cost": 0.08,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4-pro": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/webp;base64,UklGRo ~3972KB",
+    "cost": 0.25,
+    "done": true
+   }
+  },
+  "recraft/recraft-v4": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/webp;base64,UklGRqY ~1291KB",
+    "cost": 0.04,
+    "done": true
+   }
+  },
+  "recraft/recraft-v3": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/webp;base64,UklGRgJ ~1116KB",
+    "cost": 0.04,
+    "done": true
+   }
+  },
+  "sourceful/riverflow-v2-pro": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png;base64,UklGRtil ~41KB",
+    "cost": 0.15,
+    "done": true
+   }
+  },
+  "sourceful/riverflow-v2-fast": {
+   "probe": "net",
+   "probe_detail": "NETWORK: The read operation timed out",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png ~51KB",
+    "cost": 0.02,
+    "done": true
+   }
+  },
+  "black-forest-labs/flux.2-klein-4b": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png;base64,iVBORw0K ~718KB",
+    "cost": 0.014,
+    "done": true
+   }
+  },
+  "bytedance-seed/seedream-4.5": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/jpeg;base64,/9j/4AA ~909KB",
+    "cost": 0.04,
+    "done": true
+   }
+  },
+  "black-forest-labs/flux.2-max": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png;base64,iVBORw0K ~627KB",
+    "cost": 0.07,
+    "done": true
+   }
+  },
+  "black-forest-labs/flux.2-flex": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png;base64,iVBORw0K ~646KB",
+    "cost": 0.05,
+    "done": true
+   }
+  },
+  "black-forest-labs/flux.2-pro": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png;base64,iVBORw0K ~584KB",
+    "cost": 0.03,
+    "done": true
+   }
+  },
+  "openai/gpt-5-image-mini": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png;base64,iVBORw0K ~1486KB",
+    "cost": 0.041803,
+    "done": true
+   }
+  },
+  "openai/gpt-5-image": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png;base64,iVBORw0K ~1369KB",
+    "cost": 0.1929,
+    "done": true
+   }
+  },
+  "google/gemini-2.5-flash-image": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": true,
+    "note": "b64 image/png ~1019KB (重试后成功,首轮回文本)",
+    "cost": 0.0387,
+    "done": true
+   }
+  },
+  "openrouter/auto": {
+   "probe": "redirected",
+   "probe_detail": "echo=deepseek/deepseek-v4.1-flash"
+  },
+  "google/gemini-3.8-flash": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": false,
+    "note": "not_found: 404 | No endpoints found that support the requested output modalities: image",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "google/gemini-3.7-flash": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": false,
+    "note": "not_found: 404 | No endpoints found that support the requested output modalities: image",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "google/gemini-3.1-pro-preview": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": false,
+    "note": "not_found: 404 | No endpoints found that support the requested output modalities: image",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "google/gemini-2.5-pro": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": false,
+    "note": "not_found: 404 | No endpoints found that support the requested output modalities: image",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "google/gemini-2.5-flash-lite": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": false,
+    "note": "not_found: 404 | No endpoints found that support the requested output modalities: image",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "google/gemini-3.1-flash-lite": {
+   "probe": "ok",
+   "probe_detail": "",
+   "image_test": {
+    "ok": false,
+    "note": "not_found: 404 | No endpoints found that support the requested output modalities: image",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "x-ai/grok-4.6": {
+   "probe": "redirected",
+   "probe_detail": "echo=grok-4.6-2"
+  },
+  "openai/gpt-5.6-terra": {
+   "probe": "redirected",
+   "probe_detail": "echo=gpt-5.6-terra"
+  },
+  "openai/gpt-5.6-sol": {
+   "probe": "redirected",
+   "probe_detail": "echo=gpt-5.6-sol"
+  },
+  "x-ai/grok-imagine-video-1.5-lite": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | x-ai/grok-imagine-video-1.5-lite is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 0.9MB -> x-ai_grok-imagine-video-1.5-lite.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "heygen/heygen-video-1": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | heygen/heygen-video-1 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 0.8MB -> heygen_heygen-video-1.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "black-forest-labs/flux-video-edit": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | black-forest-labs/flux-video-edit is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": false,
+    "note": "HTTP 400: 400 | model \"black-forest-labs/flux-video-edit\" requires video input: include an input_references entry of type video_url",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "minimax/hailuo-3-max": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | minimax/hailuo-3-max is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 5.1MB -> minimax_hailuo-3-max.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "alibaba/wan-3.0-prime": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | alibaba/wan-3.0-prime is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 11.7MB -> alibaba_wan-3.0-prime.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "alibaba/wan-3.0": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | alibaba/wan-3.0 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 10.3MB -> alibaba_wan-3.0.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "heygen/avatar-iv": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | heygen/avatar-iv is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": false,
+    "note": "HTTP 400: 400 | avatar-iv requires an image input reference",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "black-forest-labs/flux-video-upscale": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | black-forest-labs/flux-video-upscale is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": false,
+    "note": "HTTP 400: 400 | model \"black-forest-labs/flux-video-upscale\" requires video input: include an input_references entry of type video_url",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "bytedance/seedance-2.0-mini": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | bytedance/seedance-2.0-mini is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 2.0MB -> bytedance_seedance-2.0-mini.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "bytedance/seedance-2.5": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | bytedance/seedance-2.5 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 4.0MB -> bytedance_seedance-2.5.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "black-forest-labs/flux-3-video": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | black-forest-labs/flux-3-video is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 2.7MB -> black-forest-labs_flux-3-video.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "minimax/hailuo-3": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | minimax/hailuo-3 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 2.5MB -> minimax_hailuo-3.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "runway/aleph-2": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | runway/aleph-2 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": false,
+    "note": "HTTP 400: 400 | model \"runway/aleph-2\" requires video input: include an input_references entry of type video_url",
+    "cost": 0.0,
+    "done": true
+   }
+  },
+  "runway/gen-4.5": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | runway/gen-4.5 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 1.7MB -> runway_gen-4.5.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "x-ai/grok-imagine-video-1.5": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | x-ai/grok-imagine-video-1.5 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 1.1MB -> x-ai_grok-imagine-video-1.5.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "alibaba/happyhorse-1.1": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | alibaba/happyhorse-1.1 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 2.0MB -> alibaba_happyhorse-1.1.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "alibaba/happyhorse-1.0": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | alibaba/happyhorse-1.0 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 3.8MB -> alibaba_happyhorse-1.0.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "x-ai/grok-imagine-video": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | x-ai/grok-imagine-video is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 1.0MB -> x-ai_grok-imagine-video.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "google/veo-3.1-fast": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | google/veo-3.1-fast is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 4.8MB -> google_veo-3.1-fast.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "google/veo-3.1-lite": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | google/veo-3.1-lite is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 2.9MB -> google_veo-3.1-lite.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "kwaivgi/kling-video-o1": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | kwaivgi/kling-video-o1 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 9.9MB -> kwaivgi_kling-video-o1.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "minimax/hailuo-2.3": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | minimax/hailuo-2.3 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 0.7MB -> minimax_hailuo-2.3.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "alibaba/wan-2.7": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | alibaba/wan-2.7 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 8.2MB -> alibaba_wan-2.7.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "bytedance/seedance-2.0": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | bytedance/seedance-2.0 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 1.6MB -> bytedance_seedance-2.0.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "bytedance/seedance-2.0-fast": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | bytedance/seedance-2.0-fast is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 1.6MB -> bytedance_seedance-2.0-fast.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "alibaba/wan-2.6": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | alibaba/wan-2.6 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 3.6MB -> alibaba_wan-2.6.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "bytedance/seedance-1-5-pro": {
+   "probe": "no",
+   "probe_detail": "400 | bytedance/seedance-1.5-pro is not a valid model ID",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 4.4MB -> bytedance_seedance-1-5-pro.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  },
+  "google/veo-3.1": {
+   "probe": "maybe",
+   "probe_detail": "HTTP 400 400 | google/veo-3.1 is a video generation model and cannot be used with the chat/completions endpoint. Use the /api/v1/videos endpoint instead.",
+   "video_test": {
+    "ok": true,
+    "note": "mp4 3.9MB -> google_veo-3.1.mp4",
+    "cost": 0.0,
+    "done": true,
+    "recovered": true
+   }
+  }
+ },
+ "relay_validates": true,
+ "relay_video_validates": true
+}

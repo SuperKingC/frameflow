@@ -78,6 +78,15 @@
 - `layer.html`:左键正点 / Shift 或右键负点,每次点击自动算掩码并叠加预览,score<0.5 提示补点;收下为图层(缩略图+改名+排序),导出 ZIP(逐层整幅透明 PNG + manifest + 叠加预览)。
 - 端到端实测(合成三元素设计图):橙椭圆 0.987/20478px、蓝方块 0.992/22394px(理论 22400)、绿椭圆 0.986/20655px(理论 20734),三图层收下与导出正常。worker 环境解析顺序:FRAMEFLOW_SAM_PYTHON > PYTHON_MATTING(miniapp-kit/.env 自动加载)。
 
+## 二点六、抠图页改版:五模型 AI 抠图(2026-10-13,已上线)
+
+对照同类工具(版本下拉 + 开始处理 + 贴边剪裁)重做抠图页,**键色抠图整块移除**,修边/下载保留:
+
+- `matting_worker.py`:五模型常驻 worker(stdio JSON:ping/matte,`model` 参数白名单)。`ben2`(kit 权重,MIT)、`briaai`(RMBG-1.4,tools/rmbg/ 官方 nn.Module + stub 加载,hf-mirror 下载权重 176MB;**预处理必须用官方 /255 + normalize(0.5,1.0),喂 ImageNet 均值方差会全图半透明**)、`inspyrenet`(transparent-background 包)、`u2net`/`isnet-anime`(rembg onnx)。各模型首用自动加载驻留(CUDA)。坑:第三方下载日志必须重定向 stderr,stdout 只承载 JSON 协议,否则服务端 readline 挂死。
+- `server.py /api/matting/auto`:dataURL + model → RGBA dataURL(+model/edgePx/seconds);同一门禁与看门狗。
+- `cutout.html/js`:上传 → 版本下拉(ben2/briaai/inspyrenet/u2net/isnet-anime + 场景说明)→ 开始处理;「贴边剪裁」开关 = 下载时按 contentBBox 裁掉透明边;修边画笔/魔棒/撤销/清空照旧(干净副本 clean + 记录重放,换版本重抠后修边记录仍按序重放)。`pipeline.js` 的 FS.applyModel/FS.applyKey 保留(layer/spine 页仍用键控管线;cutout 页已不再引用)。
+- 实测(2026-10-13,CUDA,ref_cat.png 240×320):worker 直跑 5/5 通过;HTTP 端到端 5/5 200(ben2 6.3s/edge1213、briaai 4.9s/edge250、inspyrenet 8.7s/edge136、u2net 2.6s/edge457、isnet-anime 2.5s/edge8——真猫照片被动漫特化模型判近全透是预期行为)。页面全流程:载图→ben2→擦除→撤销(恢复)→切 isnet-anime 重抠→切回 ben2(0.89s 热)→贴边剪裁下载 PNG 7.1KB/WebP 3.9KB,全部通过。
+
 ## 三、为什么不做"全自动语义分层"
 - 设计图的"元素"是语义概念(围巾/锤子/耳朵),纯算法只能近似;SAM2 点选把决定权留给人,把精确边界交给模型,是社区验证过的正确姿势(对比:全自由拆件已被证伪)。
 - v0 聚类先行还有个附带收益:它同时是"切图"的增强版,能处理布局复杂的雪碧图。

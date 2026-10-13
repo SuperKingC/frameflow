@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>短剧工作台 — KK工作台</title>
+<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/gen.css">
+<link rel="stylesheet" href="css/drama.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="backlink" href="index.html">← 工作台</a>
+  <div class="brand"><span class="logo">K</span> KK工作台 <span class="ver">v0.4</span></div>
+  <span class="pagetitle">短剧工作台</span>
+</header>
+
+<main class="gen-main">
+  <div class="gen-gate" id="bootHint" style="width:auto"><p class="hint" style="margin:0">正在进入短剧工作台…</p></div>
+
+  <div class="gen-grid" id="app" hidden>
+    <div class="gen-panel">
+      <h3>项目</h3>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="projSel" style="flex:1;min-width:0"></select>
+        <button class="btn" id="btnNew">新建</button>
+        <button class="btn" id="btnDelProj" hidden>删除</button>
+      </div>
+      <div id="projForm" hidden>
+        <div style="display:flex;gap:8px;margin-bottom:6px">
+          <button class="btn" id="btnIdea" hidden>🎲 来个灵感</button>
+          <button class="btn" id="btnBrainstorm">✨ 现编点子</button>
+        </div>
+        <label class="f-label">剧名
+          <input id="pTitle" class="txt" style="width:100%" placeholder="未命名短剧">
+        </label>
+        <label class="f-label">一句话故事
+          <textarea id="pLogline" rows="3" style="width:100%"
+            placeholder="例如:深夜便利店,一只会说话的猫告诉打工女孩,明天世界会重置一次"></textarea>
+        </label>
+        <label class="f-label">画面风格(点标签快选,可手改)
+          <input id="pStyle" class="txt" style="width:100%" placeholder="如:日系赛璐璐动漫,柔和光影">
+        </label>
+        <div class="style-chips" id="styleChips"></div>
+        <div class="gen-grid2">
+          <label class="f-label">画幅
+            <select id="pAspect">
+              <option value="9:16" selected>9:16 竖屏</option>
+              <option value="16:9">16:9 横屏</option>
+              <option value="1:1">1:1</option>
+              <option value="4:3">4:3</option>
+            </select>
+          </label>
+          <label class="f-label">分镜数
+            <select id="pNShots">
+              <option>4</option><option selected>6</option><option>8</option><option>10</option>
+              <option>12</option><option>16</option><option>20</option><option>24</option>
+            </select>
+          </label>
+        </div>
+        <label class="row" style="margin-top:8px"><input type="checkbox" id="pWithLines"> 按章节起草并写台词(起/承/转/合分组,每镜带对白)</label>
+        <button class="btn wide" id="btnSaveProj" style="margin-top:8px">保存项目信息</button>
+      </div>
+
+      <h3 style="margin-top:16px">角色(定妆照作全剧参考)</h3>
+      <p class="hint" id="brainHint" hidden style="margin:0 0 6px">角色可上传长相参考图(点角色里的「+」),生成定妆照时会按参考图保持一致。</p>
+      <div id="charList"></div>
+      <button class="btn wide" id="btnAddChar" hidden>+ 添加角色</button>
+
+      <h3 style="margin-top:16px">成片</h3>
+      <button class="btn primary wide" id="btnCompose" hidden>合成成片(含配音混音+字幕)</button>
+      <button class="btn wide" id="btnPlayAll" hidden style="margin-top:8px">▶ 连播预览</button>
+      <button class="btn wide" id="btnRunAll" hidden style="margin-top:8px">⚡ 一键串跑(自动补齐缺的首帧/成片)</button>
+      <div id="composedBox"></div>
+      <p class="hint" id="quotaLine" style="margin-top:10px">剩余额度:—</p>
+      <p class="hint">流程:填故事 → ✨生成分镜(可手改,可带台词)→ 角色定妆 → 逐镜生首帧 → 逐镜生视频 → 合成。长剧用「一键串跑」按限额排队;镜头时长按可灵 3.0 支持 3~15 秒(1 分钟剧约 5~8 镜)。台词区写好对白的镜头,「🎙 生成配音」秒出;合成时自动混音+烧字幕。素材落盘 genwork/drama/,重启不丢。</p>
+    </div>
+
+    <div class="gen-stage">
+      <div class="label-row">
+        <label style="margin:0;font-size:11.5px;letter-spacing:1.2px;color:var(--accent)">分镜</label>
+        <div style="display:flex;gap:8px">
+          <button class="btn" id="btnAddShot" hidden>+ 手动加镜</button>
+          <button class="btn primary" id="btnStoryboard" hidden>✨ 生成分镜</button>
+        </div>
+      </div>
+      <div id="shotList"></div>
+      <div class="gen-empty" id="shotEmpty" hidden>还没有镜头:填好左侧「一句话故事」后点「✨ 生成分镜」,或「+ 手动加镜」。</div>
+    </div>
+  </div>
+</main>
+
+<div class="gen-lightbox" id="playModal"><div id="playBox"></div></div>
+<div class="gen-lightbox" id="ideaModal"><div id="ideaBox" class="idea-box"></div></div>
+<div class="gen-lightbox" id="lightbox"><img id="lightboxImg" alt="预览"></div>
+
+<footer class="statusbar"><span id="status">就绪。</span></footer>
+
+<!-- 页内门禁兜底:直开本页时先验证邀请码;与生图/生视频同一把码,首页弹窗验证过则静默复验直进 -->
+<div class="gate-overlay" id="gateOverlay">
+  <div class="gate-dialog" role="dialog" aria-modal="true">
+    <h2>短剧工作台</h2>
+    <p class="hint">内部工作台,请输入邀请码进入;一天内错误 3 次将锁定到明天。</p>
+    <input type="password" class="gate-input" id="gateCode" autocomplete="off" placeholder="邀请码">
+    <button class="btn primary wide" id="gateGo">进入</button>
+    <p class="gate-error" id="gateError" hidden></p>
+  </div>
+</div>
+
+<script src="js/gate.js"></script>
+<script src="js/drama.js"></script>
+</body>
+</html>

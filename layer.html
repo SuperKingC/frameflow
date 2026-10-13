@@ -2,13 +2,13 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>图层分离 — FrameFlow</title>
+<title>图层分离 — KK工作台</title>
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
 <header class="topbar">
-  <a class="backlink" href="index.html">← 工具箱</a>
-  <div class="brand"><span class="logo">F</span> FrameFlow <span class="ver">v0.3</span></div>
+  <a class="backlink" href="index.html">← 工作台</a>
+  <div class="brand"><span class="logo">K</span> KK工作台 <span class="ver">v0.3</span></div>
   <span class="pagetitle">图层分离(SAM2 点选)</span>
 </header>
 
@@ -59,7 +59,19 @@
 
 <footer class="statusbar"><span id="status">拖入设计图开始。需要本机 SAM2 环境(miniapp-kit 的 PYTHON_MATTING)。</span></footer>
 
+<!-- 页内门禁兜底:绕过首页直开本页也需邀请码;与生图/生视频同一把码,验证过则静默直进 -->
+<div class="gate-overlay" id="gateOverlay">
+  <div class="gate-dialog" role="dialog" aria-modal="true">
+    <h2>图层分离</h2>
+    <p class="hint">内部工作台,请输入邀请码进入;一天内错误 3 次将锁定到明天。</p>
+    <input type="password" class="gate-input" id="gateCode" autocomplete="off" placeholder="邀请码">
+    <button class="btn primary wide" id="gateGo">进入</button>
+    <p class="gate-error" id="gateError" hidden></p>
+  </div>
+</div>
+
 <script src="js/util.js"></script>
+<script src="js/gate.js"></script>
 <script src="js/layer.js"></script>
 </body>
 </html>

@@ -2,13 +2,13 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>Spine 帧动画工作流 — FrameFlow</title>
+<title>Spine 帧动画工作流 — KK工作台</title>
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
 <header class="topbar">
-  <a class="backlink" href="index.html">← 工具箱</a>
-  <div class="brand"><span class="logo">F</span> FrameFlow <span class="ver">v0.2</span></div>
+  <a class="backlink" href="index.html">← 工作台</a>
+  <div class="brand"><span class="logo">K</span> KK工作台 <span class="ver">v0.2</span></div>
   <span class="pagetitle">Spine 帧动画工作流</span>
   <span class="spacer"></span>
   <input id="charId" value="hero_v01" title="角色ID(用于导出文件名)" size="9">
@@ -31,6 +31,20 @@
       </div>
       <div class="row"><img id="genRefThumb" class="refthumb" alt="" hidden></div>
       <div class="row"><textarea id="genPrompt" rows="3" placeholder="只写运动,不复述外观(图管长相,词管动作)。例:角色原地轻轻呼吸,尾巴缓慢摆动"></textarea></div>
+      <div class="row inline">
+        <label>动作模板
+          <select id="genTemplate">
+            <option value="">(不使用模板,手写提示词)</option>
+            <option value="idle">待机 idle</option>
+            <option value="attack">普通攻击 attack</option>
+            <option value="hit">受击 hit</option>
+            <option value="move">移动 move</option>
+            <option value="ult">大招 ult</option>
+          </select>
+        </label>
+        <button id="genBatchBtn" class="btn" title="依次生成 idle/攻击/受击/移动/大招 五条视频">⚔ 一键生成战斗五件套</button>
+      </div>
+      <div class="hint">模板约定「起手收手=自然站姿」:跨动作的首尾帧互相接近,导出时才能去重复用,引擎里动作衔接也不跳。一键生成约 5 分钟/条、5 条约 25 分钟,期间别关页面;逐条点「→ 导入拆帧流程」并添加动画,导入会保留已添加的动画。</div>
       <div class="row inline">
         <label>模型
           <select id="genModel">
@@ -144,17 +158,21 @@
       <h3>⑦ 导出</h3>
       <div class="row"><label>导出缩放 <span id="exportScaleVal">1</span></label><input id="exportScale" type="range" min="0.25" max="2" step="0.05" value="1"></div>
       <div class="row inline">
-        <label>图片压缩
-          <select id="quantColors">
-            <option value="0">不压缩</option>
-            <option value="256">256 色</option>
-            <option value="128">128 色</option>
-            <option value="64">64 色</option>
+        <label>PNG 压缩
+          <select id="pngCompress">
+            <option value="none">不压缩</option>
+            <option value="tinypng" selected>TinyPNG 在线(色彩不变)</option>
+            <option value="oxipng">oxipng 本地无损</option>
           </select>
         </label>
-        <label><input id="quantDither" type="checkbox"> 抖动</label>
       </div>
-      <div class="hint">压缩=调色板量化(alpha 保留渐变),作用于图集/雪碧图/序列帧 PNG;抖动适合渐变图,纯色图慎用。角色ID同时用于 Spine 文件名与图集页名。需要独立压缩单张图?工具箱里有「图片压缩」。</div>
+      <div class="row inline">
+        <label><input id="dedupeFrames" type="checkbox" checked> 跨动画去重</label>
+        <label><input id="dedupePerceptual" type="checkbox"> 合并近似帧</label>
+        <label>阈值 <input id="dedupePhashThr" type="number" value="8" min="0" max="20" class="num" title="感知哈希距离上限,越小越严格"></label>
+      </div>
+      <div class="hint">Spine 导出自动按每帧内容紧包围盒入图集(位置写入附件偏移),并跨动画去重:像素与位置完全相同的帧只存一份。勾「合并近似帧」会把感知哈希距离 ≤ 阈值且位置接近的帧替换为已存帧,省更多但可能引入细微差异,快动作慎用。</div>
+      <div class="hint">PNG 压缩与「图片压缩」页同一方案(不压色):TinyPNG 走本地服务器代理,oxipng 像素 100% 不变;作用于图集/雪碧图/序列帧 PNG,序列帧逐张调用会慢。角色ID同时用于 Spine 文件名与图集页名。</div>
     </section>
   </aside>
 
@@ -183,9 +201,21 @@
 
 <footer class="statusbar"><span id="status">就绪。生视频或导入视频/图片 → 抠图修边 → 减帧找循环 → 添加动画 → 导出 Spine 三件套。</span></footer>
 
+<!-- 页内门禁兜底:直开本页时先验证邀请码;与生图/生视频同一把码,首页弹窗验证过则静默复验直进 -->
+<div class="gate-overlay" id="gateOverlay">
+  <div class="gate-dialog" role="dialog" aria-modal="true">
+    <h2>Spine 帧动画工作流</h2>
+    <p class="hint">内部工作台,请输入邀请码进入;一天内错误 3 次将锁定到明天。</p>
+    <input type="password" class="gate-input" id="gateCode" autocomplete="off" placeholder="邀请码">
+    <button class="btn primary wide" id="gateGo">进入</button>
+    <p class="gate-error" id="gateError" hidden></p>
+  </div>
+</div>
+
 <script src="js/util.js"></script>
 <script src="js/pipeline.js"></script>
 <script src="js/exporter.js"></script>
+<script src="js/gate.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>

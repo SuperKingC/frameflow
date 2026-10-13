@@ -1,1 +1,8 @@
 genwork/
+__pycache__/
+.zcode/
+testdata/
+tools/rmbg/model.pth
+tools/probe_out/
+tools/__pycache__/
+tools/**/__pycache__/

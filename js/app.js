@@ -5,6 +5,20 @@
   const FS = window.FS;
   const $ = function (sel) { return document.querySelector(sel); };
 
+  // 邀请码门禁(js/gate.js 解锁后置 window.FFGate):/api/gen/* 与生图工作台同一把码
+  function gateReady() { return Boolean(window.FFGate && window.FFGate.ok); }
+  function gateAuth() { return { authorization: 'Bearer ' + ((window.FFGate && window.FFGate.code) || '') }; }
+  const GATE_ERRORS = {
+    invalid_invite_code: '邀请码不正确',
+    invite_locked: '邀请码错误次数过多,今日已锁定,请明天再试',
+    upstream_unavailable: '服务端未设邀请码且当前来源非本机,已拒绝(公网部署需设 GEN_INVITE_CODE)',
+  };
+  function gateGuard(label) {
+    if (gateReady()) return true;
+    status(label + ':请先输入邀请码进入工作台。', true);
+    return false;
+  }
+
   const state = {
     frames: [],
     videoInfo: null,
@@ -13,9 +27,10 @@
     charId: 'hero_v01',
     key: { mode: 'green', color: [0, 255, 70], tol: 0.3, spill: 0.7, edges: false, edgeMode: 'none' },
     dedupeThreshold: 2,
+    dedupe: { frames: true, perceptual: false, phashThr: 8 },
     exportScale: 1,
-    maxWidth: 2048,
-    compress: { colors: 0, dither: false },
+    maxWidth: 16384,
+    compress: { mode: 'tinypng' },
     showBBox: false,
     bbox: null,
     brush: { mode: 'erase', r: 18, tol: 0.15 },
@@ -46,8 +61,7 @@
       status('正在拆帧…');
       const fps = FS.clamp(parseFloat($('#extractFps').value) || 10, 1, 30);
       state.frames = [];
-      state.loops = [];
-      state.bbox = null;
+      state.bbox = null; // state.loops 跨视频保留:逐条导入动作视频,攒成完整角色
       const result = await FS.extractFrames(file, fps, 400, function (i, n) {
         progress('拆帧中 ' + i + '/' + n);
       });
@@ -56,8 +70,12 @@
       state.selection = { start: 0, end: Math.max(0, result.frames.length - 1) };
       $('#videoInfo').textContent = result.videoW + '×' + result.videoH + ' · ' + result.duration.toFixed(2) + 's · ' + result.frames.length + ' 帧 @' + fps + 'fps';
       status('拆帧完成,正在抠图…');
+      const detected = autoDetectKey(result.frames[0]);
       await keyAll();
-      status('完成。点击色块可重新取键色;拖动"容差"后点【重新抠图】。');
+      const kept = state.loops.length ? ' 已保留 ' + state.loops.length + ' 个已添加动画,可继续选段添加下一个动作。' : '';
+      status((detected
+        ? '完成。已自动检测背景色并抠图;不满意可调容差/勾"边缘泛洪"后点【重新抠图】。'
+        : '完成。背景色不明显,当前为默认绿幕键控;请选键色模式并点【重新抠图】。') + kept);
       renderAll();
     } catch (e) {
       status('导入失败:' + e.message, true);
@@ -104,13 +122,13 @@
         proc.getContext('2d', { willReadFrequently: true }).drawImage(orig, 0, 0);
         return { id: i, orig: orig, proc: proc, strokes: [], dropped: false, hash: null };
       });
-      state.loops = [];
       state.bbox = null;
       state.selection = { start: 0, end: state.frames.length - 1 };
       $('#videoInfo').textContent = file.name + ' · ' + canvas.width + '×' + canvas.height + ' · 切出 ' + state.frames.length + ' 帧';
       computeBBox();
       renderAll();
-      status('切图完成:' + state.frames.length + ' 帧。' + (mode === 'auto' ? '' : '(非透明图可再走③抠图)'));
+      const kept = state.loops.length ? ' 已保留 ' + state.loops.length + ' 个已添加动画。' : '';
+      status('切图完成:' + state.frames.length + ' 帧。' + (mode === 'auto' ? '' : '(非透明图可再走③抠图)') + kept);
     } catch (e) {
       status('切图失败:' + e.message, true);
     } finally {
@@ -154,6 +172,32 @@
     $('#keyMode').value = 'custom';
     updateKeySwatch();
     status('键色已取样 rgb(' + d[0] + ',' + d[1] + ',' + d[2] + '),点击【重新抠图】应用。');
+  }
+
+  // 导入后自动检测背景色:画面边缘 8 个采样点颜色一致(离散小)才采用,
+  // 用于黑/白/绿等纯色底 AI 素材,免去手动选键色
+  function autoDetectKey(f) {
+    if (!f) return false;
+    const w = f.orig.width, h = f.orig.height;
+    const d = f.orig.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+    const pts = [[1, 1], [w - 2, 1], [1, h - 2], [w - 2, h - 2], [w >> 1, 1], [w >> 1, h - 2], [1, h >> 1], [w - 2, h >> 1]];
+    let r = 0, g = 0, b = 0;
+    const cols = pts.map(function (p) {
+      const i = (p[1] * w + p[0]) * 4;
+      r += d[i]; g += d[i + 1]; b += d[i + 2];
+      return [d[i], d[i + 1], d[i + 2]];
+    });
+    r /= cols.length; g /= cols.length; b /= cols.length;
+    let maxDist = 0;
+    cols.forEach(function (c) {
+      const dr = (c[0] - r) / 255, dg = (c[1] - g) / 255, db = (c[2] - b) / 255;
+      maxDist = Math.max(maxDist, Math.sqrt(dr * dr + dg * dg + db * db) / Math.sqrt(3));
+    });
+    if (maxDist >= 0.12) return false;
+    state.key = { mode: 'custom', color: [Math.round(r), Math.round(g), Math.round(b)], tol: 0.3, spill: 0.7, edges: false, edgeMode: 'none' };
+    $('#keyMode').value = 'custom';
+    updateKeySwatch();
+    return true;
   }
 
   // ---------- 对齐框 ----------
@@ -223,13 +267,17 @@
     if (!state.frames.length) return;
     const fps = FS.clamp(parseFloat($('#previewFps').value) || 10, 1, 30);
     const s = state.selection.start, e = state.selection.end;
-    playPos = s;
+    const list = [];
+    for (let i = s; i <= e; i++) if (state.frames[i] && !state.frames[i].dropped) list.push(i);
+    if (!list.length) return;
+    playPos = list[0];
+    let pos = 0;
     state.playing = true;
     playTimer = setInterval(function () {
       drawCenter(state.frames[playPos]);
       highlightThumb(playPos);
-      playPos++;
-      if (playPos > e) playPos = s;
+      pos = (pos + 1) % list.length;
+      playPos = list[pos];
     }, 1000 / fps);
     $('#playBtn').textContent = '⏸ 停止预览';
   }
@@ -434,7 +482,8 @@
     const r = await FS.exportSpritesheet(loops, state.bbox, state.exportScale, state.maxWidth, state.compress);
     FS.downloadBlob(r.pngBlob, state.charId + '_sheet.png');
     FS.downloadBlob(FS.makeTextBlob(r.metaText), state.charId + '_sheet_meta.json');
-    status('已导出精灵图集 ' + r.width + '×' + r.height + ' ' + FS.formatBytes(r.pngBlob.size) + '(PNG+描述文件)。');
+    status('已导出精灵图集 ' + r.width + '×' + r.height + ' ' + FS.formatBytes(r.pngBlob.size) + '(PNG+描述文件)。'
+      + (r.overBudget ? ' ⚠ 图集超出 16384 上限,建议调低导出缩放。' : ''));
   }
 
   async function exportFramesZip() {
@@ -446,16 +495,43 @@
 
   async function exportSpineZip() {
     const loops = exportLoops();
-    const r = await FS.exportSpine(state.charId, loops, state.bbox, state.exportScale, state.maxWidth, state.compress);
-    const zip = await FS.exportSpineZip(r, state.charId);
-    FS.downloadBlob(zip, state.charId + '_spine.zip');
-    status('已导出 Spine 三件套 ZIP ' + FS.formatBytes(zip.size) + ':' + state.charId + '.json / .atlas.txt / .png + meta.json(图集 ' + FS.formatBytes(r.pngBlob.size) + ')。');
+    try {
+      const r = await FS.exportSpine(state.charId, loops, state.bbox, state.exportScale, state.maxWidth, state.compress, {
+        dedupe: state.dedupe.frames,
+        perceptual: state.dedupe.perceptual,
+        phashThr: state.dedupe.phashThr,
+      });
+      const zip = await FS.exportSpineZip(r, state.charId);
+      FS.downloadBlob(zip, state.charId + '_spine.zip');
+      const s = r.stats;
+      const dedupMsg = s.dedupe
+        ? '去重 ' + s.totalFrames + '→' + s.uniqueFrames + ' 帧(精确 ' + s.exactMerged + (s.perceptualMerged ? ',近似 ' + s.perceptualMerged : '') + ')'
+        : '未去重';
+      status('已导出 Spine 三件套 ZIP ' + FS.formatBytes(zip.size) + ':' + state.charId + '.json / .atlas.txt / .png(图集 ' + FS.formatBytes(r.pngBlob.size) + ',' + dedupMsg + ')'
+        + (r.overBudget ? ' ⚠ 图集超出 16384 上限,建议调低导出缩放。' : '。'));
+    } catch (e) {
+      status('导出失败:' + e.message, true);
+    }
   }
 
   // ---------- 生视频(桥接 miniapp-kit anim/gen.mjs) ----------
+  const gen = { refDataUrl: null, refName: '', busy: false, batchStop: false };
 
-  // ---------- 生视频(桥接 miniapp-kit anim/gen.mjs) ----------
-  const gen = { refDataUrl: null, refName: '', jobId: null, pollTimer: null, busy: false };
+  // 战斗五件套提示词模板:只写运动(图管长相,词管动作);
+  // idle/attack/hit/ult 统一「起手收手=自然站姿」→ 跨动作首尾帧接近,导出可去重复用;
+  // move 用原地循环跑(pingpong 会倒放,跑步循环用 raw)
+  const battleTemplates = [
+    { key: 'idle', label: '待机 idle', loop: 'pingpong',
+      prompt: '角色保持自然站姿,轻轻呼吸,肩膀微微起伏,头部与尾巴小幅摆动,起始帧和结束帧都是同一个自然站姿' },
+    { key: 'attack', label: '普通攻击 attack', loop: 'off',
+      prompt: '角色从自然站姿发力,快速挥出一记近战挥砍,干净利落只出一招,收招后回到与起始相同的自然站姿' },
+    { key: 'hit', label: '受击 hit', loop: 'off',
+      prompt: '角色保持自然站姿时突然被正面击中,上半身后仰、踉跄半步,随后重新站稳回到自然站姿' },
+    { key: 'move', label: '移动 move', loop: 'raw',
+      prompt: '角色原地跑步,前后摆臂,步伐均匀有力,起点和终点姿态一致,可无缝循环' },
+    { key: 'ult', label: '大招 ult', loop: 'off',
+      prompt: '角色从自然站姿下蹲蓄力,然后爆发释放大招,动作大开大合,最后收势回到自然站姿' },
+  ];
 
   function genRefFile(file) {
     if (!file) return;
@@ -487,10 +563,12 @@
   async function genApi(payload) {
     const resp = await fetch('/api/gen/start', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...gateAuth() },
       body: JSON.stringify(payload),
     });
-    return resp.json();
+    const data = await resp.json();
+    if (!data.ok && GATE_ERRORS[data.error]) data.error = GATE_ERRORS[data.error];
+    return data;
   }
 
   function genLogShow(text) {
@@ -502,6 +580,7 @@
 
   async function genDryRun() {
     if (gen.busy) return;
+    if (!gateGuard('生视频')) return;
     if (!gen.refDataUrl) { status('生视频:请先选择首帧图。', true); return; }
     if (!$('#genPrompt').value.trim()) { status('生视频:请填写运动提示词。', true); return; }
     gen.busy = true;
@@ -518,35 +597,36 @@
     }
   }
 
-  function genPoll() {
-    if (!gen.jobId) return;
-    fetch('/api/gen/status?job=' + gen.jobId)
-      .then(function (r) { return r.json(); })
-      .then(function (r) {
-        if (!r.ok) { status('生视频任务查询失败:' + r.error, true); stopGenPoll(); return; }
-        genLogShow('已运行 ' + r.elapsedSec + 's(' + Math.round(r.elapsedSec / 60 * 10) / 10 + ' 分钟)\n' + r.tail);
-        if (r.state === 'done') {
-          stopGenPoll();
-          renderGenResults(r);
-          status('生视频完成:' + (r.videos || []).join(', ') + (r.winner ? ' | $' + (+r.winner.cost).toFixed(2) + ' 循环PSNR ' + r.winner.finalLoopPsnr + 'dB' : ''));
-        } else if (r.state === 'error') {
-          stopGenPoll();
-          status('生视频失败,详见日志。', true);
-        }
-      })
-      .catch(function () { /* 网络抖动,下轮重试 */ });
+  // 轮询生成任务直到 done;网络抖动自动重试,连续失败 10 次才报错
+  async function pollJob(jobId, onTick) {
+    let fails = 0;
+    for (;;) {
+      await FS.sleep(3000);
+      let s = null;
+      try {
+        s = await (await fetch('/api/gen/status?job=' + jobId, { headers: gateAuth() })).json();
+      } catch (e) { /* 网络抖动,下轮重试 */ }
+      if (!s || !s.ok) {
+        if (++fails >= 10) throw new Error((s && (GATE_ERRORS[s.error] || s.error)) || '任务状态查询连续失败');
+        continue;
+      }
+      fails = 0;
+      if (onTick) onTick(s);
+      if (s.state === 'done') return s;
+      if (s.state === 'error') throw new Error('生成失败,详见日志');
+    }
   }
 
-  function stopGenPoll() {
-    if (gen.pollTimer) clearInterval(gen.pollTimer);
-    gen.pollTimer = null;
-    $('#genStartBtn').disabled = false;
-  }
-
-  function renderGenResults(r) {
+  // 结果行(可累加,批量模式每个动作一行);label 传动作名/null
+  function renderResultRow(label, jobId, videos, winner) {
     const box = $('#genResults');
-    box.innerHTML = '';
-    (r.videos || []).forEach(function (name) {
+    if (label) {
+      const head = document.createElement('div');
+      head.className = 'row';
+      head.textContent = '【' + label + '】' + (winner && winner.cost != null ? '($' + (+winner.cost).toFixed(2) + ')' : '');
+      box.appendChild(head);
+    }
+    (videos || []).forEach(function (name) {
       const row = document.createElement('div');
       row.className = 'row';
       const info = document.createElement('span');
@@ -558,7 +638,7 @@
         setBusy(true);
         try {
           status('正在下载生成视频…');
-          const resp = await fetch('/api/gen/video?job=' + gen.jobId + '&video=' + encodeURIComponent(name));
+          const resp = await fetch('/api/gen/video?job=' + jobId + '&video=' + encodeURIComponent(name), { headers: gateAuth() });
           if (!resp.ok) throw new Error('下载失败 HTTP ' + resp.status);
           await importFile(await resp.blob());
         } catch (e) {
@@ -574,25 +654,75 @@
   }
 
   async function genStart() {
-    if (gen.busy || gen.pollTimer) return;
+    if (gen.busy) return;
+    if (!gateGuard('生视频')) return;
     if (!gen.refDataUrl) { status('生视频:请先选择首帧图。', true); return; }
     if (!$('#genPrompt').value.trim()) { status('生视频:请填写运动提示词。', true); return; }
     gen.busy = true;
     $('#genStartBtn').disabled = true;
+    $('#genBatchBtn').disabled = true;
     genLogShow('提交生成任务…');
+    const payload = genPayload(false);
     try {
-      const r = await genApi(genPayload(false));
+      const r = await genApi(payload);
       if (!r.ok) throw new Error(r.error || '未知错误');
-      gen.jobId = r.jobId;
-      status('生成任务已提交(' + gen.jobId + '),约 5 分钟/条,期间可继续手动流程。');
-      gen.pollTimer = setInterval(genPoll, 3000);
-      genPoll();
+      status('生成任务已提交(' + r.jobId + '),约 5 分钟/条,期间可继续手动流程。');
+      const done = await pollJob(r.jobId, function (s) {
+        genLogShow('已运行 ' + s.elapsedSec + 's(' + Math.round(s.elapsedSec / 60 * 10) / 10 + ' 分钟)\n' + s.tail);
+      });
+      renderResultRow(payload.name, r.jobId, done.videos, done.winner);
+      status('生视频完成:' + (done.videos || []).join(', ') + (done.winner ? ' | $' + (+done.winner.cost).toFixed(2) + ' 循环PSNR ' + done.winner.finalLoopPsnr + 'dB' : ''));
     } catch (e) {
-      status('生视频提交失败:' + e.message, true);
-      genLogShow('提交失败:' + e.message);
-      $('#genStartBtn').disabled = false;
+      status('生视频失败:' + e.message, true);
+      genLogShow('失败:' + e.message);
     } finally {
       gen.busy = false;
+      $('#genStartBtn').disabled = false;
+      $('#genBatchBtn').disabled = false;
+    }
+  }
+
+  // 一键生成战斗五件套:五条动作视频按顺序提交(串行,避免并发挤兑 API),
+  // 单条失败跳过继续;完成后逐条在结果区给「→ 导入拆帧流程」入口
+  async function genBatch() {
+    if (gen.busy) return;
+    if (!gateGuard('一键生成')) return;
+    if (!gen.refDataUrl) { status('一键生成:请先选择首帧图(角色定稿图)。', true); return; }
+    gen.busy = true;
+    gen.batchStop = false;
+    $('#genStartBtn').disabled = true;
+    const batchBtn = $('#genBatchBtn');
+    batchBtn.textContent = '⏹ 停止批量(当前条完成后停)';
+    genLogShow('=== 一键生成战斗五件套:约 ' + battleTemplates.length * 5 + ' 分钟 ===');
+    const t0 = Date.now();
+    try {
+      for (const t of battleTemplates) {
+        if (gen.batchStop) { genLogShow('[批量] 已停止,未开始的动作不再提交。'); break; }
+        const payload = genPayload(false);
+        payload.prompt = t.prompt;
+        payload.loop = t.loop;
+        payload.name = state.charId + '_' + t.key;
+        genLogShow('[' + t.label + '] 提交…');
+        try {
+          const r = await genApi(payload);
+          if (!r.ok) throw new Error(r.error || '未知错误');
+          const done = await pollJob(r.jobId, function (s) {
+            genLogShow('[' + t.label + '] 已运行 ' + Math.round(s.elapsedSec / 60 * 10) / 10 + ' 分钟\n' + s.tail);
+          });
+          renderResultRow(t.label, r.jobId, done.videos, done.winner);
+          genLogShow('[' + t.label + '] 完成:' + (done.videos || []).join(', '));
+          status('一键生成:『' + t.label + '』完成,累计 ' + Math.round((Date.now() - t0) / 60000) + ' 分钟。');
+        } catch (e) {
+          genLogShow('[' + t.label + '] 失败:' + e.message + '(跳过,继续下一个)');
+          status('一键生成:『' + t.label + '』失败已跳过。', true);
+        }
+      }
+    } finally {
+      gen.busy = false;
+      gen.batchStop = false;
+      $('#genStartBtn').disabled = false;
+      batchBtn.textContent = '⚔ 一键生成战斗五件套';
+      genLogShow('=== 批量结束,总耗时 ' + Math.round((Date.now() - t0) / 60000) + ' 分钟;逐条「→ 导入拆帧流程」并添加动画 ===');
     }
   }
 
@@ -632,8 +762,10 @@
       if (e.target.files[0]) importImageSlices(e.target.files[0]);
       e.target.value = '';
     });
-    $('#quantColors').addEventListener('change', function () { state.compress.colors = parseInt($('#quantColors').value) || 0; });
-    $('#quantDither').addEventListener('change', function () { state.compress.dither = $('#quantDither').checked; });
+    $('#pngCompress').addEventListener('change', function () { state.compress.mode = $('#pngCompress').value; });
+    $('#dedupeFrames').addEventListener('change', function () { state.dedupe.frames = $('#dedupeFrames').checked; });
+    $('#dedupePerceptual').addEventListener('change', function () { state.dedupe.perceptual = $('#dedupePerceptual').checked; });
+    $('#dedupePhashThr').addEventListener('change', function () { state.dedupe.phashThr = FS.clamp(parseInt($('#dedupePhashThr').value) || 0, 0, 20); });
     $('#wandTol').addEventListener('input', function () { state.brush.tol = parseFloat($('#wandTol').value); $('#wandTolVal').textContent = state.brush.tol.toFixed(2); });
     $('#charId').addEventListener('change', function () { state.charId = FS.sanitizeName($('#charId').value, 'hero_v01'); $('#charId').value = state.charId; });
     $('#detectBtn').addEventListener('click', detectLoops);
@@ -672,6 +804,17 @@
     });
     $('#genDryBtn').addEventListener('click', genDryRun);
     $('#genStartBtn').addEventListener('click', genStart);
+    $('#genBatchBtn').addEventListener('click', function () {
+      if (gen.busy) { gen.batchStop = true; status('将在当前条完成后停止批量,未开始的动作不再提交。'); return; }
+      genBatch();
+    });
+    $('#genTemplate').addEventListener('change', function () {
+      const t = battleTemplates.find(function (x) { return x.key === $('#genTemplate').value; });
+      if (!t) return;
+      $('#genPrompt').value = t.prompt;
+      $('#genLoop').value = t.loop;
+      status('已填入「' + t.label + '」运动提示词,可再手改;循环模式已设为 ' + t.loop + '。');
+    });
     bindBrush();
     updateKeySwatch();
     drawCenter();

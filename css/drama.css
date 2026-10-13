@@ -1,0 +1,135 @@
+/* 短剧工作台(drama.js 配套;复用设计系统变量与 gen.css 布局) */
+
+.f-label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 12px; color: var(--text-2);
+  margin-top: 8px;
+}
+.f-label input, .f-label textarea, .f-label select {
+  font-size: 12.5px; padding: 6px 8px;
+}
+
+/* ---------- 角色行 ---------- */
+.char {
+  display: flex; gap: 10px; align-items: flex-start;
+  border: 1px solid var(--line); border-radius: var(--radius-s);
+  padding: 10px; margin-bottom: 8px;
+  background: rgba(255, 255, 255, .02);
+}
+.char-face {
+  width: 56px; height: 74px; object-fit: cover;
+  border-radius: 6px; border: 1px solid var(--line-strong);
+  flex: none; cursor: zoom-in;
+}
+.char-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.char-main input, .char-main textarea { font-size: 12px; padding: 5px 8px; width: 100%; }
+.char-ops { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.char-ops .btn { font-size: 11.5px; padding: 3px 10px; margin: 0; }
+.char-status { font-size: 11px; color: var(--text-3); min-height: 14px; }
+.char-status.err { color: var(--danger); }
+
+/* ---------- 镜头卡 ---------- */
+.shot {
+  border: 1px solid var(--line); border-radius: var(--radius-s);
+  padding: 12px 14px; margin-bottom: 12px;
+  background: rgba(255, 255, 255, .02);
+}
+.shot-head { display: flex; gap: 8px; align-items: center; }
+.shot-head .idx { font-weight: 700; color: var(--accent); font-size: 12.5px; flex: none; }
+.shot-head .scene { flex: 1; min-width: 0; font-size: 12px; padding: 4px 8px; }
+.shot-head .st { flex: none; font-size: 11px; color: var(--text-3); }
+.shot-head .st.busy { color: var(--accent); }
+.shot .f-label { margin-top: 8px; }
+.shot-ops { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+.shot-ops .btn { font-size: 11.5px; padding: 3px 10px; margin: 0; }
+.shot-ops select { font-size: 11.5px; padding: 3px 6px; }
+.shot-media { display: flex; gap: 12px; margin-top: 10px; align-items: flex-start; flex-wrap: wrap; }
+.shot-media img.frame {
+  width: 110px; border-radius: 8px; display: block;
+  border: 1px solid var(--line-strong); cursor: zoom-in;
+}
+.shot-media video {
+  flex: 1; min-width: 200px; max-width: 420px; width: 100%;
+  border-radius: 8px; border: 1px solid var(--line); background: #000;
+}
+.shot-status { font-size: 11px; margin-top: 6px; color: var(--text-3); min-height: 14px; }
+.shot-status.err { color: var(--danger); }
+
+/* ---------- 成片 / 连播 ---------- */
+#composedBox video { width: 100%; border-radius: 8px; border: 1px solid var(--line); margin-top: 8px; background: #000; }
+#composedBox .download {
+  display: block; text-align: center; text-decoration: none;
+  font-size: 11.5px; color: var(--accent);
+  background: rgba(52, 211, 153, .1);
+  border-radius: 6px; padding: 5px 6px; margin-top: 6px;
+}
+#composedBox .download:hover { background: rgba(52, 211, 153, .2); }
+#playBox { width: min(480px, 92vw); }
+#playBox video { width: 100%; border-radius: 8px; background: #000; display: block; }
+#playBox .hint { margin: 8px 0 0; }
+
+/* ---------- 章节分组 ---------- */
+.chapter-head {
+  margin: 18px 0 10px;
+  font-size: 12px; font-weight: 700;
+  color: var(--accent-2);
+  border-bottom: 1px dashed var(--line-strong);
+  padding-bottom: 6px;
+}
+.chapter-head:first-child { margin-top: 0; }
+
+/* ---------- 风格快选 chips ---------- */
+.style-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.chip-btn {
+  cursor: pointer; padding: 3px 10px;
+  transition: all .12s ease;
+}
+.chip-btn:hover {
+  border-color: var(--accent); color: var(--accent);
+  background: rgba(52, 211, 153, .08);
+}
+
+/* ---------- 角色参考图缩略条 ---------- */
+.char-refs { display: flex; gap: 6px; flex-wrap: wrap; }
+.char-ref { position: relative; width: 44px; height: 44px; }
+.char-ref img {
+  width: 44px; height: 44px; object-fit: cover;
+  border-radius: 6px; border: 1px solid var(--line-strong); display: block;
+}
+.char-ref button {
+  position: absolute; top: -6px; right: -6px;
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 0; padding: 0; margin: 0; cursor: pointer;
+  background: rgba(255, 123, 107, .9); color: #fff;
+  font-size: 10px; line-height: 16px;
+}
+.char-ref.add {
+  display: flex; align-items: center; justify-content: center;
+  border: 1px dashed var(--line-strong); border-radius: 6px;
+  color: var(--text-3); font-size: 16px; cursor: pointer;
+  box-sizing: border-box; user-select: none;
+}
+.char-ref.add:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ---------- 灵感弹层 ---------- */
+.idea-box {
+  width: min(560px, 92vw); max-height: 80vh; overflow-y: auto;
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius); padding: 20px;
+}
+.idea-box h3 { margin: 0 0 12px; font-size: 15px; }
+.idea-card {
+  border: 1px solid var(--line); border-radius: var(--radius-s);
+  background: rgba(255, 255, 255, .02);
+  padding: 12px 14px; margin-bottom: 10px; cursor: pointer;
+  transition: border-color .15s ease;
+}
+.idea-card:hover { border-color: rgba(52, 211, 153, .5); }
+.idea-card b { font-size: 13.5px; }
+.idea-card p { margin: 5px 0 0; font-size: 12px; color: var(--text-2); line-height: 1.6; }
+.idea-style { display: inline-block; margin-top: 7px; font-size: 10.5px; color: var(--accent); }
+
+@media (max-width: 900px) {
+  .shot-media video { max-width: none; }
+}

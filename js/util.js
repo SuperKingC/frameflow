@@ -4,6 +4,15 @@
 
   const FS = (window.FS = window.FS || {});
 
+  // 邀请码门禁错误码 → 可读文案(页面请求带 FFGate 码,401/403 时展示)
+  FS.gateError = function (code) {
+    return {
+      invalid_invite_code: '邀请码未生效,请回首页重新验证',
+      invite_locked: '邀请码错误次数过多,今日已锁定,请明天再试',
+      upstream_unavailable: '服务端未设邀请码且当前来源非本机,已拒绝(公网部署需设 GEN_INVITE_CODE)',
+    }[code] || code;
+  };
+
   // ---------- 杂项 ----------
   FS.clamp = function (v, a, b) { return v < a ? a : v > b ? b : v; };
 

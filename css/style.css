@@ -22,6 +22,9 @@
 
 * { box-sizing: border-box; }
 
+/* hidden 属性优先于任何 display 规则(否则带 display 的面板会在 hidden 时透出) */
+[hidden] { display: none !important; }
+
 html, body { height: 100%; }
 
 body {
@@ -215,6 +218,35 @@ input[type="range"]::-webkit-slider-thumb {
   font-size: 11.5px;
   display: flex; gap: 18px; flex-wrap: wrap;
 }
+
+/* ---------- 生图工作台邀请码门禁弹窗(首页点卡片弹出,不跳页) ---------- */
+.gate-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, .62);
+  backdrop-filter: blur(4px);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 50;
+}
+.gate-dialog {
+  width: 370px;
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  padding: 28px 26px;
+  box-shadow: var(--shadow);
+}
+.gate-dialog h2 { margin: 0 0 6px; font-size: 19px; }
+.gate-dialog .hint { margin: 0 0 16px; }
+.gate-dialog .gate-input {
+  width: 100%; padding: 8px 11px; font-size: 13px; margin-bottom: 14px;
+  background: #24262d;
+  border: 1px solid var(--line-strong);
+  color: var(--text);
+  border-radius: 8px;
+}
+.gate-dialog .gate-input::placeholder { color: var(--text-3); }
+.gate-dialog .gate-input:focus { outline: none; border-color: var(--accent); }
+.gate-error { color: var(--danger); font-size: 12.5px; margin: 12px 0 0; }
 
 /* ---------- 工作页布局(共用于 Spine/压缩) ---------- */
 .page-main { flex: 1; display: flex; min-height: 0; }

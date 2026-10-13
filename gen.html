@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>生图 / 生视频 — KK工作台</title>
+<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/gen.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="backlink" href="index.html">← 工作台</a>
+  <div class="brand"><span class="logo">K</span> KK工作台 <span class="ver">v0.4</span></div>
+  <span class="pagetitle">生图 / 生视频</span>
+</header>
+
+<main class="gen-main">
+  <!-- 门禁:邀请码只存页面内存,错满 3 次/天当天锁定 -->
+  <div class="gen-gate" id="gate">
+    <h2>生图 / 生视频工作台</h2>
+    <p class="hint">内部工作台,请输入邀请码进入;一天内错误 3 次将锁定到明天。</p>
+    <input type="password" class="txt" id="gateCode" style="width:100%" autocomplete="off" placeholder="邀请码">
+    <button class="btn primary wide" id="gateGo">进入</button>
+    <p class="gate-error" id="gateError" hidden></p>
+  </div>
+
+  <div class="gen-grid" id="app" hidden>
+    <div class="gen-panel">
+      <h3>任务</h3>
+      <div class="row">
+        <label style="flex:1">模型
+          <select id="model" style="width:100%"></select>
+        </label>
+      </div>
+      <div class="label-row">
+        <label for="prompt">提示词</label>
+        <button class="btn" id="btnOptimize" type="button">✨ 优化提示词</button>
+      </div>
+      <textarea id="prompt" rows="4" placeholder="例如:一只小狗在草地上奔跑,水彩风格"></textarea>
+
+      <div class="opt-compare" id="optCompare" hidden>
+        <div class="opt-compare-head">
+          <span class="opt-title">优化对比</span>
+          <button class="btn" id="btnRestore" type="button">↩ 还原原文</button>
+          <button class="opt-close" id="optClose" type="button" title="收起对比">×</button>
+        </div>
+        <div class="opt-col">
+          <div class="opt-col-label">优化前</div>
+          <div class="opt-col-text" id="optBefore"></div>
+        </div>
+        <div class="opt-col is-after">
+          <div class="opt-col-label" id="optAfterLabel">优化后</div>
+          <div class="opt-col-text" id="optAfter"></div>
+        </div>
+      </div>
+
+      <div id="imageOptions">
+        <div class="gen-grid3">
+          <label>比例
+            <select id="aspect">
+              <option value="auto">自适应</option>
+              <option value="1:1">1:1 正方形</option>
+              <option value="16:9">16:9 横版</option>
+              <option value="9:16">9:16 竖版(手机)</option>
+              <option value="4:3">4:3 横版</option>
+              <option value="3:4">3:4 竖版</option>
+              <option value="3:2">3:2 横版(相机)</option>
+              <option value="2:3">2:3 竖版(海报)</option>
+              <option value="4:5">4:5 竖版(社交)</option>
+              <option value="5:4">5:4 横版</option>
+              <option value="21:9">21:9 超宽</option>
+            </select>
+          </label>
+          <label>尺寸
+            <select id="imageSize">
+              <option value="1K">1K(快)</option>
+              <option value="2K" selected>2K(清晰)</option>
+            </select>
+          </label>
+          <label>数量
+            <select id="count">
+              <option value="1" selected>1 张</option>
+              <option value="2">2 张</option>
+              <option value="3">3 张</option>
+              <option value="4">4 张</option>
+            </select>
+          </label>
+        </div>
+      </div>
+      <p class="hint" id="noParamHint" hidden>当前模型不接收比例/尺寸参数(仅 GPT 系生图支持),按模型默认出图;出图数量仍有效。</p>
+
+      <div id="videoOptions" hidden>
+        <div class="gen-grid2">
+          <label>参考模式
+            <select id="frameMode">
+              <option value="first" selected>首帧图生视频</option>
+              <option value="first_last">首尾帧(先起幅后落幅)</option>
+            </select>
+          </label>
+          <label>时长
+            <select id="duration">
+              <option value="5" selected>5 秒</option>
+              <option value="10">10 秒</option>
+            </select>
+          </label>
+        </div>
+        <div class="gen-grid2">
+          <label>分辨率
+            <select id="resolution">
+              <option value="" selected>自动(按上游默认)</option>
+              <option value="720p">720p</option>
+              <option value="1080p">1080p</option>
+            </select>
+          </label>
+        </div>
+        <label class="row"><input type="checkbox" id="audio"> 生成声音(配乐/音效,费用更高)</label>
+        <p class="hint">比例跟随首帧图;分辨率「自动」按上游默认(部分模型可能忽略该参数);首尾帧需 2 张参考图;10 秒费用约为 5 秒两倍。</p>
+      </div>
+
+      <h3 style="margin-top:16px">参考图</h3>
+      <div class="dropzone" id="refZone" style="padding:14px 12px">
+        <div style="font-size:13px" id="refLabel">图片模型最多 5 张;可拖入页面或粘贴截图;单张 ≤ 2MB,jpg/png/webp</div>
+      </div>
+      <input type="file" id="refInput" accept="image/jpeg,image/png,image/webp" multiple hidden>
+      <div class="gen-thumbs" id="thumbs"></div>
+
+      <button class="btn primary wide" id="btnSubmit">提交任务</button>
+      <div class="gen-status" id="submitStatus" hidden></div>
+      <div class="hint" id="quotaLine">剩余额度:—</div>
+      <div class="hint" id="limitHint">限额:每分钟 3 次提交;图片每天 100 张、视频每天 30 个。结果由服务端自动保存到硬盘,无需手动下载也不会丢;点「下载」可另存到当前设备。</div>
+    </div>
+
+    <div class="gen-stage">
+      <div class="gen-empty" id="genEmpty">暂无任务。提交后任务在后台生成,可一次挂多个。</div>
+      <div id="taskList"></div>
+    </div>
+  </div>
+</main>
+
+<div class="gen-lightbox" id="lightbox"><img id="lightboxImg" alt="预览"><video id="lightboxVideo" controls hidden></video></div>
+
+<footer class="statusbar"><span id="status">就绪。输入邀请码进入工作台。</span></footer>
+
+<script src="js/gen.js"></script>
+</body>
+</html>

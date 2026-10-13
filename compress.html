@@ -2,13 +2,13 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>图片压缩 — FrameFlow</title>
+<title>图片压缩 — KK工作台</title>
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
 <header class="topbar">
-  <a class="backlink" href="index.html">← 工具箱</a>
-  <div class="brand"><span class="logo">F</span> FrameFlow <span class="ver">v0.3</span></div>
+  <a class="backlink" href="index.html">← 工作台</a>
+  <div class="brand"><span class="logo">K</span> KK工作台 <span class="ver">v0.3</span></div>
   <span class="pagetitle">图片压缩</span>
 </header>
 
@@ -18,40 +18,15 @@
       <h3>上传</h3>
       <div class="dropzone" id="dropzone">
         <div style="font-size:15px;margin-bottom:4px">拖图片到这里,或点击选择</div>
-        <div style="font-size:11px;color:var(--text-3)">PNG / JPEG / WebP · 不上传,纯本地处理</div>
+        <div style="font-size:11px;color:var(--text-3)">PNG / JPEG / WebP · TinyPNG 在线压缩(经本机服务器代理)</div>
       </div>
       <input type="file" id="czipInput" accept="image/png,image/jpeg,image/webp" hidden>
 
-      <h3 style="margin-top:18px">无损 · 色彩不变</h3>
+      <h3 style="margin-top:18px">压缩</h3>
       <div class="row">
-        <button id="btnTinypng" class="btn wide">TinyPNG 在线压缩</button>
+        <button id="btnTinypng" class="btn primary wide">TinyPNG 在线压缩</button>
       </div>
       <div class="hint">智能压缩,视觉无差;走本机服务器代理,key 在 miniapp-kit/.env,不进浏览器。免费额度 500 张/月。</div>
-      <div class="row">
-        <button id="btnLossless" class="btn wide">本地无损重压 PNG</button>
-      </div>
-      <div class="hint">重写 PNG 编码,像素 100% 不变;收益取决于原图(已高度优化的图可能变大小)。</div>
-
-      <h3 style="margin-top:18px">有损 · 会改变色彩</h3>
-      <div class="row">
-        <label>量化色数
-          <select id="czipColors">
-            <option value="0" selected>不量化(色彩不变)</option>
-            <option value="256">256 色</option>
-            <option value="128">128 色</option>
-            <option value="64">64 色</option>
-          </select>
-        </label>
-        <label><input id="czipDither" type="checkbox"> 抖动</label>
-      </div>
-      <div class="row">
-        <button id="btnQuant" class="btn wide">量化压缩 PNG</button>
-      </div>
-      <div class="row inline">
-        <label>WebP质量 <input id="czipWebpQ" type="number" value="85" min="10" max="100" class="num"></label>
-        <button id="btnWebp" class="btn">转 WebP</button>
-      </div>
-      <div class="hint">量化只压 RGB、保留 alpha 渐变;抖动适合渐变图,纯色图慎用。WebP 适合通用素材,Spine 图集请仍用 PNG。</div>
     </div>
 
     <div class="czip-stage">
@@ -74,9 +49,21 @@
   </div>
 </main>
 
-<footer class="statusbar"><span id="status">把图片拖进左侧区域开始。默认提供色彩不变的无损压缩。</span></footer>
+<footer class="statusbar"><span id="status">把图片拖进左侧区域开始,TinyPNG 在线压缩、色彩不变。</span></footer>
+
+<!-- 页内门禁兜底:绕过首页直开本页也需邀请码;与生图/生视频同一把码,验证过则静默直进 -->
+<div class="gate-overlay" id="gateOverlay">
+  <div class="gate-dialog" role="dialog" aria-modal="true">
+    <h2>图片压缩</h2>
+    <p class="hint">内部工作台,请输入邀请码进入;一天内错误 3 次将锁定到明天。</p>
+    <input type="password" class="gate-input" id="gateCode" autocomplete="off" placeholder="邀请码">
+    <button class="btn primary wide" id="gateGo">进入</button>
+    <p class="gate-error" id="gateError" hidden></p>
+  </div>
+</div>
 
 <script src="js/util.js"></script>
+<script src="js/gate.js"></script>
 <script src="js/compress.js"></script>
 </body>
 </html>

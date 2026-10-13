@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>帧复用导出测试 — frame-reuse</title>
+<style>
+  body { font: 13px/1.5 Consolas, monospace; background: #1e1e1e; color: #ddd; padding: 16px; }
+  .pass { color: #7ec97e; }
+  .fail { color: #e06060; font-weight: bold; }
+  canvas { image-rendering: pixelated; border: 1px solid #555; margin: 4px; background:
+    repeating-conic-gradient(#333 0% 25%, #444 0% 50%) 0 0/16px 16px; }
+  h4 { margin: 12px 0 4px; }
+</style>
+</head>
+<body>
+<h3>Spine 导出:紧包围盒 + 跨动画去重 自动化测试</h3>
+<pre id="out">运行中…</pre>
+<h4>图集预览(去重+精确)</h4>
+<div id="preview"></div>
+<h4>回放合成校验(用图集+附件偏移重组帧)</h4>
+<div id="compose"></div>
+
+<script src="../js/util.js"></script>
+<script src="../js/pipeline.js"></script>
+<script src="../js/exporter.js"></script>
+<script>
+(function () {
+  'use strict';
+  const out = [];
+  let pass = 0, fail = 0;
+  function assert(name, cond, detail) {
+    if (cond) { pass++; out.push('PASS  ' + name); }
+    else { fail++; out.push('FAIL  ' + name + (detail !== undefined ? '  → ' + JSON.stringify(detail) : '')); }
+  }
+  function approx(a, b, eps) { return Math.abs(a - b) <= (eps === undefined ? 0.51 : eps); }
+
+  // ---- 构造测试帧:200×160,实心矩形(无抗锯齿,包围盒精确可预期) ----
+  const RED = '#e02020', BLUE = '#2060e0', YEL = '#e0c020';
+  function frame(draw) {
+    const c = document.createElement('canvas');
+    c.width = 200; c.height = 160;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    draw(ctx);
+    return { orig: c, proc: c, strokes: [], dropped: false, hash: null };
+  }
+  function base(ctx) { ctx.fillStyle = RED; ctx.fillRect(70, 50, 61, 61); }
+
+  // 共 7 帧。idle: f00=A, f01=A 的逐像素复制, f02=整体上移2px(位置不同,不精确合并),
+  // f03=A+4×4黄块(字节不同→仅感知合并)。
+  // hit:  f00=A 的复制(跨动画合并), f01=A+蓝块(更大包围盒), f02=整体左移40px(纯位移,禁止合并)。
+  const idle = { name: 'idle', fps: 10, loop: true, frames: [
+    frame(base),
+    frame(base),
+    frame(function (ctx) { ctx.fillStyle = RED; ctx.fillRect(70, 48, 61, 61); }),
+    frame(function (ctx) { base(ctx); ctx.fillStyle = YEL; ctx.fillRect(120, 70, 4, 4); }),
+  ]};
+  const hit = { name: 'hit', fps: 12, loop: false, frames: [
+    frame(base),
+    frame(function (ctx) { base(ctx); ctx.fillStyle = BLUE; ctx.fillRect(125, 45, 31, 31); }),
+    frame(function (ctx) { ctx.fillStyle = RED; ctx.fillRect(30, 50, 61, 61); }),
+  ]};
+
+  // 期望几何:G={30,45,126,66}, 锚点 cx=93, bottom=111, W=126, H=66
+  // 附件(中心偏移): idle_f00 {7.5,30.5,62,62} idle_f02 {7.5,32.5,62,62} idle_f03 {7.5,30.5,62,62}
+  //                 hit_f01 {20,33,86,66}          hit_f02 {−32.5,30.5,62,62}
+  function parseAtlas(text) {
+    const lines = text.split('\n');
+    const size = lines[1].slice(5).split(',').map(Number);
+    const regions = {};
+    for (let i = 5; i < lines.length - 1; i += 2) {
+      if (!lines[i]) continue;
+      const b = lines[i + 1].slice(7).split(',').map(Number);
+      regions[lines[i]] = { x: b[0], y: b[1], w: b[2], h: b[3] };
+    }
+    return { w: size[0], h: size[1], regions: regions };
+  }
+  function attOf(json, name) { return json.skins[0].attachments.body[name]; }
+  function attNames(json) { return Object.keys(json.skins[0].attachments.body).sort(); }
+  function timeline(json, anim) { return json.animations[anim].slots.body.attachment; }
+
+  async function main() {
+    const none = { mode: 'none' };
+
+    // ---------- 运行1:去重开,感知关 ----------
+    const r1 = await FS.exportSpine('t', [idle, hit], null, 1, 16384, none, { dedupe: true, perceptual: false });
+    const j1 = JSON.parse(r1.jsonText);
+    const s1 = r1.stats;
+    assert('R1 stats.totalFrames=7', s1.totalFrames === 7, s1);
+    assert('R1 stats.uniqueFrames=5', s1.uniqueFrames === 5, s1);
+    assert('R1 stats.exactMerged=2', s1.exactMerged === 2, s1);
+    assert('R1 骨架 126×66', j1.skeleton.width === 126 && j1.skeleton.height === 66, j1.skeleton);
+    assert('R1 附件只有5个规范名', JSON.stringify(attNames(j1)) ===
+      JSON.stringify(['hit_f01', 'hit_f02', 'idle_f00', 'idle_f02', 'idle_f03']), attNames(j1));
+    assert('R1 重复帧不占附件', !attOf(j1, 'idle_f01') && !attOf(j1, 'hit_f00'));
+    const a = attOf(j1, 'idle_f00'), b = attOf(j1, 'idle_f02'), c = attOf(j1, 'idle_f03'),
+          d = attOf(j1, 'hit_f01'), e = attOf(j1, 'hit_f02');
+    assert('R1 idle_f00 偏移 {7.5,30.5,62,62}', a && approx(a.x, 7.5, 0.001) && approx(a.y, 30.5, 0.001) && a.width === 62 && a.height === 62, a);
+    assert('R1 idle_f02 偏移 {7.5,32.5,62,62}', b && approx(b.x, 7.5, 0.001) && approx(b.y, 32.5, 0.001) && b.width === 62 && b.height === 62, b);
+    assert('R1 idle_f03 偏移 {7.5,30.5,62,62}', c && approx(c.x, 7.5, 0.001) && approx(c.y, 30.5, 0.001), c);
+    assert('R1 hit_f01 偏移 {20,33,86,66}', d && approx(d.x, 20, 0.001) && approx(d.y, 33, 0.001) && d.width === 86 && d.height === 66, d);
+    assert('R1 hit_f02 偏移 {−32.5,30.5,62,62}', e && approx(e.x, -32.5, 0.001) && approx(e.y, 30.5, 0.001), e);
+    assert('R1 idle 时间线跨动画引用', JSON.stringify(timeline(j1, 'idle').map(function (k) { return k.name; })) ===
+      JSON.stringify(['idle_f00', 'idle_f00', 'idle_f02', 'idle_f03']), timeline(j1, 'idle'));
+    assert('R1 idle 时间点', timeline(j1, 'idle').every(function (k, i) { return approx(k.time, i / 10, 0.0001); }));
+    assert('R1 hit 时间线引用 idle_f00', JSON.stringify(timeline(j1, 'hit').map(function (k) { return k.name; })) ===
+      JSON.stringify(['idle_f00', 'hit_f01', 'hit_f02']), timeline(j1, 'hit'));
+    assert('R1 默认附件=首帧规范名', j1.slots[0].attachment === 'idle_f00', j1.slots[0]);
+
+    const at1 = parseAtlas(r1.atlasText);
+    const regs1 = Object.keys(at1.regions);
+    assert('R1 atlas 5个区域', regs1.length === 5, regs1);
+    assert('R1 区域都在页内', regs1.every(function (n) {
+      const g = at1.regions[n];
+      return g.x >= 0 && g.y >= 0 && g.x + g.w <= at1.w && g.y + g.h <= at1.h;
+    }), at1);
+    const m1 = JSON.parse(r1.metaText);
+    assert('R1 meta.frameMap(idle)', JSON.stringify(m1.animations[0].frameMap) ===
+      JSON.stringify(['idle_f00', 'idle_f00', 'idle_f02', 'idle_f03']), m1.animations[0].frameMap);
+    assert('R1 meta.bbox=联合包围盒', m1.bbox.x === 30 && m1.bbox.y === 45 && m1.bbox.w === 126 && m1.bbox.h === 66, m1.bbox);
+
+    // ---------- 运行2:感知合并开 ----------
+    const r2 = await FS.exportSpine('t', [idle, hit], null, 1, 16384, none, { dedupe: true, perceptual: true, phashThr: 8 });
+    const j2 = JSON.parse(r2.jsonText);
+    assert('R2 uniqueFrames=3(上移2px与黄块帧都并入idle_f00)', r2.stats.uniqueFrames === 3, r2.stats);
+    assert('R2 perceptualMerged=2', r2.stats.perceptualMerged === 2, r2.stats);
+    assert('R2 idle 时间线全部指向 idle_f00', JSON.stringify(timeline(j2, 'idle').map(function (k) { return k.name; })) ===
+      JSON.stringify(['idle_f00', 'idle_f00', 'idle_f00', 'idle_f00']), timeline(j2, 'idle'));
+    assert('R2 纯位移帧 hit_f02 不被合并', timeline(j2, 'hit').map(function (k) { return k.name; }).join() === 'idle_f00,hit_f01,hit_f02', timeline(j2, 'hit'));
+    assert('R2 附件3个', attNames(j2).length === 3, attNames(j2));
+
+    // ---------- 运行3:去重关(行为对齐旧版,但保留紧包围盒偏移) ----------
+    const r3 = await FS.exportSpine('t', [idle, hit], null, 1, 16384, none, { dedupe: false });
+    const j3 = JSON.parse(r3.jsonText);
+    assert('R3 uniqueFrames=7', r3.stats.uniqueFrames === 7, r3.stats);
+    assert('R3 每帧独立附件', attNames(j3).length === 7 && !!attOf(j3, 'idle_f01') && !!attOf(j3, 'hit_f00'), attNames(j3));
+    assert('R3 附件仍带偏移', approx(attOf(j3, 'hit_f02').x, -32.5, 0.001), attOf(j3, 'hit_f02'));
+
+    // ---------- 回放合成:图集区域 + 附件偏移 还原画面,采样颜色 ----------
+    const bmp = await createImageBitmap(r1.pngBlob);
+    function compose(att, regionName) {
+      const cv = document.createElement('canvas');
+      cv.width = 126; cv.height = 66;
+      const ctx = cv.getContext('2d', { willReadFrequently: true });
+      const g = at1.regions[regionName];
+      // dest 中心 = 锚点(compose 坐标 63,66)+ att 偏移;Spine y 向上
+      const dx = 63 + att.x - att.width / 2;
+      const dy = 66 - att.y - att.height / 2;
+      ctx.drawImage(bmp, g.x, g.y, g.w, g.h, dx, dy, att.width, att.height);
+      return cv;
+    }
+    const cvHit = compose(attOf(j1, 'hit_f01'), 'hit_f01');
+    const cvIdle = compose(attOf(j1, 'idle_f00'), 'idle_f00');
+    document.getElementById('compose').appendChild(cvHit);
+    document.getElementById('compose').appendChild(cvIdle);
+    function px(ctx, x, y) { return ctx.getImageData(x, y, 1, 1).data; }
+    const ctxHit = cvHit.getContext('2d');
+    const isRed = function (p) { return p[0] > 150 && p[1] < 90 && p[2] < 90 && p[3] > 200; };
+    const isBlue = function (p) { return p[2] > 150 && p[0] < 90 && p[3] > 200; };
+    assert('回放 hit_f01 蓝块位置正确', isBlue(px(ctxHit, 110, 15)), Array.from(px(ctxHit, 110, 15)));
+    assert('回放 hit_f01 红块位置正确', isRed(px(ctxHit, 70, 30)), Array.from(px(ctxHit, 70, 30)));
+    assert('回放 hit_f01 角落透明', px(ctxHit, 5, 5)[3] === 0, Array.from(px(ctxHit, 5, 5)));
+    assert('回放 idle_f00 中心红色', isRed(px(cvIdle.getContext('2d'), 70, 35)), Array.from(px(cvIdle.getContext('2d'), 70, 35)));
+
+    // ---------- 图集预览 ----------
+    const pv = document.createElement('canvas');
+    pv.width = at1.w; pv.height = at1.h;
+    pv.getContext('2d').drawImage(bmp, 0, 0);
+    pv.style.width = Math.min(at1.w * 2, 480) + 'px';
+    document.getElementById('preview').appendChild(pv);
+    out.push('图集 ' + at1.w + '×' + at1.h + ' px(旧式全包围盒 7 帧需约 ' + (126 * 66 * 7) + ' px²,现约 ' + at1.w * at1.h + ' px²)');
+
+    out.push('——');
+    out.push('结果: ' + pass + ' 通过, ' + fail + ' 失败');
+    document.getElementById('out').textContent = out.join('\n');
+    document.title = fail ? ('FAILED ' + fail) : 'PASSED';
+    window.TEST_RESULTS = { pass: pass, fail: fail, lines: out };
+  }
+  main().catch(function (err) {
+    out.push('FATAL ' + (err && err.stack || err));
+    document.getElementById('out').textContent = out.join('\n');
+    document.title = 'FATAL';
+    window.TEST_RESULTS = { pass: pass, fail: 999, lines: out, error: String(err) };
+  });
+})();
+</script>
+</body>
+</html>

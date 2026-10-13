@@ -140,7 +140,7 @@
       }
       const resp = await fetch('/api/sam/segment', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', authorization: 'Bearer ' + ((window.FFGate && FFGate.code) || '') },
         body: JSON.stringify({
           image: 'data:image/png;base64,' + imageB64,
           points: st.points.map(function (p) { return [p.x, p.y]; }),
@@ -148,7 +148,7 @@
         }),
       });
       const r = await resp.json();
-      if (!r.ok) throw new Error(r.error || 'HTTP ' + resp.status);
+      if (!r.ok) throw new Error(r.error ? FS.gateError(r.error) : 'HTTP ' + resp.status);
       // mask_b64 → 单通道数据
       const maskImg = new Image();
       await new Promise(function (resolve, reject) {

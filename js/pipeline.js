@@ -143,6 +143,17 @@
     replayStrokes(frame);
   };
 
+  // ---------- 模型抠图基底(服务端 BEN2 返回的 RGBA) ----------
+  // frame.model 为整幅 RGBA 画布,与键色基底互为替代;切换基底后画笔重放仍然正确:
+  // erase 清 alpha、restore 取原图、wand 按处理图颜色泛洪,都不依赖基底怎么来的
+  FS.applyModel = function (frame) {
+    if (!frame.model) return;
+    const out = frame.proc.getContext('2d', { willReadFrequently: true });
+    out.clearRect(0, 0, frame.proc.width, frame.proc.height);
+    out.drawImage(frame.model, 0, 0);
+    replayStrokes(frame);
+  };
+
   // ---------- 画笔修擦 ----------
   // stroke: {mode:'erase'|'restore'|'wand', r:半径(px), tol:魔棒容差, pts:[[x,y],...]}
   // erase: 处理图 alpha 清 0;restore: 从原图复制像素;wand: 从点击点泛洪清除同色连通区
@@ -320,41 +331,58 @@
 
   FS.replayAllStrokes = function (frame) { replayStrokes(frame); };
 
+  // ---------- 内容包围盒 ----------
+  // 单帧内容包围盒(alpha>8,与 computeUnionBBox 同阈值);无内容返回 null
+  FS.contentBBoxOf = function (canvas) {
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const w = canvas.width, h = canvas.height;
+    const d = ctx.getImageData(0, 0, w, h).data;
+    let minX = w, minY = h, maxX = -1, maxY = -1;
+    for (let y = 0; y < h; y++) {
+      const row = y * w;
+      for (let x = 0; x < w; x++) {
+        if (d[(row + x) * 4 + 3] > 8) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX < 0) return null;
+    return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+  };
+
   // ---------- 对齐框(所有保留帧内容的联合包围盒) ----------
   FS.computeUnionBBox = function (frames) {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     frames.forEach(function (f) {
       if (f.dropped) return;
-      const ctx = f.proc.getContext('2d', { willReadFrequently: true });
-      const w = f.proc.width, h = f.proc.height;
-      const d = ctx.getImageData(0, 0, w, h).data;
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-          if (d[(y * w + x) * 4 + 3] > 8) {
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-          }
-        }
-      }
+      const b = FS.contentBBoxOf(f.proc);
+      if (!b) return;
+      if (b.x < minX) minX = b.x;
+      if (b.y < minY) minY = b.y;
+      if (b.x + b.w - 1 > maxX) maxX = b.x + b.w - 1;
+      if (b.y + b.h - 1 > maxY) maxY = b.y + b.h - 1;
     });
     if (maxX < 0) return null;
     return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
   };
 
   // ---------- 循环检测 ----------
+  // 只在未剔除的帧上找循环;start/end 报告原始帧号,添加选段时会自动跳过剔除帧。
   // 基于 16x16 亮度感知哈希:找 d(start, start+len) 小的片段,优先平滑段
   FS.detectLoops = function (frames) {
-    const n = frames.length;
+    const kept = frames.filter(function (f) { return !f.dropped; });
+    const n = kept.length;
     if (n < 6) return [];
-    const hashes = frames.map(function (f) { return FS.phashOfCanvas(f.proc); });
+    const hashes = kept.map(function (f) { return FS.phashOfCanvas(f.proc); });
     const results = [];
     const minLen = 4, maxLen = Math.min(60, n - 1);
     for (let len = minLen; len <= maxLen; len++) {
       for (let s = 0; s + len < n; s++) {
         const d = FS.phashDistance(hashes[s], hashes[s + len]);
-        if (d <= 40) results.push({ start: s, end: s + len - 1, dist: d, len: len });
+        if (d <= 40) results.push({ start: kept[s].id, end: kept[s + len - 1].id, dist: d, len: len });
       }
     }
     results.sort(function (a, b) {
