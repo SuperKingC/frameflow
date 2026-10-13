@@ -28,12 +28,15 @@ import argparse
 import base64
 import datetime
 import hashlib
+import hmac
 import http.server
 import io
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -456,26 +459,38 @@ def _is_loopback(ip):
 
 def _xff_client_ip(headers, peer):
     """真实客户端 IP:对端为回环且带 X-Forwarded-For(或 FRAMEFLOW_TRUST_PROXY=1)时,
-    取 XFF 第一个地址——额度/锁定/本机免码判定都按它计。XFF 可伪造,但部署形态是
-    「nginx 反代 + 邀请码门禁」:伪造头只能骗额度,骗不进门(仍需真码)。"""
+    取 XFF 最后一个地址——nginx 追加式($proxy_add_x_forwarded_for)下真实来源在末位,
+    取末位顺带免疫客户端伪造的首段(伪造头骗不了门,但仍影响额度/锁定归属);
+    替换式(单元素)同样成立。额度/锁定/本机免码判定都按它计。"""
     if TRUST_PROXY or _is_loopback(peer):
         xff = headers.get("X-Forwarded-For")
         if xff:
-            first = xff.split(",")[0].strip()
-            if first:
-                return first
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            if parts:
+                return parts[-1]
     return peer
+
+
+def _pub_err(e):
+    """异常转对外消息:剥掉服务器本机路径,错误串不泄露目录布局。"""
+    s = str(e)
+    for p in (str(ROOT), str(GENWORK), str(Path.home())):
+        if p and p in s:
+            s = s.replace(p, "…")
+    return s or "服务器内部错误"
 
 
 def _gen_authorize(invite_code, ip=None):
     """未配置邀请码 → 仅「真实 IP 与 TCP 对端都是回环」免码放行、其余拒绝(不计失败);
     配置了但对不上 → unauthorized(计失败)。经反代进来的流量即使对端是回环,
-    真实 IP 是公网地址,同样要码——防 XFF 缺失时把全站误判成本机。"""
+    真实 IP 是公网地址,同样要码——防 XFF 缺失时把全站误判成本机。
+    比较用 compare_digest(时序安全,防逐字节探测)。"""
     if not GEN_STUDIO["invite_code"]:
         if ip and _is_loopback(ip):
             return
         raise GenError("upstream_unavailable")
-    if invite_code != GEN_STUDIO["invite_code"]:
+    if not isinstance(invite_code, str) or not hmac.compare_digest(
+            invite_code.encode("utf-8"), GEN_STUDIO["invite_code"].encode("utf-8")):
         raise GenError("unauthorized")
 
 
@@ -1877,6 +1892,28 @@ def _drama_shot_reorder(pid, params):
     return _drama_mutate(pid, apply)
 
 
+def _drama_url_guard(url):
+    """素材代取的 SSRF 防护:仅 http/https,且主机不得解析到回环/私网/链路本地/保留地址
+    (防 file:// 读本地文件、防借服务器探测内网)。"""
+    p = urllib.parse.urlparse(url)
+    if p.scheme not in ("http", "https"):
+        raise RuntimeError("素材 URL 仅支持 http/https")
+    host = p.hostname or ""
+    if not host:
+        raise RuntimeError("素材 URL 缺少主机名")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        raise RuntimeError("素材 URL 主机无法解析")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if getattr(ip, "ipv4_mapped", None) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if (ip.is_loopback or ip.is_private or ip.is_link_local
+                or ip.is_reserved or ip.is_unspecified or ip.is_multicast):
+            raise RuntimeError("素材 URL 指向内网/保留地址,已拒绝")
+
+
 def _drama_asset_bytes(params):
     """素材二进制:dataURL 直接解码;URL 由服务端代取(上游回 URL 时前端无需下载)。"""
     data_url = params.get("dataUrl") if isinstance(params.get("dataUrl"), str) else None
@@ -1891,6 +1928,7 @@ def _drama_asset_bytes(params):
             raise RuntimeError("素材超过 80MB 上限")
         return base64.b64decode(b64), DRAMA_MIME_EXT[mime]
     if url:
+        _drama_url_guard(url)  # SSRF:仅 http(s),拒绝回环/私网/保留地址
         req = urllib.request.Request(url)
         for attempt in (1, 2):
             try:
@@ -2238,7 +2276,9 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         name = urllib.parse.unquote(path)
         name = name.replace("\\", "/").lstrip("/")
-        if (name == "" or not self._STATIC_RE.fullmatch(name)
+        if name == "":
+            name = "index.html"  # 站点根
+        if (not self._STATIC_RE.fullmatch(name)
                 or not name.lower().endswith(self._STATIC_SUFFIXES)
                 or ".." in name.split("/")):
             self.send_error(404, "File not found")
@@ -2390,7 +2430,7 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
         except GenError as e:
             self._gen_err(e)
         except Exception as e:
-            self._json({"ok": False, "error": str(e)}, 400)
+            self._json({"ok": False, "error": _pub_err(e)}, 400)
 
     def do_POST(self):
         if self.path.rstrip("/") == "/api/sam/segment":
@@ -2412,7 +2452,7 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 r = _sam_segment(points, labels, b64)
                 self._json({"ok": True, **r})
             except Exception as e:
-                self._json({"ok": False, "error": str(e)}, 400)
+                self._json({"ok": False, "error": _pub_err(e)}, 400)
             return
         if self.path.rstrip("/") == "/api/matting/auto":
             if self._gen_gate():
@@ -2432,7 +2472,7 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                             "model": model, "width": r.get("width"), "height": r.get("height"),
                             "edgePx": r.get("edge_px"), "seconds": r.get("seconds")})
             except Exception as e:
-                self._json({"ok": False, "error": str(e)}, 400)
+                self._json({"ok": False, "error": _pub_err(e)}, 400)
             return
         if self.path.rstrip("/") == "/api/compress/tinypng":
             if self._gen_gate():
@@ -2453,7 +2493,7 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 self._json({"ok": True, "image": "data:image/png;base64," + b64out,
                             "inputBytes": in_bytes, "outputBytes": len(out), "note": note})
             except Exception as e:
-                self._json({"ok": False, "error": str(e)}, 400)
+                self._json({"ok": False, "error": _pub_err(e)}, 400)
             return
         if self.path.rstrip("/") == "/api/compress/oxipng":
             if self._gen_gate():
@@ -2474,7 +2514,7 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 self._json({"ok": True, "image": "data:image/png;base64," + b64out,
                             "inputBytes": len(raw), "outputBytes": len(out), "note": note})
             except Exception as e:
-                self._json({"ok": False, "error": str(e)}, 400)
+                self._json({"ok": False, "error": _pub_err(e)}, 400)
             return
         if self.path.rstrip("/") == "/api/gen/start":
             if self._gen_gate(record_failure=True):
@@ -2492,7 +2532,7 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 else:
                     self._json({"ok": True, "jobId": job["id"]})
             except Exception as e:
-                self._json({"ok": False, "error": str(e)}, 400)
+                self._json({"ok": False, "error": _pub_err(e)}, 400)
             return
         if self.path.rstrip("/") == "/api/studio/optimize":
             # 提示词优化:锁定→鉴权(错码计失败)→独立宽松限额
@@ -2519,6 +2559,9 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 self._json({"error": "image_generation_unavailable"}, 503)
             return
         if self.path.rstrip("/") == "/api/studio/tasks":
+            # 先鉴权再读体:未持码者不该能免费消耗 64MB 读入(内存 DoS 面)
+            if self._gen_gate(record_failure=True):
+                return
             ip = self._client_ip()
             try:
                 params = self._read_json()
@@ -2609,15 +2652,11 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
             try:
                 if _gen_locked(ip):
                     raise GenError("invite_locked")
-                try:
-                    _gen_authorize(self._bearer(), self._client_ip())
-                except GenError as e:
-                    if e.code == "unauthorized":
-                        _gen_fail(ip)
-                        raise
+                _gen_authorize(self._bearer(), ip)  # 免码模式下公网来源也要拦(quota 只剩额度数字,也不该外泄)
                 self._json(_gen_quota_peek(ip))
             except GenError as e:
                 if e.code == "unauthorized":
+                    _gen_fail(ip)  # 错码计失败(输码入口语义,勿丢)
                     self._json({"error": "invalid_invite_code",
                                 "attemptsRemaining": _gen_attempts_left(ip)}, 401)
                 else:
@@ -2737,8 +2776,8 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 return
             try:
                 self._json({"ok": True, "project": _drama_read(m.group(1))})
-            except Exception as e:
-                self._json({"ok": False, "error": str(e)}, 404)
+            except Exception:
+                self._json({"ok": False, "error": "项目不存在"}, 404)
             return
         return super().do_GET()
 

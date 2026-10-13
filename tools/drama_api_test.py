@@ -143,16 +143,21 @@ check("asset missing keys err", st == 400 and "keys=[target,id,kind]" in r.get("
 # 7.9 台词/TTS:写对白 → 生成配音(SAPI 真跑)→ 校验 tts wav 落盘
 st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s1}/update",
              {"lines": "小满:今天怎么不进来?\n黑猫:在等你换班。"})
-check("lines update", st == 200 and "换班" in r["project"]["shots"][0]["lines"], r)
+proj = r["project"]
+s1cur = next(s for s in proj["shots"] if s["id"] == s1)
+check("lines update", st == 200 and "换班" in s1cur["lines"], s1cur.get("lines"))
 st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s1}/tts", {})
-check("shot tts", st == 200 and r.get("ok") and r["project"]["shots"][0]["tts"], r)
-tts_rel = r["project"]["shots"][0]["tts"]
+proj = r["project"]
+s1cur = next(s for s in proj["shots"] if s["id"] == s1)
+check("shot tts", st == 200 and r.get("ok") and s1cur["tts"], s1cur.get("tts"))
+tts_rel = s1cur["tts"]
 st, body = call("GET", f"/api/drama/projects/{pid}/asset/{tts_rel}", raw=True)
 check("tts served", st == 200 and len(body) > 5000 and body[:4] == b"RIFF", (st, len(body)))
 
 # 7.10 时长范围(2~30)截断
 st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s2}/update", {"duration": 60})
-check("duration clamped", st == 200 and r["project"]["shots"][1]["duration"] == 30, r)
+proj = r["project"]
+check("duration clamped", st == 200 and next(s for s in proj["shots"] if s["id"] == s2)["duration"] == 30, r)
 
 # 8. 分镜 LLM(真实调用一次,验证解析链路)
 st, r = call("POST", f"/api/drama/projects/{pid}/storyboard", {"nShots": 4})
