@@ -10,12 +10,12 @@
   cursor: pointer; user-select: none;
   background: rgba(255, 255, 255, .02);
 }
-.log-head .title { font-size: 12px; font-weight: 700; color: var(--accent); }
-.log-head .count { font-size: 11px; color: var(--text-3); }
-.log-head .toggle { margin-left: auto; font-size: 11px; color: var(--text-3); }
+.log-head .title { font-size: 13.5px; font-weight: 700; color: var(--accent); }
+.log-head .count { font-size: 12.5px; color: var(--text-3); }
+.log-head .toggle { margin-left: auto; font-size: 12.5px; color: var(--text-3); }
 .log-head:hover .toggle { color: var(--text-2); }
 .log-latest {
-  padding: 5px 12px 6px; font-size: 12.5px; color: var(--text-2);
+  padding: 5px 12px 6px; font-size: 14px; color: var(--text-2);
   border-top: 1px solid var(--line); min-height: 18px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
@@ -26,23 +26,23 @@
 }
 #logPanel.open .log-list { display: block; }
 .log-line {
-  font-size: 11.5px; padding: 3px 0; color: var(--text-2);
+  font-size: 13px; padding: 3px 0; color: var(--text-2);
   border-bottom: 1px dashed rgba(255, 255, 255, .04);
 }
 .log-line:last-child { border-bottom: 0; }
 .log-line .t {
   color: var(--text-3); margin-right: 8px;
-  font-family: Consolas, monospace; font-size: 10.5px;
+  font-family: Consolas, monospace; font-size: 12px;
 }
 .log-line.err { color: var(--danger); }
 
 .f-label {
   display: flex; flex-direction: column; gap: 4px;
-  font-size: 12px; color: var(--text-2);
+  font-size: 13.5px; color: var(--text-2);
   margin-top: 8px;
 }
 .f-label input, .f-label textarea, .f-label select {
-  font-size: 12.5px; padding: 6px 8px;
+  font-size: 14px; padding: 6px 8px;
 }
 
 /* ---------- 角色行 ---------- */
@@ -58,10 +58,10 @@
   flex: none; cursor: zoom-in;
 }
 .char-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
-.char-main input, .char-main textarea { font-size: 12px; padding: 5px 8px; width: 100%; }
+.char-main input, .char-main textarea { font-size: 13.5px; padding: 5px 8px; width: 100%; }
 .char-ops { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-.char-ops .btn { font-size: 11.5px; padding: 3px 10px; margin: 0; }
-.char-status { font-size: 11px; color: var(--text-3); min-height: 14px; }
+.char-ops .btn { font-size: 13px; padding: 3px 10px; margin: 0; }
+.char-status { font-size: 12.5px; color: var(--text-3); min-height: 14px; }
 .char-status.err { color: var(--danger); }
 
 /* ---------- 镜头卡 ---------- */
@@ -71,14 +71,14 @@
   background: rgba(255, 255, 255, .02);
 }
 .shot-head { display: flex; gap: 8px; align-items: center; }
-.shot-head .idx { font-weight: 700; color: var(--accent); font-size: 12.5px; flex: none; }
-.shot-head .scene { flex: 1; min-width: 0; font-size: 12px; padding: 4px 8px; }
-.shot-head .st { flex: none; font-size: 11px; color: var(--text-3); }
+.shot-head .idx { font-weight: 700; color: var(--accent); font-size: 14px; flex: none; }
+.shot-head .scene { flex: 1; min-width: 0; font-size: 13.5px; padding: 4px 8px; }
+.shot-head .st { flex: none; font-size: 12.5px; color: var(--text-3); }
 .shot-head .st.busy { color: var(--accent); }
 .shot .f-label { margin-top: 8px; }
 .shot-ops { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
-.shot-ops .btn { font-size: 11.5px; padding: 3px 10px; margin: 0; }
-.shot-ops select { font-size: 11.5px; padding: 3px 6px; }
+.shot-ops .btn { font-size: 13px; padding: 3px 10px; margin: 0; }
+.shot-ops select { font-size: 13px; padding: 3px 6px; }
 .shot-media { display: flex; gap: 12px; margin-top: 10px; align-items: flex-start; flex-wrap: wrap; }
 .shot-media img.frame {
   width: 110px; border-radius: 8px; display: block;
@@ -88,10 +88,10 @@
   flex: 1; min-width: 200px; max-width: 420px; width: 100%;
   border-radius: 8px; border: 1px solid var(--line); background: #000;
 }
-.shot-status { font-size: 11px; margin-top: 6px; color: var(--text-3); min-height: 14px; }
+.shot-status { font-size: 12.5px; margin-top: 6px; color: var(--text-3); min-height: 14px; }
 .shot-status.err { color: var(--danger); }
 /* 折叠:收起后只留首行(场景+状态+折叠钮),长剧浏览不滚屏 */
-.shot-head .fold { font-size: 11px; padding: 2px 9px; margin: 0; }
+.shot-head .fold { font-size: 12.5px; padding: 2px 9px; margin: 0; }
 .shot.collapsed > :not(.shot-head) { display: none; }
 .shot.collapsed { padding-bottom: 8px; }
 
@@ -99,7 +99,7 @@
 #composedBox video { width: 100%; border-radius: 8px; border: 1px solid var(--line); margin-top: 8px; background: #000; }
 #composedBox .download {
   display: block; text-align: center; text-decoration: none;
-  font-size: 11.5px; color: var(--accent);
+  font-size: 13px; color: var(--accent);
   background: rgba(52, 211, 153, .1);
   border-radius: 6px; padding: 5px 6px; margin-top: 6px;
 }
@@ -111,7 +111,7 @@
 /* ---------- 章节分组 ---------- */
 .chapter-head {
   margin: 18px 0 10px;
-  font-size: 12px; font-weight: 700;
+  font-size: 13.5px; font-weight: 700;
   color: var(--accent-2);
   border-bottom: 1px dashed var(--line-strong);
   padding-bottom: 6px;
@@ -141,12 +141,12 @@
   width: 16px; height: 16px; border-radius: 50%;
   border: 0; padding: 0; margin: 0; cursor: pointer;
   background: rgba(255, 123, 107, .9); color: #fff;
-  font-size: 10px; line-height: 16px;
+  font-size: 11.5px; line-height: 16px;
 }
 .char-ref.add {
   display: flex; align-items: center; justify-content: center;
   border: 1px dashed var(--line-strong); border-radius: 6px;
-  color: var(--text-3); font-size: 16px; cursor: pointer;
+  color: var(--text-3); font-size: 17px; cursor: pointer;
   box-sizing: border-box; user-select: none;
 }
 .char-ref.add:hover { border-color: var(--accent); color: var(--accent); }
@@ -158,7 +158,7 @@
   border: 1px solid var(--line-strong);
   border-radius: var(--radius); padding: 20px;
 }
-.idea-box h3 { margin: 0 0 12px; font-size: 15px; }
+.idea-box h3 { margin: 0 0 12px; font-size: 16.5px; }
 .idea-card {
   border: 1px solid var(--line); border-radius: var(--radius-s);
   background: rgba(255, 255, 255, .02);
@@ -166,9 +166,9 @@
   transition: border-color .15s ease;
 }
 .idea-card:hover { border-color: rgba(52, 211, 153, .5); }
-.idea-card b { font-size: 13.5px; }
-.idea-card p { margin: 5px 0 0; font-size: 12px; color: var(--text-2); line-height: 1.6; }
-.idea-style { display: inline-block; margin-top: 7px; font-size: 10.5px; color: var(--accent); }
+.idea-card b { font-size: 15px; }
+.idea-card p { margin: 5px 0 0; font-size: 13.5px; color: var(--text-2); line-height: 1.6; }
+.idea-style { display: inline-block; margin-top: 7px; font-size: 12px; color: var(--accent); }
 
 @media (max-width: 900px) {
   .shot-media video { max-width: none; }
