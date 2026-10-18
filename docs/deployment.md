@@ -8,12 +8,12 @@
 | 变量 | 必须 | 说明 |
 | --- | --- | --- |
 | `GEN_INVITE_CODE` | **公网必设** | 全站邀请码。**未设码时:真实 IP 为本机(含经反代但头缺失的请求)一律免码直进——等于全站裸奔**。设长随机串(≥20 位),拿到码就能烧中转站余额。 |
-| `CODEX_API_KEY` / `APIROUTER_KEY` | 生成功能需要 | 上游 ApiRouter key;也可放同级 `miniapp-kit/.env`。仅存服务端环境,不落前端、不打日志。 |
+| `CODEX_API_KEY` / `APIROUTER_KEY` | 生成功能需要 | 上游 ApiRouter key;也可放仓库根 `.env`(已 gitignore)。仅存服务端环境,不落前端、不打日志。 |
 | `TINYPNG_API_KEY`~`_5` | 压缩页需要 | 多 key 轮换;同样只在服务端。 |
 | `FRAMEFLOW_GENWORK_DIR` | 公网建议设 | 生成产物/短剧项目根目录。**务必指到站点根之外**(如 `D:\AI产出`):生图结果与短剧剧本/素材都会写到这里,放站点根下会被静态通道枚举下载。 |
 | `FRAMEFLOW_TRUST_PROXY` | 反代时建议设 | 设为 `1` 后无条件按 `X-Forwarded-For` 取真实客户端 IP(额度/锁定/本机判定都按它)。未设时服务端也会自动识别:对端是回环且带 XFF 就取 XFF——nginx 标准反代下无需设置。 |
 | `PYTHON_MATTING` | 抠图/图层页需要 | 带 torch+sam2 的 python 解释器(GPU 机器才配)。 |
-| `FRAMEFLOW_GENMJS` | 可选 | gen.mjs 路径覆盖。 |
+| `FRAMEFLOW_GENMJS` | 可选 | 内置 `anim/gen.mjs` 的路径覆盖,一般无需设置。 |
 
 ## 启动与 nginx
 
@@ -23,6 +23,8 @@ export GEN_INVITE_CODE="$(python3 -c 'import secrets;print(secrets.token_urlsafe
 export FRAMEFLOW_GENWORK_DIR=/srv/frameflow-data   # 站点根之外!
 python3 server.py --host 127.0.0.1 --port 8437 --no-browser
 ```
+
+生视频桥接(spine 页动作视频)另需 node:`apt install nodejs`;只跑生图/短剧可不装。
 
 ```nginx
 server {

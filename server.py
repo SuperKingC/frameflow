@@ -5,10 +5,9 @@
 
 功能:
 1. 静态站点(http://127.0.0.1:<port>/),所有拆帧/抠图/导出处理在浏览器本地完成。
-2. 生视频桥接:复用 miniapp-kit/anim/gen.mjs(可灵·ApiRouter)。
-   默认找同级目录 ../miniapp-kit/anim/gen.mjs,可用环境变量 FRAMEFLOW_GENMJS
-   或 --genmjs 覆盖。按 miniapp-kit 接入铁律不改其代码,差异全走配置/参数。
-   密钥从环境变量(CODEX_API_KEY / APIROUTER_KEY)或 miniapp-kit/.env 读取,不落任何文件。
+2. 生视频桥接:内置 anim/gen.mjs(自 miniapp-kit 收编,逻辑未改;可灵·ApiRouter)。
+   运行依赖 node + ffmpeg,路径可用环境变量 FRAMEFLOW_GENMJS 或 --genmjs 覆盖。
+   密钥从环境变量(CODEX_API_KEY / APIROUTER_KEY)或仓库根 .env(已 gitignore)读取,不落任何文件。
    /api/gen/* 与生图工作台共用同一把邀请码门禁(见 3);未设码时仅本机可用。
 3. 生图/生视频工作台(gen.html):移植自 Pet10 工作台(同一 ApiRouter 上游)。
    邀请码门禁(GEN_INVITE_CODE,页面不存码,Bearer 携带;一天错满 3 次锁到明天);
@@ -23,9 +22,10 @@
 6. 静态白名单:仅托管 *.html/*.css/*.js,目录列表关闭——源码/文档/.git/生成产物等一律 404,
    nginx 漏配保护也有兜底。真实客户端 IP 自动取 X-Forwarded-For(对端为回环且带该头,或设
    FRAMEFLOW_TRUST_PROXY=1),额度与锁定按真实 IP 计;模型目录接口仅对已验证者公开。
-7. 社媒运营工作台(ops.html):小红书/抖音内容工厂——人设卡驱动 LLM 文案(3 版)+ 选题库 +
-   对标库(链接收藏 + LLM 拆解)+ 话题标签库;配图走 /api/studio/tasks(额度零改动);
-   文案/素材打 zip 发布包人工发布(不做任何平台自动化);落盘 genwork/ops/。
+7. 社媒运营工作台(ops.html):小红书/抖音内容工厂——人设卡驱动 LLM 文案(3 版,图文/视频两模板)
+   + 选题库 + 对标库(链接收藏 + LLM 拆解)+ 话题标签库;图/视频素材走 /api/studio/tasks 与
+   小多利素材库(含短剧成片挂接);排期日历与发布数据手动复盘;文案/素材打 zip 发布包
+   人工发布(不做任何平台自动化);落盘 genwork/ops/。
 """
 import argparse
 import base64
@@ -54,8 +54,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_PORT = 8437
-DEFAULT_GENMJS = ROOT.parent / "miniapp-kit" / "anim" / "gen.mjs"
-MINIAPP_ENV = ROOT.parent / "miniapp-kit" / ".env"
+DEFAULT_GENMJS = ROOT / "anim" / "gen.mjs"
+MINIAPP_ENV = ROOT / ".env"
 GEN_BASE_URL = "https://apirouter.zhiqiteai.cn/ApiRouterServ/v1"
 GEN_KEY_ENV = "CODEX_API_KEY"
 GEN_PROMPT_APPEND = "镜头固定,动作幅度小而柔和,不要镜头切换,不要新增元素"
@@ -205,7 +205,7 @@ _SAM_TIERS = ("small", "large")
 
 
 def _sam_python():
-    _load_miniapp_env()
+    _load_dotenv()
     return (os.environ.get("FRAMEFLOW_SAM_PYTHON")
             or os.environ.get("PYTHON_MATTING")
             or "")
@@ -213,7 +213,7 @@ def _sam_python():
 
 def _sam_ckpt(tier):
     """返回 (ckpt_path, cfg);tier 权重缺失返回 (None, cfg)。供 /api/sam/meta 探测与 worker 启动前校验。"""
-    _load_miniapp_env()
+    _load_dotenv()
     small = os.environ.get("SAM2_CHECKPOINT", "")
     if tier == "small":
         return small, "configs/sam2.1/sam2.1_hiera_s.yaml"
@@ -373,7 +373,7 @@ _FLO_WORKER = ROOT / "florence_worker.py"
 
 
 def _flo_dir():
-    _load_miniapp_env()
+    _load_dotenv()
     return os.environ.get("FLORENCE2_DIR", "")
 
 
@@ -445,8 +445,29 @@ def _flo_ground(image_b64, phrase):
                     raise
 
 
-def _load_miniapp_env():
-    """加载 miniapp-kit/.env 的 KEY=VALUE(进程环境优先);不记录值,仅注入 os.environ。"""
+def _flo_translate(text):
+    """中文概念词 → 英文短语(Florence-2 开放词汇定位只认英文);失败抛错,前端退回原词。"""
+    if not GEN_STUDIO["upstream_key"]:
+        raise RuntimeError("未配置上游 key,无法翻译;请直接用英文词")
+    payload, _ = _gen_upstream("/chat/completions", {
+        "model": GEN_STUDIO["prompt_model"],
+        "messages": [{"role": "system",
+                      "content": "把用户给的词组翻译成 1~4 个英文单词的名词短语,用于图像开放词汇定位。"
+                                 "只输出英文短语本身,不要解释、不要引号、不要句号。"},
+                     {"role": "user", "content": text.strip()}],
+        "max_tokens": 60}, timeout_s=60)
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError("翻译响应异常")
+    content = (content or "").strip().strip('"').strip("'").rstrip(".")
+    if not content:
+        raise RuntimeError("翻译结果为空")
+    return content[:60]
+
+
+def _load_dotenv():
+    """加载仓库根 .env 的 KEY=VALUE(进程环境优先);不记录值,仅注入 os.environ。"""
     if not MINIAPP_ENV.exists():
         return
     try:
@@ -464,7 +485,7 @@ def _load_miniapp_env():
 
 
 def _tinify_keys():
-    _load_miniapp_env()
+    _load_dotenv()
     return [os.environ[n].strip() for n in
             ("TINYPNG_API_KEY", "TINYPNG_API_KEY_2", "TINYPNG_API_KEY_3", "TINYPNG_API_KEY_4", "TINYPNG_API_KEY_5")
             if os.environ.get(n, "").strip()]
@@ -476,7 +497,7 @@ def _tinify_compress(image_bytes):
     import base64
     keys = _tinify_keys()
     if not keys:
-        raise RuntimeError("未找到 TinyPNG key:请设置环境变量 TINYPNG_API_KEY,或确认 miniapp-kit/.env 存在")
+        raise RuntimeError("未找到 TinyPNG key:请设置环境变量 TINYPNG_API_KEY,或在仓库根放 .env(已 gitignore)")
     dead = []
     last_err = None
     for key in keys:
@@ -532,7 +553,7 @@ class GenError(Exception):
 
 def _gen_studio_init():
     """启动时装配工作台配置:邀请码、上游 key(不落盘、不打印)。"""
-    _load_miniapp_env()
+    _load_dotenv()
     GEN_STUDIO["invite_code"] = (os.environ.get("GEN_INVITE_CODE")
                                  or os.environ.get("IMAGE_INVITE_CODE") or "").strip()
     GEN_STUDIO["upstream_key"] = (os.environ.get("IMAGE_UPSTREAM_API_KEY")
@@ -1376,7 +1397,9 @@ def _start_job(params, genmjs):
     genmjs = Path(genmjs or DEFAULT_GENMJS)
     if not genmjs.exists():
         raise RuntimeError(
-            f"未找到 gen.mjs: {genmjs}(用 --genmjs 或环境变量 FRAMEFLOW_GENMJS 指定 miniapp-kit/anim/gen.mjs)")
+            f"未找到内置 gen.mjs: {genmjs}(用 --genmjs 或环境变量 FRAMEFLOW_GENMJS 指定)")
+    if not shutil.which("node"):
+        raise RuntimeError("未找到 node:生视频桥接需要 Node.js(服务器 apt install nodejs;Windows 装官网 LTS)")
     name = params.get("name") or "action"
     name = "".join(c if (c.isalnum() and c.isascii()) or c in "_-" else "_" for c in name).strip("_") or "action"
     prompt = (params.get("prompt") or "").strip()
@@ -2821,12 +2844,14 @@ def _srt_ts(sec):
 OPS_DIR = GENWORK / "ops"   # 随 FRAMEFLOW_GENWORK_DIR;人设/帖子/选题/对标绝不放站点根下
 _OPS_LOCK = threading.RLock()  # 全部 ops 读写共用(记录少,文件 IO 快;重入兼容嵌套调用)
 _OPS_ID_RE = re.compile(r"^[a-f0-9]{12}$")
-_OPS_ASSET_NAME_RE = re.compile(r"^a\d+\.(?:png|jpg|jpeg|webp|gif)$")
+_OPS_ASSET_NAME_RE = re.compile(r"^a\d+\.(?:png|jpg|jpeg|webp|gif|mp4)$")
 _OPS_LIB_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")  # 库文件名单段名,禁路径分隔符
-_OPS_DATAURL_RE = re.compile(r"^data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=]+)$")
-_OPS_MIME_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
-_OPS_EXT_MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp", "gif": "image/gif"}
-_OPS_MAX_ASSET_BYTES = 10 * 1024 * 1024
+_OPS_DATAURL_RE = re.compile(r"^data:(image/(?:png|jpeg|webp|gif)|video/mp4);base64,([A-Za-z0-9+/=]+)$")
+_OPS_MIME_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif", "video/mp4": "mp4"}
+_OPS_EXT_MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp", "gif": "image/gif", "mp4": "video/mp4"}
+_OPS_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_OPS_MAX_VIDEO_BYTES = 80 * 1024 * 1024  # 视频素材放宽(短剧成片/镜头),与 drama dataURL 上限一致
+_OPS_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _OPS_PLATFORMS = ("xhs", "dy")
 _OPS_PILLARS = ("日常治愈", "工具彩蛋", "幕后花絮")
 _OPS_TAG_GROUPS = ("流量", "精准", "人设", "自定义")
@@ -3100,22 +3125,27 @@ def _ops_parse_copies(content):
 
 
 def _ops_copy(params):
-    """按人设生成 3 版文案 {title, body, tags};配额在路由层走 ip+":opt" 宽松池。"""
+    """按人设生成 3 版文案 {title, body, tags};配额在路由层走 ip+":opt" 宽松池。
+    kind=image|video:视频帖文案按「视频描述」写(首句钩子+前 3 秒画面建议)。"""
     if not GEN_STUDIO["upstream_key"]:
         raise GenError("upstream_unavailable")
     persona = _ops_load("personas", str(params.get("personaId") or ""))
     platform = params.get("platform")
     if platform not in _OPS_PLATFORMS:
         raise GenError("invalid_platform")
+    kind = params.get("kind") if params.get("kind") in ("image", "video") else "image"
     topic = (params.get("topic") if isinstance(params.get("topic"), str) else "").strip()[:800]
     if not topic:
         raise GenError("invalid_prompt")
     extra = (params.get("extra") if isinstance(params.get("extra"), str) else "").strip()[:400]
     pillar = params.get("pillar") if params.get("pillar") in _OPS_PILLARS else ""
+    kind_note = ("这条内容会配视频,文案是视频描述:首句即钩子,并用一句话给出前 3 秒的画面建议,"
+                 "不要出现「视频开头」这类术语。" if kind == "video" else
+                 "这条是图文内容:正文供直接阅读,图片另配,文案里不要描述配图动作。")
     user = "\n".join(["账号:" + persona["name"],
                       "平台:" + _OPS_PLATFORM_META[platform]["label"]]
                      + (["内容支柱:" + pillar] if pillar else [])
-                     + ["选题:" + topic]
+                     + ["选题:" + topic, kind_note]
                      + (["补充要求:" + extra] if extra else []))
     payload, _ = _gen_upstream("/chat/completions", {
         "model": DRAMA_STORY_MODEL,
@@ -3183,37 +3213,68 @@ def _ops_analyze(params):
             "topicIdeas": _ops_parse_strlist(obj.get("topicIdeas"), 5)}
 
 
-# 素材库:现成小多利资产的只读白名单(按目录扫描,新文件自动出现;mp4/webp 留 P2 视频接入)
+# 素材库:现成小多利资产的只读白名单(按目录扫描,新文件自动出现);P2 起开放视频
+# (mp4/webp 动画)并把短剧工作台的成片/镜头成片挂进来(name = drama-<pid>-composed|shot-<sid>.mp4)
 _OPS_LIBRARY_DIRS = (
     ("姿势图", GENWORK / "duoli_final"),
     ("风格图", GENWORK / "duoli_refs"),
     ("关键帧", GENWORK / "duoli_probe"),
+    ("动画循环", GENWORK / "duoli_v3"),
+    ("动画循环", GENWORK / "duoli_motion"),
     ("真狗实拍", ROOT / "testdata" / "duoli_ref"),
 )
-_OPS_LIB_IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+_OPS_LIB_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4")
+_OPS_DRAMA_LIB_RE = re.compile(r"^drama-([a-f0-9]{12})-(composed|shot-([a-f0-9]{12}))\.mp4$")
 
 
 def _ops_library_scan():
     items, seen = [], set()
+
+    def add(name, group, path):
+        if name in seen:
+            return
+        seen.add(name)
+        items.append({"name": name, "group": group,
+                      "mime": _OPS_EXT_MIME[path.suffix.lower().lstrip(".")],
+                      "bytes": path.stat().st_size})
+
     for label, d in _OPS_LIBRARY_DIRS:
         if not d.exists():
             continue
         for p in sorted(d.iterdir(), key=lambda x: x.name.lower()):
-            if not p.is_file() or p.suffix.lower() not in _OPS_LIB_IMG_EXTS or p.name in seen:
+            if not p.is_file() or p.suffix.lower() not in _OPS_LIB_EXTS:
                 continue
-            seen.add(p.name)
-            items.append({"name": p.name, "group": label,
-                          "mime": _OPS_EXT_MIME[p.suffix.lower().lstrip(".")],
-                          "bytes": p.stat().st_size})
+            add(p.name, label, p)
+    # 短剧产物挂接:成片 composed.mp4 + 每镜成片 shots/<sid>_clip.mp4
+    if DRAMA_DIR.exists():
+        for pd in sorted(DRAMA_DIR.iterdir(), key=lambda x: x.name):
+            if not pd.is_dir() or not DRAMA_PID_RE.fullmatch(pd.name):
+                continue
+            composed = pd / "composed.mp4"
+            if composed.is_file():
+                add(f"drama-{pd.name}-composed.mp4", "短剧成片", composed)
+            shots = pd / "shots"
+            if shots.is_dir():
+                for f in sorted(shots.glob("*_clip.mp4")):
+                    sid = f.name[:-len("_clip.mp4")]
+                    if re.fullmatch(r"[a-f0-9]{12}", sid):
+                        add(f"drama-{pd.name}-shot-{sid}.mp4", "短剧镜头", f)
     return items
 
 
 def _ops_library_file(name):
     if not _OPS_LIB_NAME_RE.fullmatch(name or ""):
         raise RuntimeError("文件名不合法")
+    m = _OPS_DRAMA_LIB_RE.fullmatch(name or "")
+    if m:  # 短剧挂接:名字→drama 项目内真实路径(均带正则校验,无穿越面)
+        p = DRAMA_DIR / m.group(1) / (
+            "composed.mp4" if m.group(2) == "composed" else f"shots/{m.group(3)}_clip.mp4")
+        if p.is_file():
+            return p
+        raise RuntimeError("素材不存在")
     for _, d in _OPS_LIBRARY_DIRS:
         p = d / name
-        if p.is_file() and p.suffix.lower() in _OPS_LIB_IMG_EXTS:
+        if p.is_file() and p.suffix.lower() in _OPS_LIB_EXTS:
             return p
     raise RuntimeError("素材不存在")
 
@@ -3226,10 +3287,12 @@ def _ops_post_create(params):
     pillar = params.get("pillar") if params.get("pillar") in _OPS_PILLARS else _OPS_PILLARS[0]
     platforms = [p for p in (params.get("platforms") or []) if p in _OPS_PLATFORMS] or ["xhs"]
     chosen = _ops_norm_chosen(params.get("chosen"))
+    kind = params.get("kind") if params.get("kind") in ("image", "video") else "image"
     rec = {"id": _ops_new_id(), "accountId": persona["id"], "topic": topic, "pillar": pillar,
+           "kind": kind,
            "platforms": platforms, "copies": _ops_norm_copies(params.get("copies")),
            "chosen": chosen, "assets": [], "status": "draft" if chosen else "idea",
-           "notes": "", "stats": None, "publishedAt": None,
+           "notes": "", "stats": None, "publishedAt": None, "scheduleAt": None,
            "createdAt": _ops_now(), "updatedAt": _ops_now()}
     return _ops_save("posts", rec)
 
@@ -3246,6 +3309,8 @@ def _ops_post_update(pid, params):
                 d["platforms"] = ps
         if "chosen" in params:
             d["chosen"] = _ops_norm_chosen(params.get("chosen"))
+        if params.get("kind") in ("image", "video"):
+            d["kind"] = params["kind"]
         if isinstance(params.get("copies"), list):
             d["copies"] = _ops_norm_copies(params["copies"])
         if isinstance(params.get("notes"), str):
@@ -3254,6 +3319,18 @@ def _ops_post_update(pid, params):
             d["status"] = params["status"]
             if params["status"] == "published" and not d.get("publishedAt"):
                 d["publishedAt"] = _ops_now()
+        if "scheduleAt" in params:  # 排期日:YYYY-MM-DD;空串/非法值 = 清除
+            v = params.get("scheduleAt")
+            d["scheduleAt"] = v.strip() if isinstance(v, str) and _OPS_DATE_RE.fullmatch(v.strip()) else None
+        if isinstance(params.get("stats"), dict):  # 复盘数据:仅白名单键,非负整数,增量合并
+            st = dict(d.get("stats") or {})
+            for k in ("views", "likes", "saves", "comments", "follows"):
+                if k in params["stats"]:
+                    try:
+                        st[k] = max(0, int(params["stats"][k] or 0))
+                    except (TypeError, ValueError):
+                        st[k] = 0
+            d["stats"] = st
     return _ops_mutate("posts", pid, apply)
 
 
@@ -3267,8 +3344,7 @@ def _ops_post_delete(pid):
 
 def _ops_post_asset_add(pid, params):
     """素材落盘:{file:{taskId,index}} 从 studio 成品磁盘直读(与 drama 同款,绕 SSRF);
-    或 {dataUrl} 本地上传(≤10MB,仅 jpg/png/webp/gif)。"""
-    kind = params.get("kind") if params.get("kind") in ("cover", "image") else "image"
+    或 {dataUrl} 本地上传(图 ≤10MB,视频 mp4 ≤80MB)。kind 缺省按 mime 自动判(video/image)。"""
     if isinstance(params.get("file"), dict):
         ref = params["file"]
         path, mime = _gen_task_file(ref.get("taskId") if isinstance(ref.get("taskId"), str) else "",
@@ -3276,19 +3352,20 @@ def _ops_post_asset_add(pid, params):
         raw = path.read_bytes()
         ext = _OPS_MIME_EXT.get(mime) or _OPS_EXT_MIME.get(path.suffix.lstrip(".").lower())
         if not ext:
-            raise RuntimeError("素材类型不支持(jpg/png/webp/gif)")
+            raise RuntimeError("素材类型不支持(jpg/png/webp/gif/mp4)")
     else:
         m = _OPS_DATAURL_RE.match(params.get("dataUrl") if isinstance(params.get("dataUrl"), str) else "")
         if not m:
-            raise RuntimeError("dataURL 格式不支持(仅 jpg/png/webp/gif)")
+            raise RuntimeError("dataURL 格式不支持(仅 jpg/png/webp/gif/mp4)")
         b64 = m.group(2)
         padding = 2 if b64.endswith("==") else (1 if b64.endswith("=") else 0)
-        if (len(b64) * 3 // 4) - padding > _OPS_MAX_ASSET_BYTES:
-            raise RuntimeError("素材超过 10MB 上限")
         raw = base64.b64decode(b64)
         ext = _OPS_MIME_EXT[m.group(1)]
-    if not raw or len(raw) > _OPS_MAX_ASSET_BYTES:
-        raise RuntimeError("素材为空或超过 10MB 上限")
+    cap = _OPS_MAX_VIDEO_BYTES if ext == "mp4" else _OPS_MAX_IMAGE_BYTES
+    if not raw or len(raw) > cap:
+        raise RuntimeError("素材为空或超过 %dMB 上限" % (cap // 1024 // 1024))
+    kind = params.get("kind") if params.get("kind") in ("cover", "image", "video") else (
+        "video" if ext == "mp4" else "image")
 
     def apply(d):
         used = {a["file"] for a in d["assets"]}
@@ -3345,6 +3422,7 @@ def _ops_package(pid):
         lines.append("")
     lines.append("选题:" + post.get("topic", ""))
     lines.append("内容支柱:" + post.get("pillar", ""))
+    lines.append("类型:" + ("视频" if post.get("kind") == "video" else "图文"))
     lines.append("更新时间:" + post.get("updatedAt", ""))
     text = "\n".join(lines)
     buf = io.BytesIO()
@@ -3388,6 +3466,8 @@ def _ops_research_create(params):
     if not re.match(r"^https?://", url):
         raise RuntimeError("链接需以 http(s):// 开头")
     title = (params.get("title") if isinstance(params.get("title"), str) else "").strip()[:120] or url[:80]
+    account = str(params.get("accountId") or "").strip()
+    account = account if _OPS_ID_RE.fullmatch(account) else ""  # 对标按账号隔离(P3);空 = 通用
     stats = params.get("stats") if isinstance(params.get("stats"), dict) else {}
 
     def num(k):
@@ -3396,6 +3476,7 @@ def _ops_research_create(params):
         except (TypeError, ValueError):
             return 0
     rec = {"id": _ops_new_id(), "platform": platform, "url": url, "title": title,
+           "accountId": account,
            "note": (params.get("note") if isinstance(params.get("note"), str) else "").strip()[:600],
            "group": params.get("group") if params.get("group") in ("对标", "热点", "素材") else "对标",
            "stats": {"likes": num("likes"), "saves": num("saves"), "comments": num("comments")},
@@ -3792,6 +3873,18 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 r = _flo_ground(b64, phrase) if phrase else _flo_instances(b64)
                 self._json({"ok": True, **({"phrase": r["phrase"]} if phrase else {}),
                             "instances": r.get("instances", [])})
+            except Exception as e:
+                self._json({"ok": False, "error": _pub_err(e)}, 400)
+            return
+        if self.path.rstrip("/") == "/api/sam/translate":
+            if self._gen_gate():
+                return
+            try:
+                params = self._read_json()
+                text = (params.get("text") or "").strip()
+                if not text or len(text) > 60:
+                    raise RuntimeError("text 为空或过长(≤60 字符)")
+                self._json({"ok": True, "en": _flo_translate(text)})
             except Exception as e:
                 self._json({"ok": False, "error": _pub_err(e)}, 400)
             return
@@ -4257,7 +4350,7 @@ def main():
                         help="监听地址;公网部署用 0.0.0.0(建议前置 nginx,且务必设 GEN_INVITE_CODE)")
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--genmjs", default=None,
-                        help="miniapp-kit/anim/gen.mjs 路径(默认同级 ../miniapp-kit,或环境变量 FRAMEFLOW_GENMJS)")
+                        help="gen.mjs 路径(默认内置 anim/gen.mjs,或环境变量 FRAMEFLOW_GENMJS)")
     args = parser.parse_args()
     genmjs = _genmjs_path(args.genmjs)
     _gen_studio_init()
@@ -4275,13 +4368,14 @@ def main():
     url = f"http://{args.host}:{args.port}/"
     print(f"FrameFlow 已启动: {url}")
     print(f"生成结果目录: {GEN_STUDIO_DIR}(环境变量 FRAMEFLOW_GENWORK_DIR 可改;保留 {GEN_STUDIO_RETENTION_DAYS:g} 天)")
-    print(f"生视频引擎: {genmjs}({'✓ 存在' if genmjs.exists() else '✗ 未找到,生视频功能不可用,其余功能正常'})")
+    node_ok = bool(shutil.which("node"))
+    print(f"生视频引擎: {genmjs}({'✓ 存在' if genmjs.exists() else '✗ 未找到'}) + node({'✓' if node_ok else '✗ 未装:apt install nodejs,生视频不可用,其余功能正常'})")
     if GEN_STUDIO["invite_code"]:
         gen_state = "✓ 已开放(gen.html + spine.html,邀请码门禁)"
     elif GEN_STUDIO["upstream_key"]:
         gen_state = "✓ 已开放:本机免码直进(gen.html/spine.html);公网/局域网部署务必设 GEN_INVITE_CODE"
     else:
-        gen_state = "✗ 未开放:缺上游 key(CODEX_API_KEY / APIROUTER_KEY / miniapp-kit/.env)"
+        gen_state = "✗ 未开放:缺上游 key(CODEX_API_KEY / APIROUTER_KEY / 仓库根 .env)"
     print(f"生图工作台: {gen_state}")
     ff = shutil.which("ffmpeg")
     print(f"短剧工作台: genwork/drama/ 项目落盘;合成依赖 ffmpeg({'✓ ' + ff if ff else '✗ 未找到,无法合成'})")

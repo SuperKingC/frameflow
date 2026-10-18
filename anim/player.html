@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>anim 预览 — 视频循环 / 雪碧图翻帧</title>
+<style>
+  :root { --line: #e3e6ea; }
+  body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; margin: 0; background: #f6f7f9; color: #222; }
+  header { padding: 16px 20px; background: #fff; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0 0 4px; }
+  header p { font-size: 12px; color: #777; margin: 0; }
+  main { max-width: 1080px; margin: 0 auto; padding: 16px 20px 60px; }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-top: 16px; }
+  .card h2 { font-size: 14px; margin: 0 0 10px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .card h2 .meta { font-size: 12px; color: #888; font-weight: 400; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  .cell { display: flex; flex-direction: column; gap: 6px; }
+  .cell .label { font-size: 12px; color: #666; }
+  video { max-width: 460px; width: 100%; border-radius: 8px; background: #000; }
+  .stage { border-radius: 8px; overflow: hidden; line-height: 0; }
+  .stage.checker { background: repeating-conic-gradient(#ccc 0 25%, #fff 0 50%) 0 0 / 20px 20px; }
+  .stage.white { background: #fff; }
+  .stage.dark { background: #30343b; }
+  .stage.magenta { background: #ff2fb2; }
+  canvas { width: 460px; max-width: 100%; height: auto; display: block; }
+  .ctrl { display: flex; gap: 8px; align-items: center; font-size: 12px; flex-wrap: wrap; }
+  .ctrl button { border: 1px solid var(--line); background: #fff; border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+  .ctrl button:hover { background: #f0f2f5; }
+  .ctrl input { width: 52px; border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; font-size: 12px; }
+  .files { font-size: 12px; color: #888; margin-top: 10px; line-height: 1.8; }
+  .files a { color: #2b6cb0; margin-right: 12px; }
+  .empty { color: #999; font-size: 13px; padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>anim 预览</h1>
+  <p>读取本目录 manifest.json;视频直接循环播放,雪碧图按帧翻页;透明版切换底色检查抠像边缘。</p>
+</header>
+<main id="app"><div class="empty">读取 manifest.json …</div></main>
+
+<script>
+const app = document.getElementById('app')
+const h = (tag, attrs = {}, children = []) => {
+  const el = document.createElement(tag)
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k.startsWith('on')) el.addEventListener(k.slice(2), v)
+    else if (v != null) el.setAttribute(k, v)
+  }
+  for (const c of children) if (c != null) el.append(c) // 跳过 null 子节点,别把 "null" 渲染成文本
+  return el
+}
+const fileLink = (name) => name && h('a', { href: encodeURIComponent(name), target: '_blank' }, [name])
+
+// 雪碧图播放器:canvas 按 fps 翻页,rgb 与 alpha(若有)共用同一时间轴
+function spritePlayer(item, base) {
+  const f = item.frames
+  let img, imgA
+  const cv = h('canvas', { width: f.frameWidth, height: f.frameHeight })
+  const ctx = cv.getContext('2d')
+  const cvA = h('canvas', { width: f.frameWidth, height: f.frameHeight })
+  const ctxA = cvA.getContext('2d')
+  let playing = true, t0 = performance.now(), fps = f.fps
+
+  const drawOne = (now) => {
+    if (!playing || !img) return
+    const idx = Math.floor(((now - t0) / 1000) * fps) % f.count
+    const sx = (idx % f.cols) * f.frameWidth, sy = Math.floor(idx / f.cols) * f.frameHeight
+    ctx.drawImage(img, sx, sy, f.frameWidth, f.frameHeight, 0, 0, f.frameWidth, f.frameHeight)
+    if (imgA) { ctxA.clearRect(0, 0, cvA.width, cvA.height); ctxA.drawImage(imgA, sx, sy, f.frameWidth, f.frameHeight, 0, 0, f.frameWidth, f.frameHeight) }
+  }
+  // 用 setInterval 而非 rAF:后台/被遮挡的标签页 rAF 会被浏览器暂停,预览页切走再切回要继续在动
+  const load = (src) => new Promise((ok, no) => { const i = new Image(); i.onload = () => ok(i); i.onerror = no; i.src = src })
+  setInterval(() => drawOne(performance.now()), 66)
+
+  const wrap = h('div', { class: 'card' }, [
+    h('h2', {}, [item.name + ' · 雪碧图翻帧', h('span', { class: 'meta' }, [`${f.count} 帧 @${f.fps}fps ${f.frameWidth}×${f.frameHeight} 网格 ${f.cols}×${f.rows}`])]),
+    h('div', { class: 'row' }, [
+      h('div', { class: 'cell' }, [h('span', { class: 'label' }, ['原版雪碧图']), h('div', { class: 'stage checker' }, [cv])]),
+      h('div', { class: 'cell' }, [h('span', { class: 'label' }, ['透明抠像版(切底色看边缘)']), h('div', { class: 'stage checker' }, [cvA])]),
+    ]),
+    h('div', { class: 'ctrl', style: 'margin-top:10px' }, [
+      h('button', { onclick: () => { playing = !playing; if (playing) t0 = performance.now() - 0 } }, ['播放/暂停']),
+      h('span', {}, ['fps ']), h('input', { type: 'number', value: f.fps, min: 1, max: 30,
+        oninput: (e) => { const v = +e.target.value; if (v > 0) { fps = v; t0 = performance.now() } } }),
+      h('span', {}, ['底色 ']),
+      ...['checker', 'white', 'dark', 'magenta'].map((c) =>
+        h('button', { onclick: (e) => { for (const s of e.target.closest('.card').querySelectorAll('.stage')) s.className = 'stage ' + c } }, [{ checker: '棋盘格', white: '白底', dark: '深底', magenta: '品红底' }[c]])),
+    ]),
+    h('div', { class: 'files' }, ['文件: ', fileLink(f.image), f.imageAlpha ? fileLink(f.imageAlpha) : null, fileLink(item.name + '_sprite.json')]),
+  ])
+
+  Promise.all([load(f.image), f.imageAlpha ? load(f.imageAlpha).catch(() => null) : Promise.resolve(null)]).then(([i, ia]) => {
+    img = i; imgA = ia
+  })
+  return wrap
+}
+
+function videoPlayer(item) {
+  const w = item.winner
+  return h('div', { class: 'card' }, [
+    h('h2', {}, [item.name + ' · 视频', h('span', { class: 'meta' },
+      [`${w.model} | $${(+w.cost).toFixed(2)} | ${w.durationSec}s ${w.width}×${w.height} ${(w.bytes / 1048576).toFixed(2)}MB | 处理=${w.treatment} | 循环 ${w.loopOk ? '✅ ' + w.finalLoopPsnr + 'dB' : '⚠️ ' + w.finalLoopPsnr + 'dB 建议只播一次'}`])]),
+    h('div', { class: 'row' }, [
+      h('div', { class: 'cell' }, [h('span', { class: 'label' }, ['成品(循环播放)']),
+        h('video', { src: w.file, controls: '', loop: '', muted: '', autoplay: '', playsinline: '' })]),
+      h('div', { class: 'cell' }, [h('span', { class: 'label' }, ['母带(未处理)']), fileLink(w.master)]),
+    ]),
+  ])
+}
+
+fetch('./manifest.json').then((r) => r.json()).then((m) => {
+  app.innerHTML = ''
+  const items = (m.items || []).filter((it) => it.winner)
+  if (!items.length) { app.innerHTML = '<div class="empty">manifest 里还没有成品,先跑 anim/gen.mjs</div>'; return }
+  for (const it of items) { app.append(videoPlayer(it)); if (it.frames) app.append(spritePlayer(it)) }
+}).catch(() => { app.innerHTML = '<div class="empty">读不到 manifest.json——确认通过 preview/serve.mjs 访问本目录</div>' })
+</script>
+</body>
+</html>

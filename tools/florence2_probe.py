@@ -21,7 +21,7 @@ import sys, os, json, time
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
-MD = r"D:\Pet10-tools\florence2\Florence-2-base-native"  # florence2_convert.py 的产物(键名已转换)
+MD = os.environ.get("FLORENCE2_DIR") or r"D:\Pet10-tools\florence2\Florence-2-base-native"  # 转换版权重;可用 FLORENCE2_DIR 覆盖
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")

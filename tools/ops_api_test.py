@@ -7,6 +7,7 @@
 """
 import io
 import json
+import shutil
 import socket
 import subprocess
 import sys
@@ -151,11 +152,17 @@ def main():
     # 6. 对标库
     st, r = call("POST", "/api/ops/research", {"platform": "dy", "url": "https://www.douyin.com/video/x",
                                                "title": "联调对标", "note": "钩子很稳",
+                                               "accountId": pid_,
                                                "stats": {"likes": "12", "saves": None, "comments": "abc"}})
-    check("research create", st == 200 and r["item"]["stats"] == {"likes": 12, "saves": 0, "comments": 0}, r)
+    check("research create", st == 200 and r["item"]["stats"] == {"likes": 12, "saves": 0, "comments": 0}
+          and r["item"]["accountId"] == pid_, r)
     rid = r["item"]["id"]
     st, r = call("POST", "/api/ops/research", {"platform": "xhs", "url": "ftp://bad"})
     check("research bad url", st == 400 and "http" in r.get("error", ""), r)
+    st, r = call("POST", "/api/ops/research", {"platform": "xhs", "url": "https://ok.example/a",
+                                               "accountId": "zzz"})
+    check("research bad accountId cleared", st == 200 and r["item"]["accountId"] == "", r)
+    call("POST", "/api/ops/research/%s/delete" % r["item"]["id"])
     st, r = call("GET", "/api/ops/research")
     check("research in list", any(x["id"] == rid for x in r["items"]), r)
     st, r = call("POST", "/api/ops/research/%s/delete" % rid)
@@ -177,6 +184,18 @@ def main():
     st, r = call("POST", "/api/ops/posts/%s/update" % ppid, {"status": "published", "notes": "已发链接 x"})
     check("post published stamps", st == 200 and r["post"]["status"] == "published"
           and r["post"]["publishedAt"], r)
+
+    # 7.5 排期与复盘数据(P3):合法日期落、非法清空、stats 白名单整数合并
+    st, r = call("POST", "/api/ops/posts/%s/update" % ppid,
+                 {"scheduleAt": "2026-10-20", "stats": {"likes": "5", "views": None, "bogus": 9}})
+    check("schedule+stats set", st == 200 and r["post"]["scheduleAt"] == "2026-10-20"
+          and r["post"]["stats"] == {"likes": 5, "views": 0}, r)
+    st, r = call("POST", "/api/ops/posts/%s/update" % ppid,
+                 {"scheduleAt": "2026/10/20", "stats": {"comments": "-3"}})
+    check("schedule invalid cleared + stats clamped",
+          st == 200 and r["post"]["scheduleAt"] is None
+          and r["post"]["stats"].get("comments") == 0
+          and r["post"]["stats"].get("likes") == 5, r)
     st, r = call("GET", "/api/ops/posts")
     row = next((x for x in r["posts"] if x["id"] == ppid), {})
     check("post list joined", row.get("accountName") == "联调账号", row)
@@ -196,6 +215,25 @@ def main():
     check("asset delete", st == 200 and r["post"]["assets"] == [], r)
     check("asset file gone", not (ROOT / "genwork" / "ops" / "posts" / ppid / "assets" / "a1.png").is_file())
 
+    # 8.5 视频素材(P2):ffmpeg 产 0.3s 小 mp4 → dataURL(kind 自动判 video)→ 落盘/回读/删除
+    import base64 as _b64
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "testsrc=size=160x120:rate=24:duration=0.3",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    str(ROOT / "genwork" / "ops" / "_test_vid.mp4")], check=True)
+    vid_b64 = _b64.b64encode((ROOT / "genwork" / "ops" / "_test_vid.mp4").read_bytes()).decode()
+    (ROOT / "genwork" / "ops" / "_test_vid.mp4").unlink()
+    st, r = call("POST", "/api/ops/posts/%s/assets" % ppid,
+                 {"dataUrl": "data:video/mp4;base64," + vid_b64})
+    check("video asset add", st == 200 and r["post"]["assets"][0]["file"] == "a1.mp4"
+          and r["post"]["assets"][0]["kind"] == "video"
+          and r["post"]["assets"][0]["mime"] == "video/mp4", r)
+    st, body, headers = call("GET", "/api/ops/posts/%s/asset/a1.mp4" % ppid, raw=True)
+    check("video asset served", st == 200 and headers.get("Content-Type") == "video/mp4"
+          and len(body) > 500, (st, len(body)))
+    st, r = call("POST", "/api/ops/posts/%s/assets/delete" % ppid, {"index": 1})
+    check("video asset delete", st == 200 and r["post"]["assets"] == [], r)
+
     # 9. 发布包 zip:文案.txt(带 BOM)+ tags.txt + assets
     st, r = call("POST", "/api/ops/posts/%s/assets" % ppid,
                  {"dataUrl": "data:image/png;base64," + TINY_PNG_B64})
@@ -213,16 +251,33 @@ def main():
     st, r = call("POST", "/api/ops/posts/%s/assets/delete" % ppid, {"index": 1})
     check("asset cleanup", st == 200 and r["post"]["assets"] == [], r)
 
-    # 10. 素材库
+    # 10. 素材库(P2:视频项 + 短剧挂接)
+    drama_pid = "ab12cd34ef56"
+    drama_dir = ROOT / "genwork" / "drama" / drama_pid
+    (drama_dir / "shots").mkdir(parents=True, exist_ok=True)
+    fake_mp4 = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 600
+    (drama_dir / "composed.mp4").write_bytes(fake_mp4)
+    (drama_dir / "shots" / "ab12cd34ef56_clip.mp4").write_bytes(fake_mp4)
     st, r = call("GET", "/api/ops/library")
+    lib_names = [x["name"] for x in r.get("items", [])]
     check("library list", st == 200 and r.get("ok") and len(r["items"]) >= 1
           and all({"name", "group", "mime", "bytes"} <= set(x) for x in r["items"]),
           len(r.get("items", [])))
+    check("library has video", any(x["mime"] == "video/mp4" for x in r["items"]),
+          [x["name"] for x in r["items"] if x["mime"] == "video/mp4"][:3])
+    check("library drama hooked", f"drama-{drama_pid}-composed.mp4" in lib_names
+          and f"drama-{drama_pid}-shot-ab12cd34ef56.mp4" in lib_names,
+          [n for n in lib_names if n.startswith("drama-")])
+    st, body, _ = call("GET", "/api/ops/library/file/drama-%s-composed.mp4" % drama_pid, raw=True)
+    check("library drama served", st == 200 and body[:8] == fake_mp4[:8], (st, len(body)))
+    st, body, _ = call("GET", "/api/ops/library/file/drama-%s-shot-zzzz.mp4" % drama_pid, raw=True)
+    check("library drama bad name 404", st in (400, 404), st)
     lib_name = r["items"][0]["name"]
     st, body, _ = call("GET", "/api/ops/library/file/" + urllib.request.quote(lib_name), raw=True)
     check("library file served", st == 200 and len(body) > 100, (st, len(body)))
     st, body, _ = call("GET", "/api/ops/library/file/no_such.png", raw=True)
     check("library missing 404", st == 404, st)
+    shutil.rmtree(drama_dir, ignore_errors=True)  # 短剧挂接夹具清理
 
     # 11. 防穿越与未知端点
     st, r = call("GET", "/api/ops/posts/%s/asset/..%%2fpost.json" % ppid)
@@ -232,7 +287,7 @@ def main():
 
     # 12. LLM 文案(真实调用;上游未配或瞬时 5xx 重试一次,再不行则跳过;opt 档撞 429 等下一分钟)
     copy_body = {"personaId": pid_, "topic": "小多利偷吃了一块饼干",
-                 "pillar": "日常治愈", "platform": "xhs"}
+                 "pillar": "日常治愈", "platform": "xhs", "kind": "video"}
     st, r = call("POST", "/api/ops/copy", copy_body)
     for attempt in (1, 2, 3):
         if st == 429 and attempt < 3:

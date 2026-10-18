@@ -16,8 +16,8 @@ import torch
 from safetensors.torch import load_file, save_file
 from transformers import Florence2Config, Florence2ForConditionalGeneration
 
-SRC = r"D:\Pet10-tools\florence2\Florence-2-base"
-DST = r"D:\Pet10-tools\florence2\Florence-2-base-native"
+SRC = sys.argv[1] if len(sys.argv) > 1 else r"D:\Pet10-tools\florence2\Florence-2-base"
+DST = sys.argv[2] if len(sys.argv) > 2 else SRC + "-native"
 
 
 def rename(k):

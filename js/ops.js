@@ -1,6 +1,6 @@
-// FrameFlow - 内容运营工作台(ops.html)
-// 两 tab:创作(人设卡→选题→LLM 文案 3 版→建帖→配图→发布包)/ 调研(平台直达→对标库→LLM 拆解→选题库)。
-// 后端 /api/ops/* 与生图工作台同一把邀请码门禁;配图生成复用 /api/studio/tasks(额度零改动)。
+// FrameFlow - 内容运营工作台(ops.html)v2
+// 三 tab:创作(人设卡→选题→LLM 文案→建帖→配图/视频→发布包)/ 排期(周历+复盘)/ 调研(直达+对标+拆解)。
+// 后端 /api/ops/* 与生图工作台同一把邀请码门禁;生成复用 /api/studio/tasks(额度零改动)。
 // 发布是人工流程:复制文案 + 下载 zip,不做任何平台自动化。
 (function () {
   'use strict';
@@ -60,24 +60,30 @@
   }
 
   // ---------- 状态 ----------
-  var META = null;          // {platforms, pillars, tagGroups, statuses, links}
+  var META = null;
   var PERSONAS = [];
   var CUR = null;           // 当前人设 id
-  var COPIES = [];          // 最近一次生成的文案(可编辑)
-  var POSTS = [];
-  var CURPOST = null;       // 当前打开帖子的完整 json
+  var COPIES = [];
+  var POSTS = [];           // 完整帖子记录(含 assets/scheduleAt/stats)
+  var CURPOST = null;
   var TOPICS = [];
   var RESEARCH = [];
-  var LIB = [];             // 素材库清单
-  var MODELS = [];          // 可用生图模型
-  var GENREFS = [];         // 生图参考图(素材库文件名,≤5)
-  var GENOWNER = {};        // taskId -> postId(归属,结束后保留,结果不丢)
+  var LIB = [];
+  var MODELS = [];
+  var GENREFS = [];
+  var GENOWNER = {};        // taskId -> postId
   var GENRESULTS = {};      // taskId -> 快照
-  var POLL = {};            // taskId -> true(仍在轮询)
+  var POLL = {};            // taskId -> true(轮询中)
   var tagPlat = 'xhs';
-  var libMode = 'asset';    // 素材库弹窗用途:asset=选入素材 ref=参考图
+  var libMode = 'asset';
   var libPicked = {};
   var saveTimer = null;
+  var statsTimer = null;
+  var ACCT_FILTER = '';
+  var STATUS_FILTER = '';
+  var RF_FILTER = '';
+  var WEEK_OFFSET = 0;      // 0=本周,±N 周
+  var KIND_SEL = 'image';
 
   function currentPersona() {
     for (var i = 0; i < PERSONAS.length; i++) if (PERSONAS[i].id === CUR) return PERSONAS[i];
@@ -92,6 +98,10 @@
       if (META.statuses[i].id === id) return META.statuses[i].label;
     }
     return id;
+  }
+  function personaName(id) {
+    for (var i = 0; i < PERSONAS.length; i++) if (PERSONAS[i].id === id) return PERSONAS[i].name;
+    return '?';
   }
 
   // ---------- 工具 ----------
@@ -140,10 +150,32 @@
   function fmtDate(iso) {
     return (iso || '').replace('T', ' ').slice(0, 16);
   }
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
-    });
+  function dayISO(d) {
+    function z(x) { return (x < 10 ? '0' : '') + x; }
+    return d.getFullYear() + '-' + z(d.getMonth() + 1) + '-' + z(d.getDate());
+  }
+  function mondayOf(d) {
+    var x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    x.setDate(x.getDate() - ((x.getDay() + 6) % 7));
+    return x;
+  }
+  function openLightbox(src, isVideo) {
+    var img = $('#lightboxImg'), vid = $('#lightboxVideo');
+    if (isVideo) {
+      img.hidden = true;
+      vid.hidden = false;
+      vid.src = src;
+    } else {
+      vid.hidden = true;
+      vid.removeAttribute('src');
+      img.hidden = false;
+      img.src = src;
+    }
+    $('#lightbox').style.display = 'flex';
+  }
+  function closeLightbox() {
+    $('#lightbox').style.display = 'none';
+    $('#lightboxVideo').pause && $('#lightboxVideo').pause();
   }
 
   // ---------- 启动 ----------
@@ -165,7 +197,7 @@
     }).then(function () {
       renderAll();
       setInterval(pollLoop, 3000);
-      status('就绪。选题 → 文案 → 配图 → 发布包;发布在平台人工完成。');
+      status('就绪。选题 → 文案 → 配图/视频 → 排期 → 人工发布。');
     }).catch(function (e) {
       status('初始化失败:' + (e && e.message || e), true);
     });
@@ -173,7 +205,23 @@
 
   function wireStatic() {
     $('#tabCreate').addEventListener('click', function () { switchTab('create'); });
+    $('#tabSched').addEventListener('click', function () { switchTab('sched'); });
     $('#tabResearch').addEventListener('click', function () { switchTab('research'); });
+    document.querySelectorAll('.ops-card-head[data-fold]').forEach(function (h) {
+      h.addEventListener('click', function () {
+        var body = document.getElementById(h.getAttribute('data-fold'));
+        var card = h.parentElement;
+        var fold = h.querySelector('.fold');
+        var nowHidden = body.hidden;
+        body.hidden = !nowHidden;
+        card.classList.toggle('folded', !nowHidden);
+        fold.textContent = nowHidden ? '收起 ▴' : '展开 ▾';
+      });
+    });
+    $('#dueBanner').addEventListener('click', function () {
+      WEEK_OFFSET = 0;
+      switchTab('sched');
+    });
     $('#personaSel').addEventListener('change', function () {
       CUR = this.value;
       COPIES = [];
@@ -185,16 +233,23 @@
     $('#tagPlat').addEventListener('change', function () { tagPlat = this.value; renderTags(); });
     $('#btnTagAdd').addEventListener('click', addTag);
     $('#tagNew').addEventListener('keydown', function (e) { if (e.key === 'Enter') addTag(); });
+    $('#kindSel').addEventListener('change', function () { KIND_SEL = this.value; });
     $('#btnGenCopy').addEventListener('click', genCopy);
     $('#btnNewPost').addEventListener('click', newEmptyPost);
+    $('#acctFilter').addEventListener('change', function () { ACCT_FILTER = this.value; renderPostList(); });
+    $('#statusFilter').addEventListener('change', function () { STATUS_FILTER = this.value; renderPostList(); });
+    $('#wkPrev').addEventListener('click', function () { WEEK_OFFSET--; renderSched(); });
+    $('#wkNext').addEventListener('click', function () { WEEK_OFFSET++; renderSched(); });
+    $('#wkToday').addEventListener('click', function () { WEEK_OFFSET = 0; renderSched(); });
     $('#btnXhsSearch').addEventListener('click', function () { openLink('xhsSearch'); });
     $('#btnDySearch').addEventListener('click', function () { openLink('dySearch'); });
     $('#btnXhsExplore').addEventListener('click', function () { openLink('xhsExplore'); });
     $('#btnDyHot').addEventListener('click', function () { openLink('dyHot'); });
+    $('#rfAcctFilter').addEventListener('change', function () { RF_FILTER = this.value; renderResearch(); });
     $('#btnResearchAdd').addEventListener('click', addResearch);
     $('#btnAnalyze').addEventListener('click', analyze);
     $('#btnTopicAdd').addEventListener('click', addTopicManual);
-    $('#lightbox').addEventListener('click', function () { this.style.display = 'none'; });
+    $('#lightbox').addEventListener('click', closeLightbox);
     $('#libModal').addEventListener('click', function (e) {
       if (e.target === this) this.style.display = 'none';
     });
@@ -202,9 +257,12 @@
 
   function switchTab(name) {
     $('#paneCreate').hidden = name !== 'create';
+    $('#paneSched').hidden = name !== 'sched';
     $('#paneResearch').hidden = name !== 'research';
     $('#tabCreate').classList.toggle('active', name === 'create');
+    $('#tabSched').classList.toggle('active', name === 'sched');
     $('#tabResearch').classList.toggle('active', name === 'research');
+    if (name === 'sched') renderSched();
   }
 
   function openLink(kind) {
@@ -227,6 +285,16 @@
         o.value = p; o.textContent = p;
         sel.appendChild(o);
       });
+      var sf = $('#statusFilter');
+      sf.innerHTML = '';
+      var all = document.createElement('option');
+      all.value = ''; all.textContent = '全部状态';
+      sf.appendChild(all);
+      META.statuses.forEach(function (s) {
+        var o = document.createElement('option');
+        o.value = s.id; o.textContent = s.label;
+        sf.appendChild(o);
+      });
     });
   }
   function loadModels() {
@@ -244,6 +312,28 @@
       if (!r.ok) throw new Error(errMsg(r.p));
       PERSONAS = r.p.personas || [];
       if (!CUR && PERSONAS.length) CUR = PERSONAS[0].id;
+      renderAcctSelects();
+    });
+  }
+  function renderAcctSelects() {
+    [['#acctFilter', '全部账号', ACCT_FILTER, function (v) { ACCT_FILTER = v; renderPostList(); }],
+     ['#rfAccount', null, CUR, null],
+     ['#rfAcctFilter', '全部账号', RF_FILTER, function (v) { RF_FILTER = v; renderResearch(); }]
+    ].forEach(function (cfg) {
+      var sel = $(cfg[0]);
+      if (!sel) return;
+      sel.innerHTML = '';
+      if (cfg[1]) {
+        var all = document.createElement('option');
+        all.value = ''; all.textContent = cfg[1];
+        sel.appendChild(all);
+      }
+      PERSONAS.forEach(function (p) {
+        var o = document.createElement('option');
+        o.value = p.id; o.textContent = p.name;
+        sel.appendChild(o);
+      });
+      sel.value = cfg[2] || '';
     });
   }
   function loadTopics() {
@@ -266,7 +356,9 @@
     renderTopicChips();
     renderTopicList();
     renderResearch();
+    renderAcctSelects();
     renderPostList();
+    renderDueBanner();
   }
 
   // ---------- 人设卡 ----------
@@ -295,7 +387,7 @@
   function savePersona() {
     if (!CUR) { status('没有账号', true); return; }
     var p = currentPersona();
-    var body = {
+    oPOST('/personas/' + CUR + '/update', {
       name: $('#pfName').value,
       persona: {
         positioning: $('#pfPositioning').value,
@@ -307,8 +399,7 @@
         pillars: p.persona.pillars,
       },
       tags: p.tags,
-    };
-    oPOST('/personas/' + CUR + '/update', body).then(function (r) {
+    }).then(function (r) {
       if (!r.ok) { status(errMsg(r.p), true); return; }
       for (var i = 0; i < PERSONAS.length; i++) if (PERSONAS[i].id === CUR) PERSONAS[i] = r.p.persona;
       fillPersonaForm();
@@ -447,11 +538,13 @@
     var ps = selectedPlatforms();
     if (!ps.length) { status('至少勾选一个平台', true); return; }
     var platform = ps[0];
+    KIND_SEL = $('#kindSel').value;
     var btn = $('#btnGenCopy');
     btn.disabled = true;
-    status('正在按「' + currentPersona().name + '」人设生成 ' + platformLabel(platform) + ' 文案…(10~30 秒)');
+    status('正在按「' + currentPersona().name + '」人设生成 ' + platformLabel(platform) +
+           (KIND_SEL === 'video' ? ' 视频帖' : ' 图文') + ' 文案…(10~30 秒)');
     oPOST('/copy', { personaId: CUR, topic: topic, pillar: $('#pillarSel').value,
-                     platform: platform }).then(function (r) {
+                     platform: platform, kind: KIND_SEL }).then(function (r) {
       btn.disabled = false;
       if (!r.ok) { status(errMsg(r.p), true); return; }
       COPIES = r.p.copies || [];
@@ -466,7 +559,8 @@
     var lib = tagsInLibrary(plat);
     COPIES.forEach(function (c, i) {
       var card = el('div', 'copy-card');
-      card.appendChild(el('div', 'c-head', '版本 ' + (i + 1) + ' · ' + platformLabel(plat)));
+      card.appendChild(el('div', 'c-head',
+        '版本 ' + (i + 1) + ' · ' + platformLabel(plat) + ' · ' + (KIND_SEL === 'video' ? '视频帖' : '图文')));
       var title = el('input', 'txt');
       title.value = c.title;
       title.addEventListener('input', function () { c.title = this.value; });
@@ -480,7 +574,7 @@
       (c.tags || []).forEach(function (t) {
         var on = lib[t];
         var chip = el('span', 'ops-tag clickable' + (on ? ' on' : ''), '#' + t);
-        if (!on) chip.title = '标签库没有,「用这版」后可一键收进标签库';
+        if (!on) chip.title = '标签库没有,建帖后可一键收进标签库';
         chip.addEventListener('click', function () {
           var idx = c.tags.indexOf(t);
           if (idx >= 0) { c.tags.splice(idx, 1); chip.classList.remove('on'); }
@@ -500,10 +594,6 @@
         copyText([c.title, c.body, tagLine(c.tags)].filter(Boolean).join('\n\n'));
       });
       ops.appendChild(cp);
-      var regen = el('button', 'btn', '再生成');
-      regen.type = 'button';
-      regen.addEventListener('click', genCopy);
-      ops.appendChild(regen);
       card.appendChild(ops);
       box.appendChild(card);
     });
@@ -513,50 +603,55 @@
     if (!c) return;
     var topic = ($('#topicInput').value || '').trim();
     oPOST('/posts', { accountId: CUR, topic: topic, pillar: $('#pillarSel').value,
+                      kind: $('#kindSel').value,
                       platforms: selectedPlatforms(), copies: COPIES,
                       chosen: { title: c.title, body: c.body, tags: c.tags.slice() } })
       .then(function (r) {
         if (!r.ok) { status(errMsg(r.p), true); return; }
         loadPosts().then(function () {
           openPost(r.p.post.id);
-          status('帖子已建(草稿态),可以配图或继续改文案');
+          status('帖子已建(草稿态),可以配图/挂视频或继续改文案');
         });
       });
   }
 
-  // ---------- 帖子 ----------
-  function summaryOf(full) {
-    return { id: full.id, accountId: full.accountId, accountName: full.accountName,
-             topic: full.topic, pillar: full.pillar, platforms: full.platforms,
-             chosen: full.chosen, status: full.status, createdAt: full.createdAt,
-             updatedAt: full.updatedAt };
+  // ---------- 帖子列表 ----------
+  function filteredPosts() {
+    return POSTS.filter(function (p) {
+      if (ACCT_FILTER && p.accountId !== ACCT_FILTER) return false;
+      if (STATUS_FILTER && p.status !== STATUS_FILTER) return false;
+      return true;
+    });
   }
   function renderPostList() {
     var box = $('#postList');
     box.innerHTML = '';
-    var sorted = POSTS.slice().sort(function (a, b) {
+    var sorted = filteredPosts().sort(function (a, b) {
       return (b.createdAt || '').localeCompare(a.createdAt || '');
     });
     sorted.forEach(function (p) {
       var card = el('div', 'post-card' + (CURPOST && CURPOST.id === p.id ? ' sel' : ''));
       card.appendChild(el('span', 'post-dot ' + p.status));
-      card.appendChild(el('span', 'p-title', (p.chosen && p.chosen.title) || p.topic));
-      card.appendChild(el('span', 'p-meta',
-        (p.accountName || '?') + ' · ' + p.platforms.map(platformLabel).join('/') +
-        ' · ' + statusLabel(p.status) + ' · ' + fmtDate(p.updatedAt)));
+      var main = el('div', 'p-main');
+      main.appendChild(el('div', 'p-title', (p.chosen && p.chosen.title) || p.topic));
+      var bits = [(p.accountName || personaName(p.accountId))];
+      bits.push(p.platforms.map(platformLabel).join('/'));
+      bits.push(statusLabel(p.status));
+      if (p.kind === 'video') bits.push('🎬视频');
+      var assetN = (p.assets || []).length;
+      if (assetN) bits.push('🖼' + assetN);
+      main.appendChild(el('div', 'p-meta', bits.join(' · ') + ' · ' + fmtDate(p.updatedAt)));
+      card.appendChild(main);
+      if (p.scheduleAt) card.appendChild(el('span', 'p-sched', p.scheduleAt.slice(5)));
       card.addEventListener('click', function () { openPost(p.id); });
       box.appendChild(card);
     });
     $('#postEmpty').hidden = sorted.length > 0;
     $('#postListView').hidden = !!CURPOST;
     $('#postDetail').hidden = !CURPOST;
+    renderDueBanner();
   }
   function refreshPostRow() {
-    if (!CURPOST) return;
-    var s = summaryOf(CURPOST);
-    for (var i = 0; i < POSTS.length; i++) {
-      if (POSTS[i].id === s.id) { POSTS[i] = s; break; }
-    }
     var hidden = $('#postListView').hidden;
     var detHidden = $('#postDetail').hidden;
     renderPostList();
@@ -599,12 +694,24 @@
       });
     }, 700);
   }
+  function scheduleStatsSave() {
+    clearTimeout(statsTimer);
+    statsTimer = setTimeout(function () {
+      if (!CURPOST) return;
+      oPOST('/posts/' + CURPOST.id + '/update', { stats: CURPOST.stats }).then(function (r) {
+        if (!r.ok) { status(errMsg(r.p), true); return; }
+        CURPOST = r.p.post;
+        refreshPostRow();
+      });
+    }, 700);
+  }
 
   function newEmptyPost() {
     var topic = ($('#topicInput').value || '').trim();
     if (!topic) topic = window.prompt('这条帖子讲什么(选题)');
     if (!topic) return;
     oPOST('/posts', { accountId: CUR, topic: topic, pillar: $('#pillarSel').value,
+                      kind: $('#kindSel').value,
                       platforms: selectedPlatforms() }).then(function (r) {
       if (!r.ok) { status(errMsg(r.p), true); return; }
       loadPosts().then(function () {
@@ -614,6 +721,14 @@
     });
   }
 
+  // ---------- 帖子详情 ----------
+  var STEPS = [
+    { id: 'idea', label: '想法' },
+    { id: 'draft', label: '草稿' },
+    { id: 'ready', label: '待发' },
+    { id: 'published', label: '已发' },
+  ];
+
   function renderPostDetail() {
     var p = CURPOST;
     if (!p) return;
@@ -621,25 +736,41 @@
     box.innerHTML = '';
     var d = el('div', 'ops-detail');
 
-    // 头部:状态 + 流转 + 返回/删除
-    var head = el('div', 'd-head');
-    head.appendChild(el('span', 'post-dot ' + p.status));
-    head.appendChild(el('span', 'status-pill', statusLabel(p.status)));
-    if (p.status === 'idea') flowBtn(head, '转草稿', 'draft');
-    if (p.status === 'draft') flowBtn(head, '标记待发', 'ready');
-    if (p.status === 'ready') flowBtn(head, '标记已发', 'published');
-    if (p.status === 'published') {
-      head.appendChild(el('span', 'p-meta', '发布于 ' + fmtDate(p.publishedAt)));
-      flowBtn(head, '退回草稿', 'draft');
-    }
-    var spacer = el('span', 'spacer');
-    head.appendChild(spacer);
-    var back = el('button', 'btn', '← 返回列表');
+    // ---- 头部:状态 stepper + 操作 ----
+    var head = el('div', 'ops-detail-head');
+    var steps = el('div', 'ops-steps');
+    var curIdx = STEPS.findIndex(function (s) { return s.id === p.status; });
+    STEPS.forEach(function (s, i) {
+      var st = el('span', 'ops-step' + (i < curIdx ? ' done' : '') + (i === curIdx ? ' cur' : '') +
+                  (i !== curIdx ? ' tok' : ''));
+      st.appendChild(el('span', 'sdot'));
+      st.appendChild(el('span', null, s.label));
+      if (i !== curIdx) {
+        st.title = '改为「' + s.label + '」';
+        st.addEventListener('click', function () {
+          patchPost({ status: s.id }).then(function (np) { if (np) renderPostDetail(); });
+        });
+      }
+      steps.appendChild(st);
+      if (i < STEPS.length - 1) steps.appendChild(el('span', null, '→'));
+    });
+    head.appendChild(steps);
+    head.appendChild(el('span', 'spacer'));
+    var copyBtn = el('button', 'btn primary', '📋 复制文案');
+    copyBtn.type = 'button';
+    copyBtn.addEventListener('click', function () { copyText(composedText(CURPOST)); });
+    head.appendChild(copyBtn);
+    var zip = el('button', 'btn', '⬇ 发布包');
+    zip.type = 'button';
+    zip.addEventListener('click', downloadPackage);
+    head.appendChild(zip);
+    var back = el('button', 'btn', '返回列表');
     back.type = 'button';
     back.addEventListener('click', closePost);
     head.appendChild(back);
-    var del = el('button', 'btn', '🗑 删除');
+    var del = el('button', 'btn', '🗑');
     del.type = 'button';
+    del.title = '删除帖子';
     del.addEventListener('click', function () {
       if (!window.confirm('删除这条帖子?文案与素材一并删除,不可恢复。')) return;
       oPOST('/posts/' + p.id + '/delete').then(function () {
@@ -651,12 +782,34 @@
     head.appendChild(del);
     d.appendChild(head);
 
-    // 选题行
-    d.appendChild(el('div', 'label-row', '选题:' + p.topic + '  ·  支柱:' + p.pillar));
+    // ---- 中区:左=文案,右=标签+排期与数据 ----
+    var mid = el('div', 'ops-grid2');
+    var leftCol = el('div', 'ops-col');
 
-    // 平台勾选
-    var plats = el('div', 'label-row');
-    plats.appendChild(el('span', 'c-head', '发布平台:'));
+    // 文案卡
+    var copy = el('div', 'ops-subcard');
+    var copyHead = el('div', 'sc-head');
+    copyHead.appendChild(el('span', null, '📝 文案'));
+    var kindSel = el('select');
+    kindSel.style.cssText = 'width:auto;margin-left:auto;font-size:11.5px;padding:2px 6px';
+    [['image', '图文'], ['video', '🎬 视频']].forEach(function (kv) {
+      var o = document.createElement('option');
+      o.value = kv[0]; o.textContent = kv[1];
+      if (p.kind === kv[0]) o.selected = true;
+      kindSel.appendChild(o);
+    });
+    kindSel.addEventListener('change', function () {
+      patchPost({ kind: this.value });
+    });
+    copyHead.appendChild(kindSel);
+    copy.appendChild(copyHead);
+    var c = p.chosen || { title: '', body: '', tags: [] };
+    var topicLine = el('div', 'hint', '选题:' + p.topic + ' · 支柱:' + p.pillar);
+    topicLine.style.margin = '0 0 8px';
+    copy.appendChild(topicLine);
+    var plats = el('div', 'ops-row');
+    plats.style.marginBottom = '6px';
+    plats.appendChild(el('span', 'sc-note', '发布平台:'));
     ['xhs', 'dy'].forEach(function (k) {
       var lb = el('label', 'row');
       lb.style.margin = '0';
@@ -675,32 +828,29 @@
       lb.appendChild(document.createTextNode(' ' + platformLabel(k)));
       plats.appendChild(lb);
     });
-    d.appendChild(plats);
-
-    // 文案
-    var c = p.chosen || { title: '', body: '', tags: [] };
+    copy.appendChild(plats);
     var titleLb = el('label', 'f-label', '标题');
     var titleIn = el('input', 'txt');
     titleIn.value = c.title || '';
     titleLb.appendChild(titleIn);
-    d.appendChild(titleLb);
+    copy.appendChild(titleLb);
     var bodyLb = el('label', 'f-label', '正文(标签不写进正文,复制/打包时自动拼在尾部)');
     var bodyTa = el('textarea');
-    bodyTa.rows = 6;
+    bodyTa.rows = 7;
     bodyTa.value = c.body || '';
     bodyLb.appendChild(bodyTa);
-    d.appendChild(bodyLb);
+    copy.appendChild(bodyLb);
     var counts = el('div', 'count-line');
-    d.appendChild(counts);
+    copy.appendChild(counts);
     function recount() {
       counts.innerHTML = '';
       CURPOST.platforms.forEach(function (k) {
         var m = META.platforms[k];
         var tOver = k === 'xhs' && titleIn.value.length > m.titleMax;
         var bOver = bodyTa.value.length > m.bodyMax;
-        var seg = el('span', null, (m.label + ' 标题 ' + titleIn.value.length + '/' + m.titleMax +
-                                    ' · 正文 ' + bodyTa.value.length + '/' + m.bodyMax + '   '));
-        if (tOver || bOver) seg.className = 'over';
+        var seg = el('span', 'count-badge' + (tOver || bOver ? ' over' : ''),
+                     m.label + ' 标题 ' + titleIn.value.length + '/' + m.titleMax +
+                     ' · 正文 ' + bodyTa.value.length + '/' + m.bodyMax);
         counts.appendChild(seg);
       });
     }
@@ -720,10 +870,13 @@
       recount();
       scheduleSave();
     });
+    leftCol.appendChild(copy);
 
-    // 标签 chips(点 = 增/删这篇的标签;发布拼接在复制/打包时自动做)
-    var tagRow = el('div', null);
-    tagRow.appendChild(el('div', 'c-head', '话题标签(点标签增删)'));
+    // ---- 右列:标签 + 排期与数据 ----
+    var rightCol = el('div', 'ops-col');
+
+    var tagCard = el('div', 'ops-subcard');
+    tagCard.appendChild(el('div', 'sc-head', '🏷 话题标签'));
     var chips = el('div', 'ops-tags');
     function renderPostTags() {
       chips.innerHTML = '';
@@ -741,12 +894,12 @@
       });
     }
     renderPostTags();
-    tagRow.appendChild(chips);
-    var tagOps = el('div', 'label-row');
-    tagOps.style.marginTop = '6px';
+    tagCard.appendChild(chips);
+    var tagOps = el('div', 'ops-row');
+    tagOps.style.marginTop = '8px';
     var tagInput = el('input', 'txt');
-    tagInput.placeholder = '自定义标签(不带#)后回车';
-    tagInput.style.cssText = 'width:auto;flex:1;min-width:120px';
+    tagInput.placeholder = '自定义标签(回车添加)';
+    tagInput.style.cssText = 'flex:1;min-width:0';
     tagInput.addEventListener('keydown', function (e) {
       if (e.key !== 'Enter') return;
       var name = this.value.trim().replace(/^#/, '');
@@ -758,8 +911,9 @@
       scheduleSave();
     });
     tagOps.appendChild(tagInput);
-    var saveLib = el('button', 'btn', '把所选标签存进标签库');
+    var saveLib = el('button', 'btn', '存进标签库');
     saveLib.type = 'button';
+    saveLib.title = '把所选标签收进该账号标签库';
     saveLib.addEventListener('click', function () {
       var p2 = currentPersona();
       if (!p2 || !CURPOST.chosen) return;
@@ -777,10 +931,45 @@
       });
     });
     tagOps.appendChild(saveLib);
-    tagRow.appendChild(tagOps);
-    d.appendChild(tagRow);
+    tagCard.appendChild(tagOps);
+    rightCol.appendChild(tagCard);
 
-    // 备注
+    // 排期与数据卡
+    var schedCard = el('div', 'ops-subcard');
+    schedCard.appendChild(el('div', 'sc-head', '🗓 排期与数据'));
+    var dateLb = el('label', 'f-label', '计划发布日(到点用平台定时发)');
+    var dateIn = el('input', 'txt');
+    dateIn.type = 'date';
+    dateIn.value = p.scheduleAt || '';
+    dateIn.addEventListener('change', function () {
+      patchPost({ scheduleAt: this.value || '' }).then(function () { renderDueBanner(); });
+    });
+    dateLb.appendChild(dateIn);
+    schedCard.appendChild(dateLb);
+    var statsRow = el('div', 'ops-grid3');
+    statsRow.style.marginTop = '8px';
+    [['views', '曝光'], ['likes', '赞'], ['saves', '藏'],
+     ['comments', '评'], ['follows', '涨粉']].forEach(function (kv) {
+      var lb = el('label', 'f-label');
+      lb.style.marginTop = '0';
+      lb.appendChild(el('span', null, kv[1]));
+      var num = el('input', 'txt');
+      num.type = 'number';
+      num.min = '0';
+      num.value = (p.stats && p.stats[kv[0]] !== undefined && p.stats[kv[0]] !== null) ? p.stats[kv[0]] : '';
+      num.addEventListener('input', function () {
+        bindStats();
+        var v = parseInt(this.value, 10);
+        CURPOST.stats[kv[0]] = isNaN(v) ? 0 : Math.max(0, v);
+        scheduleStatsSave();
+      });
+      lb.appendChild(num);
+      statsRow.appendChild(lb);
+    });
+    function bindStats() {
+      if (!CURPOST.stats) CURPOST.stats = {};
+    }
+    schedCard.appendChild(statsRow);
     var notesLb = el('label', 'f-label', '备注(发布链接/复盘想法)');
     var notes = el('textarea');
     notes.rows = 2;
@@ -790,21 +979,39 @@
       scheduleSave();
     });
     notesLb.appendChild(notes);
-    d.appendChild(notesLb);
+    schedCard.appendChild(notesLb);
+    rightCol.appendChild(schedCard);
 
-    // 素材条
-    d.appendChild(el('div', 'label-row', '素材(第一张即封面)'));
+    mid.appendChild(leftCol);
+    mid.appendChild(rightCol);
+    d.appendChild(mid);
+
+    // ---- 素材卡 ----
+    var assetCard = el('div', 'ops-subcard');
+    var assetHead = el('div', 'sc-head');
+    assetHead.appendChild(el('span', null, '🖼 素材'));
+    assetHead.appendChild(el('span', 'sc-note', '第一张即封面;视频直接挂 mp4'));
+    assetCard.appendChild(assetHead);
     var strip = el('div', 'ops-assets');
     (p.assets || []).forEach(function (a, i) {
       var item = el('div', 'ops-asset');
-      var img = document.createElement('img');
-      img.src = '/api/ops/posts/' + p.id + '/asset/' + a.file;
-      img.alt = a.file;
-      img.addEventListener('click', function () {
-        $('#lightboxImg').src = img.src;
-        $('#lightbox').style.display = 'flex';
-      });
-      item.appendChild(img);
+      var isVideo = a.mime === 'video/mp4';
+      var url = '/api/ops/posts/' + p.id + '/asset/' + a.file;
+      if (isVideo) {
+        var v = document.createElement('video');
+        v.src = url;
+        v.muted = true;
+        v.preload = 'metadata';
+        v.addEventListener('click', function () { openLightbox(url, true); });
+        item.appendChild(v);
+        item.appendChild(el('span', 'vmark', '▶ 视频'));
+      } else {
+        var img = document.createElement('img');
+        img.src = url;
+        img.alt = a.file;
+        img.addEventListener('click', function () { openLightbox(url, false); });
+        item.appendChild(img);
+      }
       if (i === 0) item.appendChild(el('span', 'cover-mark', '封面'));
       var x = el('span', 'x', '×');
       x.title = '删除素材';
@@ -825,43 +1032,30 @@
     var addLib = el('div', 'ops-asset add', '素材库');
     addLib.addEventListener('click', function () { openLibrary('asset'); });
     strip.appendChild(addLib);
-    d.appendChild(strip);
+    assetCard.appendChild(strip);
+    d.appendChild(assetCard);
 
-    // 生成配图
-    d.appendChild(buildGenBox());
-
-    // 底部操作
-    var foot = el('div', 'c-ops');
-    var copyBtn = el('button', 'btn primary', '📋 复制文案');
-    copyBtn.type = 'button';
-    copyBtn.addEventListener('click', function () { copyText(composedText(CURPOST)); });
-    foot.appendChild(copyBtn);
-    var zip = el('button', 'btn', '⬇ 下载素材包(zip)');
-    zip.type = 'button';
-    zip.addEventListener('click', downloadPackage);
-    foot.appendChild(zip);
-    d.appendChild(foot);
+    // ---- AI 生图卡 ----
+    var genCard = el('div', 'ops-subcard');
+    genCard.appendChild(el('div', 'sc-head', '🎨 AI 生成配图'));
+    genCard.appendChild(buildGenBox());
+    d.appendChild(genCard);
 
     box.appendChild(d);
-  }
-  function flowBtn(parent, label, to) {
-    var b = el('button', 'btn', label);
-    b.type = 'button';
-    b.addEventListener('click', function () {
-      patchPost({ status: to }).then(function (np) { if (np) renderPostDetail(); });
-    });
-    parent.appendChild(b);
   }
   function pickLocalFile() {
     var inp = document.createElement('input');
     inp.type = 'file';
-    inp.accept = 'image/jpeg,image/png,image/webp,image/gif';
+    inp.accept = 'image/jpeg,image/png,image/webp,image/gif,video/mp4';
     inp.addEventListener('change', function () {
       var f = inp.files && inp.files[0];
       if (!f) return;
-      if (f.size > 10 * 1024 * 1024) { status('图片超过 10MB,请先压缩', true); return; }
+      var isVideo = f.type === 'video/mp4';
+      var cap = isVideo ? 80 * 1024 * 1024 : 10 * 1024 * 1024;
+      if (f.size > cap) { status((isVideo ? '视频' : '图片') + '超过 ' + (cap / 1024 / 1024) + 'MB 上限', true); return; }
+      status('正在上传…');
       blobToDataURL(f).then(function (dataUrl) {
-        return oPOST('/posts/' + CURPOST.id + '/assets', { dataUrl: dataUrl, kind: 'image' });
+        return oPOST('/posts/' + CURPOST.id + '/assets', { dataUrl: dataUrl });
       }).then(function (r) {
         if (!r.ok) { status(errMsg(r.p), true); return; }
         CURPOST = r.p.post;
@@ -897,11 +1091,7 @@
   function buildGenBox() {
     var p = CURPOST;
     var box = el('div', 'genbox');
-    var head = el('div', 'label-row');
-    head.appendChild(el('label', null, 'AI 生成配图(走生图工作台额度)'));
-    box.appendChild(head);
-
-    var opts = el('div', 'label-row');
+    var opts = el('div', 'ops-row');
     opts.style.gap = '8px';
     var modelSel = el('select');
     modelSel.style.width = 'auto';
@@ -921,6 +1111,7 @@
       o.value = r[0]; o.textContent = r[1];
       ratioSel.appendChild(o);
     });
+    ratioSel.value = p.kind === 'video' ? '9:16' : '3:4';
     opts.appendChild(ratioSel);
     box.appendChild(opts);
 
@@ -983,7 +1174,6 @@
     });
     box.appendChild(genBtn);
 
-    // 本帖的生成结果与进行中状态
     var res = el('div', 'gen-res');
     Object.keys(GENRESULTS).forEach(function (tid) {
       if (GENOWNER[tid] !== p.id) return;
@@ -997,14 +1187,11 @@
         snap.data.forEach(function (it, idx) {
           var img = document.createElement('img');
           img.src = '/api/studio/file/' + snap.id + '/' + (idx + 1);
-          img.addEventListener('click', function () {
-            $('#lightboxImg').src = img.src;
-            $('#lightbox').style.display = 'flex';
-          });
+          img.addEventListener('click', function () { openLightbox(img.src, false); });
           item.appendChild(img);
           var pick = el('div', 'pick', '选入帖子');
           pick.addEventListener('click', function () {
-            oPOST('/posts/' + p.id + '/assets', { file: { taskId: snap.id, index: idx + 1 }, kind: 'image' })
+            oPOST('/posts/' + p.id + '/assets', { file: { taskId: snap.id, index: idx + 1 } })
               .then(function (r) {
                 if (!r.ok) { status(errMsg(r.p), true); return; }
                 CURPOST = r.p.post;
@@ -1054,7 +1241,8 @@
     var box = $('#libBox');
     box.innerHTML = '';
     var head = el('div', 'lib-head');
-    head.appendChild(el('strong', null, mode === 'asset' ? '素材库 · 点图选入帖子' : '素材库 · 勾选参考图(≤5)'));
+    head.appendChild(el('strong', null,
+      mode === 'asset' ? '素材库 · 点图选入帖子(图/视频)' : '素材库 · 勾选参考图(≤5,仅图片)'));
     head.appendChild(el('span', 'spacer'));
     if (mode === 'ref') {
       var ok = el('button', 'btn primary', '确定');
@@ -1075,15 +1263,26 @@
     box.appendChild(head);
     var grid = el('div', 'ops-libgrid');
     LIB.forEach(function (item) {
+      var isVideo = item.mime === 'video/mp4';
       var it = el('div', 'ops-libitem');
-      var img = document.createElement('img');
-      img.src = '/api/ops/library/file/' + encodeURIComponent(item.name);
-      img.loading = 'lazy';
-      it.appendChild(img);
+      if (isVideo) {
+        var v = document.createElement('video');
+        v.src = '/api/ops/library/file/' + encodeURIComponent(item.name);
+        v.muted = true;
+        v.preload = 'metadata';
+        it.appendChild(v);
+      } else {
+        var img = document.createElement('img');
+        img.src = '/api/ops/library/file/' + encodeURIComponent(item.name);
+        img.loading = 'lazy';
+        it.appendChild(img);
+      }
       it.appendChild(el('div', 'l-name', item.name));
-      it.appendChild(el('div', 'l-meta', item.group + ' · ' + Math.round(item.bytes / 1024) + 'KB'));
+      it.appendChild(el('div', 'l-meta', item.group + ' · ' + Math.round(item.bytes / 1024) + 'KB' +
+        (isVideo ? ' · ▶' : '')));
       it.addEventListener('click', function () {
         if (libMode === 'ref') {
+          if (isVideo) { status('参考图只能选图片', true); return; }
           if (libPicked[item.name]) { delete libPicked[item.name]; it.classList.remove('sel'); }
           else {
             if (Object.keys(libPicked).length >= 5) { status('参考图最多 5 张', true); return; }
@@ -1095,7 +1294,7 @@
         }
         status('正在把「' + item.name + '」加入素材…');
         libraryDataURL(item.name).then(function (dataUrl) {
-          return oPOST('/posts/' + CURPOST.id + '/assets', { dataUrl: dataUrl, kind: 'image' });
+          return oPOST('/posts/' + CURPOST.id + '/assets', { dataUrl: dataUrl });
         }).then(function (r) {
           if (!r.ok) { status(errMsg(r.p), true); return; }
           CURPOST = r.p.post;
@@ -1111,6 +1310,154 @@
     $('#libModal').style.display = 'flex';
   }
 
+  // ---------- 排期 tab ----------
+  function renderSched() {
+    var start = mondayOf(new Date());
+    start.setDate(start.getDate() + WEEK_OFFSET * 7);
+    var days = [];
+    for (var i = 0; i < 7; i++) {
+      var d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
+      days.push(d);
+    }
+    $('#wkLabel').textContent = dayISO(days[0]).slice(5) + ' ~ ' + dayISO(days[6]).slice(5) +
+      (WEEK_OFFSET === 0 ? '(本周)' : '');
+    var today = dayISO(new Date());
+    var DOWS = ['一', '二', '三', '四', '五', '六', '日'];
+    var grid = $('#weekGrid');
+    grid.innerHTML = '';
+    days.forEach(function (d, i) {
+      var iso = dayISO(d);
+      var cell = el('div', 'wk-cell' + (iso === today ? ' wk-today' : '') +
+                    (i >= 5 ? ' wk-off' : ''));
+      var dh = el('div', 'wk-date');
+      dh.appendChild(el('span', 'wk-dow', '周' + DOWS[i]));
+      dh.appendChild(el('span', null, iso.slice(5)));
+      cell.appendChild(dh);
+      POSTS.forEach(function (p) {
+        if (p.scheduleAt !== iso) return;
+        var chip = el('div', 'wk-chip s-' + p.status,
+          (p.kind === 'video' ? '🎬 ' : '') + ((p.chosen && p.chosen.title) || p.topic));
+        chip.title = statusLabel(p.status) + ' · ' + p.platforms.map(platformLabel).join('/') +
+          '(点开帖子)';
+        chip.addEventListener('click', function () {
+          switchTab('create');
+          openPost(p.id);
+        });
+        cell.appendChild(chip);
+      });
+      grid.appendChild(cell);
+    });
+
+    // 未排期 backlog
+    var backlog = $('#backlogList');
+    backlog.innerHTML = '';
+    var pending = POSTS.filter(function (p) {
+      return !p.scheduleAt && (p.status === 'draft' || p.status === 'ready');
+    }).sort(function (a, b) { return (b.updatedAt || '').localeCompare(a.updatedAt || ''); });
+    pending.forEach(function (p) {
+      var row = el('div', 'backlog-row');
+      row.appendChild(el('span', 'post-dot ' + p.status));
+      row.appendChild(el('span', 'b-title', (p.kind === 'video' ? '🎬 ' : '') +
+        ((p.chosen && p.chosen.title) || p.topic)));
+      row.appendChild(el('span', 'p-meta', statusLabel(p.status)));
+      var t1 = el('button', 'btn', '排今天');
+      t1.type = 'button';
+      t1.addEventListener('click', function () { schedQuick(p.id, today); });
+      row.appendChild(t1);
+      var t2 = el('button', 'btn', '排明天');
+      t2.type = 'button';
+      var tm = new Date();
+      tm.setDate(tm.getDate() + 1);
+      t2.addEventListener('click', function () { schedQuick(p.id, dayISO(tm)); });
+      row.appendChild(t2);
+      var open = el('button', 'btn', '详情');
+      open.type = 'button';
+      open.addEventListener('click', function () {
+        switchTab('create');
+        openPost(p.id);
+      });
+      row.appendChild(open);
+      backlog.appendChild(row);
+    });
+    if (!pending.length) backlog.appendChild(el('div', 'gen-empty', '没有待排期的帖子:草稿/待发都会出现在这里。'));
+
+    renderReview();
+    renderDueBanner();
+  }
+  function schedQuick(pid, day) {
+    oPOST('/posts/' + pid + '/update', { scheduleAt: day }).then(function (r) {
+      if (!r.ok) { status(errMsg(r.p), true); return; }
+      for (var i = 0; i < POSTS.length; i++) {
+        if (POSTS[i].id === pid) POSTS[i] = r.p.post;
+      }
+      if (CURPOST && CURPOST.id === pid) CURPOST = r.p.post;
+      renderSched();
+      status('已排到 ' + day);
+    });
+  }
+
+  // 复盘:按支柱聚合已发帖子的手动数据
+  function renderReview() {
+    var box = $('#reviewBox');
+    box.innerHTML = '';
+    var published = POSTS.filter(function (p) { return p.status === 'published'; });
+    if (!published.length) {
+      box.appendChild(el('div', 'gen-empty', '还没有已发帖子;发布后在帖子详情里填数据,这里自动聚合。'));
+      return;
+    }
+    var byPillar = {};
+    META.pillars.forEach(function (pl) { byPillar[pl] = { n: 0, views: 0, likes: 0, saves: 0, comments: 0, follows: 0 }; });
+    published.forEach(function (p) {
+      var b = byPillar[p.pillar] || byPillar[META.pillars[0]];
+      b.n += 1;
+      var s = p.stats || {};
+      b.views += s.views || 0;
+      b.likes += s.likes || 0;
+      b.saves += s.saves || 0;
+      b.comments += s.comments || 0;
+      b.follows += s.follows || 0;
+    });
+    var grid = el('div', 'ops-review');
+    var head = el('div', 'review-row head');
+    ['支柱', '发帖', '曝光', '赞', '藏', '评', '涨粉'].forEach(function (h) {
+      var s = el('span', null, h);
+      if (h !== '支柱') s.className = 'num';
+      head.appendChild(s);
+    });
+    grid.appendChild(head);
+    var total = { n: 0, views: 0, likes: 0, saves: 0, comments: 0, follows: 0 };
+    META.pillars.forEach(function (pl) {
+      var b = byPillar[pl];
+      if (!b.n) return;
+      ['n', 'views', 'likes', 'saves', 'comments', 'follows'].forEach(function (k) { total[k] += b[k]; });
+      var row = el('div', 'review-row');
+      row.appendChild(el('span', null, pl));
+      ['n', 'views', 'likes', 'saves', 'comments', 'follows'].forEach(function (k) {
+        var s = el('span', 'num', b[k]);
+        row.appendChild(s);
+      });
+      grid.appendChild(row);
+    });
+    var trow = el('div', 'review-row total');
+    trow.appendChild(el('span', null, '合计'));
+    ['n', 'views', 'likes', 'saves', 'comments', 'follows'].forEach(function (k) {
+      trow.appendChild(el('span', 'num', total[k]));
+    });
+    grid.appendChild(trow);
+    box.appendChild(grid);
+  }
+
+  function renderDueBanner() {
+    var today = dayISO(new Date());
+    var due = POSTS.filter(function (p) { return p.scheduleAt === today && p.status !== 'published'; });
+    var b = $('#dueBanner');
+    if (!due.length) { b.hidden = true; return; }
+    b.hidden = false;
+    b.textContent = '📌 今天待发 ' + due.length + ' 条:' +
+      due.slice(0, 2).map(function (p) { return (p.chosen && p.chosen.title) || p.topic; }).join('、') +
+      (due.length > 2 ? ' 等' : '');
+  }
+
   // ---------- 调研:对标库 ----------
   function addResearch() {
     var url = ($('#rfUrl').value || '').trim();
@@ -1121,6 +1468,7 @@
       url: url,
       title: ($('#rfTitle').value || '').trim(),
       note: ($('#rfNote').value || '').trim(),
+      accountId: $('#rfAccount').value || '',
       stats: { likes: $('#rfLikes').value, saves: $('#rfSaves').value, comments: $('#rfComments').value },
     }).then(function (r) {
       if (!r.ok) { status(errMsg(r.p), true); return; }
@@ -1133,11 +1481,15 @@
   function renderResearch() {
     var box = $('#researchList');
     box.innerHTML = '';
-    RESEARCH.forEach(function (it) {
+    var list = RESEARCH.filter(function (it) {
+      return !RF_FILTER || it.accountId === RF_FILTER;
+    });
+    list.forEach(function (it) {
       var card = el('div', 'research-card');
       var head = el('div', 'r-head');
       head.appendChild(el('span', 'r-plat p-' + it.platform, platformLabel(it.platform)));
       head.appendChild(el('span', 'r-plat', it.group));
+      if (it.accountId) head.appendChild(el('span', 'r-plat', personaName(it.accountId)));
       var sp = el('span', 'spacer');
       head.appendChild(sp);
       var del = el('span', 'ops-tag clickable', '删');
@@ -1159,7 +1511,7 @@
         '赞 ' + it.stats.likes + ' · 藏 ' + it.stats.saves + ' · 评 ' + it.stats.comments));
       box.appendChild(card);
     });
-    $('#researchEmpty').hidden = RESEARCH.length > 0;
+    $('#researchEmpty').hidden = list.length > 0;
   }
 
   // ---------- 调研:LLM 拆解 ----------

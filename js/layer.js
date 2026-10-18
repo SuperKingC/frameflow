@@ -320,25 +320,56 @@
     if (!st.canvas || st.busy || !phrase) return;
     setBusy(true);
     try {
-      const r = await samFetch('/api/sam/concepts', { phrase: phrase });
-      const inst = (r.instances || [])[0];
-      if (!inst) {
-        status('没找到「' + phrase + '」对应的元素;换个说法,或直接拖框/点选。', true);
+      let query = phrase;
+      if (/[\u4e00-\u9fff]/.test(query)) {
+        // 语义拆分模型只认英文:中文词先走 LLM 翻译(不可用则退回原词)
+        status('「' + phrase + '」翻译成英文中…');
+        try {
+          const t = await samFetch('/api/sam/translate', { text: query });
+          if (t.en) { status('「' + phrase + '」→ "' + t.en + '"'); query = t.en; }
+        } catch (e) { /* 翻译不可用,用原词碰运气 */ }
+      }
+      const r = await samFetch('/api/sam/concepts', { phrase: query });
+      const list = r.instances || [];
+      if (!list.length) {
+        status('没找到「' + phrase + '」对应的元素;换个英文词试试,或直接拖框/点选。', true);
         return;
       }
-      // 概念命中 → 实例包围盒作 box 提示,SAM2 出精确掩码;收层时以概念词命名
-      st.box = { x0: inst.bbox[0], y0: inst.bbox[1], x1: inst.bbox[0] + inst.bbox[2] - 1, y1: inst.bbox[1] + inst.bbox[3] - 1 };
-      st.points = [];
-      st.dragging = null;
-      st.pendingGround = phrase;
-      drawView();
+      const feather = $('#featherToggle').checked ? 2 : 0;
+      if (list.length === 1) {
+        // 单实例:进预览流程,可继续补点精修,收层时以概念词命名
+        const inst = list[0];
+        st.box = { x0: inst.bbox[0], y0: inst.bbox[1], x1: inst.bbox[0] + inst.bbox[2] - 1, y1: inst.bbox[1] + inst.bbox[3] - 1 };
+        st.points = [];
+        st.dragging = null;
+        st.pendingGround = phrase;
+        drawView();
+      } else {
+        // 多实例:全部直接拆成图层(先给结果再改错),命名 词-1..N
+        let n = 0;
+        for (let i = 0; i < list.length; i++) {
+          const b = list[i].bbox;
+          try {
+            const seg = await samFetch('/api/sam/segment', {
+              model: st.samModel, points: [], labels: [],
+              box: [b[0], b[1], b[0] + b[2] - 1, b[1] + b[3] - 1],
+            });
+            maskToLayer(await decodeMask(seg.mask_b64), phrase + '-' + (i + 1), feather, phrase);
+            n++;
+          } catch (e) { /* 单框失败跳过 */ }
+        }
+        st.points = []; st.box = null; st.dragging = null; st.pendingGround = null;
+        status('「' + phrase + '」拆出 ' + n + ' 个实例图层' + (n < list.length ? '(' + (list.length - n) + ' 框分割失败已跳过)' : '') + ';不合适的在图层列表 ✕ 删除。');
+        return;
+      }
     } catch (e) {
       status('按词拆失败:' + e.message, true);
+      return;
     } finally {
       setBusy(false);
     }
     await segment();
-    if (st.pendingGround === phrase && st.preview) {
+    if (st.preview) {
       status('「' + phrase + '」已定位出掩码 score=' + st.preview.score + ',面积 ' + st.preview.area + ' px;满意点「收下」,不满意继续补点。');
     }
   }
@@ -380,11 +411,8 @@
     return a;
   }
 
-  function keepFromRgba(rgba, name, featherPx) {
-    // rgba: ImageData(BEN2 结果);按其 alpha 收层(可选羽化),推入图层列表
-    let alpha = new Uint8Array(st.canvas.width * st.canvas.height);
-    const src = rgba.data;
-    for (let i = 0; i < alpha.length; i++) alpha[i] = src[i * 4 + 3];
+  function maskToLayer(alpha, name, featherPx, grounded) {
+    // 掩码 → RGBA 图层(核心收层);不碰 points/box/preview,单收与批量拆件共用
     if (featherPx) alpha = featherAlpha(alpha, st.canvas.width, st.canvas.height, featherPx);
     const layer = document.createElement('canvas');
     layer.width = st.canvas.width;
@@ -409,55 +437,32 @@
       }
     }
     lctx.putImageData(out, 0, 0);
-    const label = name || ('图层' + (st.layers.length + 1));
-    st.layers.push({ name: label, canvas: layer, area: area, bbox: { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 }, feather: featherPx || 0 });
-    st.points = [];
-    st.box = null;
-    st.preview = null;
+    st.layers.push({ name: name, canvas: layer, area: area, bbox: { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 }, feather: featherPx || 0, grounded: grounded || null });
     renderLayers();
     drawView();
+    return st.layers[st.layers.length - 1];
+  }
+
+  function keepFromRgba(rgba, name, featherPx) {
+    // rgba: ImageData(BEN2 结果);按其 alpha 收层(可选羽化)
+    let alpha = new Uint8Array(st.canvas.width * st.canvas.height);
+    const src = rgba.data;
+    for (let i = 0; i < alpha.length; i++) alpha[i] = src[i * 4 + 3];
+    const l = maskToLayer(alpha, name, featherPx, null);
+    st.points = []; st.box = null; st.preview = null;
     $('#keepBtn').disabled = true;
-    return area;
+    return l.area;
   }
 
   function keepLayer() {
     if (!st.preview) return;
     const feather = $('#featherToggle').checked ? 2 : 0;
-    let alpha = st.preview.maskData;
-    if (feather) alpha = featherAlpha(alpha, st.canvas.width, st.canvas.height, feather);
-    const layer = document.createElement('canvas');
-    layer.width = st.canvas.width;
-    layer.height = st.canvas.height;
-    const lctx = layer.getContext('2d');
-    const out = lctx.createImageData(st.canvas.width, st.canvas.height);
-    const orig = st.canvas.getContext('2d').getImageData(0, 0, st.canvas.width, st.canvas.height).data;
-    let minX = Infinity, minY = Infinity, maxX = -1, maxY = -1, area = 0;
-    for (let i = 0, n = alpha.length; i < n; i++) {
-      const a = alpha[i];
-      if (a > 0) {
-        area++;
-        const x = i % st.canvas.width, y = (i / st.canvas.width) | 0;
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-        out.data[i * 4] = orig[i * 4];
-        out.data[i * 4 + 1] = orig[i * 4 + 1];
-        out.data[i * 4 + 2] = orig[i * 4 + 2];
-        out.data[i * 4 + 3] = a;
-      }
-    }
-    lctx.putImageData(out, 0, 0);
     const name = st.pendingGround || '图层' + (st.layers.length + 1);
-    st.layers.push({ name: name, canvas: layer, area: area, bbox: { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 }, feather: feather, grounded: st.pendingGround || null });
+    const l = maskToLayer(st.preview.maskData, name, feather, st.pendingGround);
     st.pendingGround = null;
-    st.points = [];
-    st.box = null;
-    st.preview = null;
-    renderLayers();
-    drawView();
+    st.points = []; st.box = null; st.preview = null;
     $('#keepBtn').disabled = true;
-    status('已收下「' + name + '」(' + area + ' px' + (feather ? ',羽化' + feather + 'px' : '') + ')。继续下一个元素。');
+    status('已收下「' + l.name + '」(' + l.area + ' px' + (feather ? ',羽化' + feather + 'px' : '') + ')。继续下一个元素。');
   }
 
   // ---------- 未覆盖像素自检 ----------

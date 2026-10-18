@@ -12,9 +12,9 @@ import sys
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from server import _load_miniapp_env, _find_key, GEN_BASE_URL  # noqa: E402
+from server import _load_dotenv, _find_key, GEN_BASE_URL  # noqa: E402
 
-_load_miniapp_env()
+_load_dotenv()
 KEY = _find_key()
 print("base:", GEN_BASE_URL, "| key:", "set" if KEY else "MISSING")
 

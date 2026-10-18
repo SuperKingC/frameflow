@@ -514,7 +514,7 @@
     }
   }
 
-  // ---------- 生视频(桥接 miniapp-kit anim/gen.mjs) ----------
+  // ---------- 生视频(内置 anim/gen.mjs,服务端 node 桥接) ----------
   const gen = { refDataUrl: null, refName: '', busy: false, batchStop: false };
 
   // 战斗五件套提示词模板:只写运动(图管长相,词管动作);

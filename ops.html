@@ -14,155 +14,220 @@
   <span class="pagetitle">内容运营</span>
 </header>
 
-<main class="gen-main">
+<main class="ops-shell">
   <div class="gen-gate" id="bootHint" style="width:auto"><p class="hint" style="margin:0">正在进入内容运营…</p></div>
 
   <div id="app" hidden>
-    <div class="ops-tabs">
-      <button class="ops-tab active" id="tabCreate" type="button">🎨 创作</button>
-      <button class="ops-tab" id="tabResearch" type="button">🔍 调研</button>
+    <div class="ops-topbar2">
+      <div class="ops-tabs">
+        <button class="ops-tab active" id="tabCreate" type="button">✍️ 创作</button>
+        <button class="ops-tab" id="tabSched" type="button">🗓 排期</button>
+        <button class="ops-tab" id="tabResearch" type="button">🔍 调研</button>
+      </div>
+      <button class="ops-due" id="dueBanner" type="button" hidden></button>
     </div>
 
     <!-- ============ 创作 ============ -->
-    <div class="gen-grid" id="paneCreate">
-      <div class="gen-panel">
-        <h3>账号 · 人设卡</h3>
-        <div style="display:flex;gap:8px;align-items:center">
-          <select id="personaSel" style="flex:1;min-width:0"></select>
-        </div>
-        <div id="personaForm" class="ops-persona">
-          <label class="f-label">账号名
-            <input id="pfName" class="txt" style="width:100%">
-          </label>
-          <label class="f-label">定位(一句话)
-            <textarea id="pfPositioning" rows="2" style="width:100%"></textarea>
-          </label>
-          <label class="f-label">目标人群
-            <textarea id="pfAudience" rows="2" style="width:100%"></textarea>
-          </label>
-          <label class="f-label">语气 / 口吻
-            <textarea id="pfTone" rows="2" style="width:100%"></textarea>
-          </label>
-          <label class="f-label">口头禅
-            <input id="pfCatchphrase" class="txt" style="width:100%" placeholder="如:汪!">
-          </label>
-          <label class="f-label">视觉风格(配图提示词的基调)
-            <textarea id="pfVisual" rows="4" style="width:100%"></textarea>
-          </label>
-          <label class="f-label">禁忌
-            <textarea id="pfTaboos" rows="2" style="width:100%"></textarea>
-          </label>
-          <button class="btn primary wide" id="btnSavePersona">保存人设</button>
-        </div>
+    <div class="ops-layout" id="paneCreate">
+      <aside class="ops-side">
+        <section class="ops-card">
+          <div class="ops-card-head" data-fold="secTopic">
+            <span class="ops-card-title">✍️ 选题与生成</span>
+            <span class="fold">收起 ▴</span>
+          </div>
+          <div class="ops-card-body" id="secTopic">
+            <label class="f-label">这条内容讲什么
+              <textarea id="topicInput" rows="2" placeholder="一句话选题;或点下方选题库灵感"></textarea>
+            </label>
+            <div class="style-chips" id="topicChips"></div>
+            <div class="ops-row" style="margin-top:8px">
+              <label class="f-label" style="flex:1">支柱
+                <select id="pillarSel"></select>
+              </label>
+              <label class="f-label" style="flex:1">类型
+                <select id="kindSel">
+                  <option value="image">图文</option>
+                  <option value="video">视频</option>
+                </select>
+              </label>
+            </div>
+            <div class="ops-row" style="margin-top:8px">
+              <label class="row" style="margin:0"><input type="checkbox" id="platXhs" checked> 小红书</label>
+              <label class="row" style="margin:0"><input type="checkbox" id="platDy" checked> 抖音</label>
+            </div>
+            <button class="btn primary wide" id="btnGenCopy" style="margin-top:10px" type="button">✨ 生成 3 版文案</button>
+            <div id="copyList" class="ops-copies"></div>
+          </div>
+        </section>
 
-        <h3>话题标签库</h3>
-        <div class="label-row" style="gap:6px;flex-wrap:wrap">
-          <select id="tagPlat" style="width:auto"><option value="xhs">小红书</option><option value="dy">抖音</option></select>
-          <input id="tagNew" class="txt" style="flex:1;min-width:90px" placeholder="新标签(不带#)">
-          <select id="tagGroup" style="width:auto">
-            <option>流量</option><option>精准</option><option>人设</option><option>自定义</option>
-          </select>
-          <button class="btn" id="btnTagAdd" type="button">添加</button>
-        </div>
-        <div id="tagCloud" class="ops-tags"></div>
+        <section class="ops-card folded">
+          <div class="ops-card-head" data-fold="secPersona">
+            <span class="ops-card-title">🎭 账号 · 人设卡</span>
+            <span class="fold">展开 ▾</span>
+          </div>
+          <div class="ops-card-body" id="secPersona" hidden>
+            <select id="personaSel" style="width:100%"></select>
+            <div class="ops-persona">
+              <label class="f-label">账号名<input id="pfName" class="txt"></label>
+              <label class="f-label">定位(一句话)<textarea id="pfPositioning" rows="2"></textarea></label>
+              <label class="f-label">目标人群<textarea id="pfAudience" rows="2"></textarea></label>
+              <label class="f-label">语气 / 口吻<textarea id="pfTone" rows="2"></textarea></label>
+              <label class="f-label">口头禅<input id="pfCatchphrase" class="txt" placeholder="如:汪!"></label>
+              <label class="f-label">视觉风格(配图提示词基调)<textarea id="pfVisual" rows="4"></textarea></label>
+              <label class="f-label">禁忌<textarea id="pfTaboos" rows="2"></textarea></label>
+              <button class="btn primary wide" id="btnSavePersona" type="button">保存人设</button>
+            </div>
+          </div>
+        </section>
 
-        <h3>选题</h3>
-        <label class="f-label">这条内容讲什么
-          <textarea id="topicInput" rows="2" style="width:100%" placeholder="一句话选题;也可点下面选题库里的灵感"></textarea>
-        </label>
-        <div class="style-chips" id="topicChips"></div>
-        <div class="label-row" style="gap:10px;margin-top:8px;flex-wrap:wrap">
-          <label class="f-label" style="margin:0">支柱
-            <select id="pillarSel" style="width:auto"></select>
-          </label>
-          <label class="row" style="margin:0"><input type="checkbox" id="platXhs" checked> 小红书</label>
-          <label class="row" style="margin:0"><input type="checkbox" id="platDy" checked> 抖音</label>
-        </div>
-        <button class="btn primary wide" id="btnGenCopy" style="margin-top:10px" type="button">✨ 生成 3 版文案</button>
-        <div id="copyList" class="ops-copies"></div>
-      </div>
+        <section class="ops-card folded">
+          <div class="ops-card-head" data-fold="secTags">
+            <span class="ops-card-title">🏷 话题标签库</span>
+            <span class="fold">展开 ▾</span>
+          </div>
+          <div class="ops-card-body" id="secTags" hidden>
+            <div class="ops-row" style="flex-wrap:wrap;gap:6px">
+              <select id="tagPlat" style="width:auto"><option value="xhs">小红书</option><option value="dy">抖音</option></select>
+              <select id="tagGroup" style="width:auto">
+                <option>流量</option><option>精准</option><option>人设</option><option>自定义</option>
+              </select>
+            </div>
+            <div class="ops-row" style="margin-top:6px;gap:6px">
+              <input id="tagNew" class="txt" style="flex:1;min-width:0" placeholder="新标签(不带#)">
+              <button class="btn" id="btnTagAdd" type="button">添加</button>
+            </div>
+            <div id="tagCloud" class="ops-tags"></div>
+          </div>
+        </section>
+      </aside>
 
-      <div class="gen-stage">
+      <section class="ops-main-col">
         <div id="postListView">
-          <div class="label-row">
-            <label style="margin:0;font-size:11.5px;letter-spacing:1.2px;color:var(--accent)">帖子</label>
+          <div class="ops-listbar">
+            <h2 class="ops-coltitle">帖子</h2>
+            <span class="spacer"></span>
+            <select id="acctFilter" style="width:auto" title="按账号筛选"></select>
+            <select id="statusFilter" style="width:auto" title="按状态筛选"></select>
             <button class="btn" id="btnNewPost" type="button">＋ 新建空帖</button>
           </div>
           <div id="postList" class="ops-posts"></div>
           <div class="gen-empty" id="postEmpty" hidden>还没有帖子:左侧选好选题点「✨ 生成 3 版文案」,挑一版「用这版」即建帖;或点「＋ 新建空帖」。</div>
         </div>
         <div id="postDetail" hidden></div>
-      </div>
+      </section>
+    </div>
+
+    <!-- ============ 排期 ============ -->
+    <div class="ops-layout ops-layout-1col" id="paneSched" hidden>
+      <section class="ops-card">
+        <div class="ops-card-head">
+          <span class="ops-card-title">🗓 本周排期</span>
+          <span class="spacer"></span>
+          <div class="ops-row" style="gap:6px">
+            <button class="btn" id="wkPrev" type="button" title="上一周">‹</button>
+            <span class="ops-weeklabel" id="wkLabel"></span>
+            <button class="btn" id="wkNext" type="button" title="下一周">›</button>
+            <button class="btn" id="wkToday" type="button">本周</button>
+          </div>
+        </div>
+        <div class="ops-card-body">
+          <p class="hint" style="margin:0 0 8px">到点发布用平台自带的定时功能;这里只管把帖子排到哪天、到点提醒你。</p>
+          <div class="ops-week" id="weekGrid"></div>
+          <h3 class="ops-subtitle">未排期(草稿 / 待发)</h3>
+          <div id="backlogList" class="ops-backlog"></div>
+        </div>
+      </section>
+      <section class="ops-card">
+        <div class="ops-card-head">
+          <span class="ops-card-title">📊 复盘 · 按内容支柱</span>
+          <span class="spacer"></span>
+          <span class="hint" style="margin:0">数据在帖子详情里手动填</span>
+        </div>
+        <div class="ops-card-body" id="reviewBox"></div>
+      </section>
     </div>
 
     <!-- ============ 调研 ============ -->
-    <div class="gen-grid" id="paneResearch" hidden>
-      <div class="gen-panel">
-        <h3>平台直达</h3>
-        <p class="hint" style="margin:0 0 6px">直达平台搜索/热榜页(新标签打开);数据人工看,本工具不代抓(两平台均无公开 API,且反爬严格)。</p>
-        <label class="f-label">关键词
-          <input id="kwInput" class="txt" style="width:100%" placeholder="如:中华田园犬 / 治愈系萌宠">
-        </label>
-        <div class="gen-grid2" style="margin-top:6px">
-          <button class="btn" id="btnXhsSearch" type="button">小红书 搜索</button>
-          <button class="btn" id="btnDySearch" type="button">抖音 搜索</button>
-        </div>
-        <div class="gen-grid2" style="margin-top:6px">
-          <button class="btn" id="btnXhsExplore" type="button">小红书 发现页</button>
-          <button class="btn" id="btnDyHot" type="button">抖音 热榜</button>
-        </div>
+    <div class="ops-layout" id="paneResearch" hidden>
+      <aside class="ops-side">
+        <section class="ops-card">
+          <div class="ops-card-head"><span class="ops-card-title">🧭 平台直达</span></div>
+          <div class="ops-card-body">
+            <p class="hint" style="margin:0 0 6px">新标签打开平台页;热度数据人工看,本工具不代抓(两平台均无公开 API,反爬严格)。</p>
+            <input id="kwInput" class="txt" style="width:100%" placeholder="关键词,如:中华田园犬">
+            <div class="ops-grid2" style="margin-top:8px;gap:6px">
+              <button class="btn" id="btnXhsSearch" type="button">小红书 搜索</button>
+              <button class="btn" id="btnDySearch" type="button">抖音 搜索</button>
+            </div>
+            <div class="ops-grid2" style="margin-top:6px;gap:6px">
+              <button class="btn" id="btnXhsExplore" type="button">小红书 发现</button>
+              <button class="btn" id="btnDyHot" type="button">抖音 热榜</button>
+            </div>
+          </div>
+        </section>
 
-        <h3>收藏对标</h3>
-        <div class="gen-grid2">
-          <label class="f-label">平台
-            <select id="rfPlatform"><option value="xhs">小红书</option><option value="dy">抖音</option></select>
-          </label>
-          <label class="f-label">分组
-            <select id="rfGroup"><option>对标</option><option>热点</option><option>素材</option></select>
-          </label>
-        </div>
-        <label class="f-label">链接
-          <input id="rfUrl" class="txt" style="width:100%" placeholder="https://www.xiaohongshu.com/explore/…">
-        </label>
-        <label class="f-label">标题
-          <input id="rfTitle" class="txt" style="width:100%" placeholder="对标标题(留空取链接前段)">
-        </label>
-        <label class="f-label">备注(好在哪/可抄什么)
-          <textarea id="rfNote" rows="2" style="width:100%"></textarea>
-        </label>
-        <div class="gen-grid3">
-          <label class="f-label">赞 <input id="rfLikes" class="txt" type="number" min="0" placeholder="0"></label>
-          <label class="f-label">藏 <input id="rfSaves" class="txt" type="number" min="0" placeholder="0"></label>
-          <label class="f-label">评 <input id="rfComments" class="txt" type="number" min="0" placeholder="0"></label>
-        </div>
-        <button class="btn wide" id="btnResearchAdd" type="button">＋ 收藏到对标库</button>
+        <section class="ops-card">
+          <div class="ops-card-head"><span class="ops-card-title">⭐ 收藏对标</span></div>
+          <div class="ops-card-body">
+            <div class="ops-grid2" style="gap:6px">
+              <label class="f-label" style="margin-top:0">平台
+                <select id="rfPlatform"><option value="xhs">小红书</option><option value="dy">抖音</option></select>
+              </label>
+              <label class="f-label" style="margin-top:0">分组
+                <select id="rfGroup"><option>对标</option><option>热点</option><option>素材</option></select>
+              </label>
+            </div>
+            <label class="f-label">账号
+              <select id="rfAccount"></select>
+            </label>
+            <label class="f-label">链接<input id="rfUrl" class="txt" placeholder="https://www.xiaohongshu.com/explore/…"></label>
+            <label class="f-label">标题<input id="rfTitle" class="txt" placeholder="对标标题(留空取链接前段)"></label>
+            <label class="f-label">备注(好在哪/可抄什么)<textarea id="rfNote" rows="2"></textarea></label>
+            <div class="ops-grid3" style="gap:6px">
+              <label class="f-label" style="margin-top:0">赞<input id="rfLikes" class="txt" type="number" min="0" placeholder="0"></label>
+              <label class="f-label" style="margin-top:0">藏<input id="rfSaves" class="txt" type="number" min="0" placeholder="0"></label>
+              <label class="f-label" style="margin-top:0">评<input id="rfComments" class="txt" type="number" min="0" placeholder="0"></label>
+            </div>
+            <button class="btn wide" id="btnResearchAdd" style="margin-top:8px" type="button">＋ 收藏到对标库</button>
+          </div>
+        </section>
 
-        <h3>对标拆解(LLM)</h3>
-        <label class="f-label">粘贴对标笔记文字(标题+正文+标签)
-          <textarea id="anText" rows="6" style="width:100%" placeholder="把对标笔记的标题和正文复制粘贴到这里;平台数据要自己看,LLM 只拆文字。"></textarea>
-        </label>
-        <button class="btn primary wide" id="btnAnalyze" type="button">🔍 拆解这条内容</button>
-        <div id="analyzeResult"></div>
-      </div>
+        <section class="ops-card">
+          <div class="ops-card-head"><span class="ops-card-title">🔎 对标拆解(LLM)</span></div>
+          <div class="ops-card-body">
+            <label class="f-label" style="margin-top:0">粘贴对标笔记文字(标题+正文+标签)
+              <textarea id="anText" rows="6" placeholder="把对标笔记的标题和正文复制到这里;平台数据自己看,LLM 只拆文字。"></textarea>
+            </label>
+            <button class="btn primary wide" id="btnAnalyze" style="margin-top:8px" type="button">🔍 拆解这条内容</button>
+            <div id="analyzeResult"></div>
+          </div>
+        </section>
+      </aside>
 
-      <div class="gen-stage">
-        <div class="label-row">
-          <label style="margin:0;font-size:11.5px;letter-spacing:1.2px;color:var(--accent)">选题库</label>
-          <button class="btn" id="btnTopicAdd" type="button">＋ 手动加选题</button>
-        </div>
-        <div id="topicList" class="ops-topics"></div>
-
-        <div class="label-row" style="margin-top:16px">
-          <label style="margin:0;font-size:11.5px;letter-spacing:1.2px;color:var(--accent)">对标库</label>
+      <section class="ops-main-col">
+        <div class="ops-listbar">
+          <h2 class="ops-coltitle">对标库</h2>
+          <span class="spacer"></span>
+          <select id="rfAcctFilter" style="width:auto" title="按账号筛选"></select>
         </div>
         <div id="researchList" class="ops-research"></div>
         <div class="gen-empty" id="researchEmpty" hidden>还没有收藏的对标:左侧填链接收藏,或先用「平台直达」去平台找爆款。</div>
-      </div>
+
+        <div class="ops-listbar" style="margin-top:18px">
+          <h2 class="ops-coltitle">选题库</h2>
+          <span class="spacer"></span>
+          <button class="btn" id="btnTopicAdd" type="button">＋ 手动加选题</button>
+        </div>
+        <div id="topicList" class="ops-topics"></div>
+      </section>
     </div>
   </div>
 </main>
 
-<div class="gen-lightbox" id="lightbox"><img id="lightboxImg" alt="预览"></div>
+<div class="gen-lightbox" id="lightbox">
+  <img id="lightboxImg" alt="预览" hidden>
+  <video id="lightboxVideo" controls playsinline hidden></video>
+</div>
 <div class="gen-lightbox" id="libModal"><div id="libBox" class="ops-libbox"></div></div>
 
 <footer class="statusbar"><span id="status">就绪。</span></footer>

@@ -8,8 +8,9 @@ import sys
 import time
 import urllib.request
 
-BASE = "https://hf-mirror.com/microsoft/Florence-2-base/resolve/main/"
-DEST = sys.argv[1] if len(sys.argv) > 1 else "D:/Pet10-tools/florence2/Florence-2-base"
+REPO = sys.argv[1] if len(sys.argv) > 1 else "Florence-2-base"   # 仓库名(不含 microsoft/ 前缀)
+BASE = f"https://hf-mirror.com/microsoft/{REPO}/resolve/main/"
+DEST = sys.argv[2] if len(sys.argv) > 2 else f"D:/Pet10-tools/florence2/{REPO}"
 
 SMALL = ["config.json", "configuration_florence2.py", "modeling_florence2.py",
          "processing_florence2.py", "preprocessor_config.json",
