@@ -281,8 +281,12 @@
   color: var(--text);
 }
 .ops-subcard > .sc-head .sc-note { font-weight: 400; font-size: 13.5px; color: var(--text-3); }
-.ops-grid2 { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr); gap: 12px; align-items: start; }
+.ops-grid2 { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr); gap: 12px; align-items: stretch; }
 .ops-grid2 > .ops-subcard { margin: 0; }
+/* 两栏等高:短的一栏由弹性子卡吃满,正文/备注 textarea 随之加高,消除栏底空洞 */
+.ops-col > .ops-subcard.fill { flex: 1; display: flex; flex-direction: column; }
+.ops-subcard.fill > .f-label.grow { flex: 1; display: flex; flex-direction: column; }
+.ops-subcard.fill > .f-label.grow textarea { flex: 1; min-height: 96px; }
 .ops-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 
 .count-line { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }

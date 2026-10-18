@@ -786,8 +786,8 @@
     var mid = el('div', 'ops-grid2');
     var leftCol = el('div', 'ops-col');
 
-    // 文案卡
-    var copy = el('div', 'ops-subcard');
+    // 文案卡(fill:与右栏等高,正文 textarea 吃满)
+    var copy = el('div', 'ops-subcard fill');
     var copyHead = el('div', 'sc-head');
     copyHead.appendChild(el('span', null, '📝 文案'));
     var kindSel = el('select');
@@ -834,7 +834,7 @@
     titleIn.value = c.title || '';
     titleLb.appendChild(titleIn);
     copy.appendChild(titleLb);
-    var bodyLb = el('label', 'f-label', '正文(标签不写进正文,复制/打包时自动拼在尾部)');
+    var bodyLb = el('label', 'f-label grow', '正文(标签不写进正文,复制/打包时自动拼在尾部)');
     var bodyTa = el('textarea');
     bodyTa.rows = 7;
     bodyTa.value = c.body || '';
@@ -935,7 +935,7 @@
     rightCol.appendChild(tagCard);
 
     // 排期与数据卡
-    var schedCard = el('div', 'ops-subcard');
+    var schedCard = el('div', 'ops-subcard fill');
     schedCard.appendChild(el('div', 'sc-head', '🗓 排期与数据'));
     var dateLb = el('label', 'f-label', '计划发布日(到点用平台定时发)');
     var dateIn = el('input', 'txt');
@@ -970,7 +970,7 @@
       if (!CURPOST.stats) CURPOST.stats = {};
     }
     schedCard.appendChild(statsRow);
-    var notesLb = el('label', 'f-label', '备注(发布链接/复盘想法)');
+    var notesLb = el('label', 'f-label grow', '备注(发布链接/复盘想法)');
     var notes = el('textarea');
     notes.rows = 2;
     notes.value = p.notes || '';
