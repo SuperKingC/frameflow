@@ -3,7 +3,8 @@
 
 /* ---------- 页面骨架 ---------- */
 .ops-shell {
-  width: 100%;          /* body 是纵向 flex,子项被 margin:auto 收缩成 fit-content,必须显式撑满 */
+  flex: 1;              /* body 纵向 flex:撑满视口,状态条钉底(与 .gen-main/.hub-main 一致) */
+  width: 100%;          /* 子项被 margin:auto 收缩成 fit-content,必须显式撑满 */
   max-width: 1200px;
   margin: 0 auto;
   padding: 18px 20px 26px;
