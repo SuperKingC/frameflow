@@ -513,6 +513,35 @@
 /* 灯箱媒体自适应 */
 #lightbox img, #lightbox video { max-width: 96vw; max-height: 92vh; border-radius: 8px; }
 
+/* ---------- AI 优化建议弹窗 ---------- */
+.ops-optbox { max-width: 720px; }
+.ops-optitem {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+  background: var(--panel);
+  padding: 11px 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+.ops-optitem .o-problem { font-size: 15px; color: var(--text); }
+.ops-optitem .o-problem::before { content: '⚠ '; color: #d9b45a; }
+.ops-optitem .o-suggest { font-size: 14px; color: var(--text-3); }
+.ops-optitem .o-suggest::before { content: '↳ '; }
+.ops-optitem .o-revised {
+  font-size: 15px;
+  color: var(--text-2);
+  background: var(--panel-2, var(--panel));
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-s);
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  max-height: 200px;
+  overflow: auto;
+}
+.ops-optitem .o-ops { display: flex; gap: 6px; margin-top: 2px; }
+
 /* ---------- 窄屏 ---------- */
 @media (max-width: 900px) {
   .ops-layout { grid-template-columns: minmax(0, 1fr); }

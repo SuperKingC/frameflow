@@ -253,6 +253,17 @@
     $('#libModal').addEventListener('click', function (e) {
       if (e.target === this) this.style.display = 'none';
     });
+    $('#optModal').addEventListener('click', function (e) {
+      if (e.target === this) this.style.display = 'none';
+    });
+    $('#btnPersonaOptimize').addEventListener('click', function () {
+      if (!$('#pfPositioning').value.trim() && !$('#pfVisual').value.trim() &&
+          !$('#pfTone').value.trim() && !$('#pfTaboos').value.trim()) {
+        status('先填一点人设内容再优化(定位/视觉/语气任一)', true);
+        return;
+      }
+      opsOptimize(this, 'persona', personaText(), adoptPersona);
+    });
   }
 
   function switchTab(name) {
@@ -829,12 +840,46 @@
       plats.appendChild(lb);
     });
     copy.appendChild(plats);
-    var titleLb = el('label', 'f-label', '标题');
+    var titleLb = el('label', 'f-label');
     var titleIn = el('input', 'txt');
     titleIn.value = c.title || '';
+    var titleHead = el('div', 'ops-row');
+    titleHead.style.justifyContent = 'space-between';
+    titleHead.appendChild(el('span', null, '标题'));
+    var optTitleBtn = el('button', 'btn', '✨ 优化');
+    optTitleBtn.type = 'button';
+    optTitleBtn.title = '让 LLM 给几条改进版标题,采纳后替换';
+    optTitleBtn.addEventListener('click', function () {
+      opsOptimize(optTitleBtn, 'title', titleIn.value, function (revised) {
+        titleIn.value = revised;
+        bindChosen();
+        CURPOST.chosen.title = revised;
+        recount();
+        scheduleSave();
+      }, { topic: p.topic, platform: CURPOST.platforms[0] });
+    });
+    titleHead.appendChild(optTitleBtn);
+    titleLb.appendChild(titleHead);
     titleLb.appendChild(titleIn);
     copy.appendChild(titleLb);
-    var bodyLb = el('label', 'f-label grow', '正文(标签不写进正文,复制/打包时自动拼在尾部)');
+    var bodyLb = el('label', 'f-label grow');
+    var bodyHead = el('div', 'ops-row');
+    bodyHead.style.justifyContent = 'space-between';
+    bodyHead.appendChild(el('span', null, '正文(标签不写进正文,复制/打包时自动拼在尾部)'));
+    var optBodyBtn = el('button', 'btn', '✨ 优化');
+    optBodyBtn.type = 'button';
+    optBodyBtn.title = '让 LLM 给几版改进正文,采纳后替换';
+    optBodyBtn.addEventListener('click', function () {
+      opsOptimize(optBodyBtn, 'body', bodyTa.value, function (revised) {
+        bodyTa.value = revised;
+        bindChosen();
+        CURPOST.chosen.body = revised;
+        recount();
+        scheduleSave();
+      }, { topic: p.topic, platform: CURPOST.platforms[0] });
+    });
+    bodyHead.appendChild(optBodyBtn);
+    bodyLb.appendChild(bodyHead);
     var bodyTa = el('textarea');
     bodyTa.rows = 7;
     bodyTa.value = c.body || '';
@@ -876,7 +921,29 @@
     var rightCol = el('div', 'ops-col');
 
     var tagCard = el('div', 'ops-subcard');
-    tagCard.appendChild(el('div', 'sc-head', '🏷 话题标签'));
+    var tagHead = el('div', 'sc-head');
+    tagHead.appendChild(el('span', null, '🏷 话题标签'));
+    var optTagsBtn = el('button', 'btn', '✨ 优化');
+    optTagsBtn.type = 'button';
+    optTagsBtn.style.marginLeft = 'auto';
+    optTagsBtn.title = '让 LLM 给一套标签,采纳后并入当前标签';
+    optTagsBtn.addEventListener('click', function () {
+      bindChosen();
+      opsOptimize(optTagsBtn, 'tags', tagLine(CURPOST.chosen.tags), function (revised) {
+        var add = [];
+        revised.split(/[\s,，#]+/).forEach(function (t) {
+          t = t.trim();
+          if (t && CURPOST.chosen.tags.indexOf(t) < 0 && add.indexOf(t) < 0) add.push(t);
+        });
+        if (!add.length) { status('建议里的标签都已在列表中'); return false; }
+        CURPOST.chosen.tags = CURPOST.chosen.tags.concat(add);
+        renderPostTags();
+        scheduleSave();
+        status('已并入 ' + add.length + ' 个新标签');
+      }, { topic: p.topic, platform: CURPOST.platforms[0] });
+    });
+    tagHead.appendChild(optTagsBtn);
+    tagCard.appendChild(tagHead);
     var chips = el('div', 'ops-tags');
     function renderPostTags() {
       chips.innerHTML = '';
@@ -1121,7 +1188,20 @@
     promptTa.rows = 3;
     promptTa.value = (p.topic || '') + '。' + visual + '。' +
       '画面干净治愈,构图留出上方标题空间,不要出现文字。';
-    var promptLb = el('label', 'f-label', '配图提示词(可改)');
+    var promptLb = el('label', 'f-label');
+    var promptHead = el('div', 'ops-row');
+    promptHead.style.justifyContent = 'space-between';
+    promptHead.appendChild(el('span', null, '配图提示词(可改)'));
+    var optPromptBtn = el('button', 'btn', '✨ 优化');
+    optPromptBtn.type = 'button';
+    optPromptBtn.title = '让 LLM 给几版更稳的生图提示词,采纳后替换';
+    optPromptBtn.addEventListener('click', function () {
+      opsOptimize(optPromptBtn, 'prompt', promptTa.value, function (revised) {
+        promptTa.value = revised;
+      }, { topic: p.topic, platform: CURPOST.platforms[0] });
+    });
+    promptHead.appendChild(optPromptBtn);
+    promptLb.appendChild(promptHead);
     promptLb.appendChild(promptTa);
     box.appendChild(promptLb);
 
@@ -1565,5 +1645,103 @@
       d.appendChild(all);
     }
     box.appendChild(d);
+  }
+
+  // ---------- 通用「✨优化」:LLM 建议弹窗 + 采纳(采纳制,绝不直接改内容) ----------
+  var OPT_TARGET_LABEL = {
+    persona: '人设卡优化建议', title: '标题优化建议', body: '正文优化建议',
+    tags: '话题标签优化建议', prompt: '配图提示词优化建议',
+  };
+  var PERSONA_FIELD_MAP = [
+    ['目标人群', 'pfAudience'], ['人群', 'pfAudience'], ['定位', 'pfPositioning'],
+    ['语气', 'pfTone'], ['口吻', 'pfTone'], ['口头禅', 'pfCatchphrase'],
+    ['视觉风格', 'pfVisual'], ['视觉', 'pfVisual'], ['禁忌', 'pfTaboos'],
+  ];
+
+  function personaText() {
+    return ['定位:' + $('#pfPositioning').value, '目标人群:' + $('#pfAudience').value,
+            '语气:' + $('#pfTone').value, '口头禅:' + $('#pfCatchphrase').value,
+            '视觉风格:' + $('#pfVisual').value, '禁忌:' + $('#pfTaboos').value].join('\n');
+  }
+
+  function adoptPersona(revised) {
+    var hit = 0;
+    revised.split(/\n+/).forEach(function (line) {
+      var t = line.replace(/\*\*/g, '').trim();
+      if (!t) return;
+      // 容忍:【字段】内容 / 字段:内容 / 1. 字段:内容 / - 字段:内容
+      var m = t.match(/^(?:\d{1,2}\s*[.、)．]\s*)?(?:[-•]\s*)?(?:【\s*([^:：】]{1,8})\s*】|([^:：【】]{1,8})\s*[:：])\s*(.*)$/);
+      if (!m) return;
+      var label = ((m[1] || m[2]) || '').trim(), val = (m[3] || '').trim();
+      if (!val) return;
+      for (var i = 0; i < PERSONA_FIELD_MAP.length; i++) {
+        if (label.indexOf(PERSONA_FIELD_MAP[i][0]) >= 0) {
+          var input = document.getElementById(PERSONA_FIELD_MAP[i][1]);
+          if (input) { input.value = val; hit++; }
+          break;
+        }
+      }
+    });
+    if (!hit) { status('未能识别字段行,请手动对照弹窗文本填入', true); return false; }
+    status('已填入 ' + hit + ' 个字段,记得点「保存人设」落盘');
+    return true;
+  }
+
+  function opsOptimize(btn, target, text, apply, opts) {
+    opts = opts || {};
+    if (!CUR) { status('还没有账号人设', true); return; }
+    if (!text || !text.trim()) { status('这一栏还是空的,先填点内容', true); return; }
+    var payload = { target: target, text: text, personaId: CUR };
+    if (opts.topic) payload.topic = opts.topic;
+    if (opts.platform) payload.platform = opts.platform;
+    var old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '✨ 优化中…';
+    oPOST('/optimize', payload).then(function (r) {
+      btn.disabled = false;
+      btn.textContent = old;
+      if (!r.ok) { status(errMsg(r.p), true); return; }
+      var items = (r.p && r.p.items) || [];
+      if (!items.length) { status('没有给出可用建议,稍后再试', true); return; }
+      showOptModal(OPT_TARGET_LABEL[target] || '优化建议', items, apply);
+    }).catch(function (e) {
+      btn.disabled = false;
+      btn.textContent = old;
+      status('优化请求失败:' + (e && e.message || e), true);
+    });
+  }
+
+  function showOptModal(title, items, apply) {
+    var box = $('#optBox');
+    box.innerHTML = '';
+    var head = el('div', 'lib-head');
+    head.appendChild(el('strong', null, '✨ ' + title + '(点「采纳」替换当前内容;原文仍在编辑框里,可手动撤销)'));
+    head.appendChild(el('span', 'spacer'));
+    var close = el('button', 'btn', '关闭');
+    close.type = 'button';
+    close.addEventListener('click', function () { $('#optModal').style.display = 'none'; });
+    head.appendChild(close);
+    box.appendChild(head);
+    items.forEach(function (it) {
+      var card = el('div', 'ops-optitem');
+      card.appendChild(el('div', 'o-problem', it.problem));
+      if (it.suggestion) card.appendChild(el('div', 'o-suggest', it.suggestion));
+      card.appendChild(el('div', 'o-revised', it.revised));
+      var ops = el('div', 'o-ops');
+      var use = el('button', 'btn primary', '采纳(替换当前内容)');
+      use.type = 'button';
+      use.addEventListener('click', function () {
+        if (apply(it.revised) === false) return;  // 采纳失败则留在弹窗
+        $('#optModal').style.display = 'none';
+      });
+      ops.appendChild(use);
+      var cp = el('button', 'btn', '复制文本');
+      cp.type = 'button';
+      cp.addEventListener('click', function () { copyText(it.revised); });
+      ops.appendChild(cp);
+      card.appendChild(ops);
+      box.appendChild(card);
+    });
+    $('#optModal').style.display = 'flex';
   }
 })();
