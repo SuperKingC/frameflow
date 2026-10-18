@@ -2,12 +2,25 @@
 // 门禁复用 gate.js(与生图/生视频同一把码,sessionStorage 静默直进)。
 // 生成走 /api/studio/tasks(额度/重试语义零改动):提交后把任务 id 挂到镜头/角色上,轮询成功后
 // 立刻把素材 POST 回 /api/drama/projects/<pid>/asset 落盘。studio v0.5 成功快照的 data 项是
-// {"file","mime"}(结果已落盘),换算成 /api/studio/file/<id>/<n> 直链交给服务端代取;
-// 兼容旧形状(b64_json / url)。素材统一从 /api/drama/projects/<pid>/asset/<rel> 提供。
+// {"file","mime"}(结果已在本机磁盘),落盘时带 taskId/index 让服务端直读磁盘——不能拼回环
+// URL 让服务端自取(会被代取的 SSRF 防护拒绝);兼容旧形状(b64_json / url)。
+// 素材统一从 /api/drama/projects/<pid>/asset/<rel> 提供。
 (function () {
   'use strict';
 
   const $ = function (sel) { return document.querySelector(sel); };
+  let BUSY = false;   // 分镜等长 LLM 请求进行中:锁全部生成入口,防误触中断导致"网络错误"
+
+  function setBusy(on, msg) {
+    BUSY = on;
+    ['btnStoryboard', 'btnRunAll', 'btnCompose', 'btnNew', 'btnDelProj', 'btnAddShot', 'btnAddChar',
+     'btnIdea', 'btnBrainstorm', 'btnClearShots', 'projSel']
+      .forEach(function (id) {
+        const elx = $('#' + id);
+        if (elx) elx.disabled = !!on;
+      });
+    if (on && msg) status(msg + '(期间已锁定其它操作,请稍候)');
+  }
   const IMG_MODEL = 'openai/gpt-5.4-image-2';
   const VID_MODEL = 'kwaivgi/kling-v3.0-pro';
 
@@ -16,10 +29,12 @@
   let META = { styles: [], ideas: [], linesIdeas: [], voices: [] };
   let VID_DURATIONS = [5, 10];   // 当前视频模型的 supported_durations(动态更新)
   const poll = {};       // studio taskId -> { kind:'first'|'clip'|'portrait', id, startedAt }
+  const COLLAPSED = new Set();   // 收起状态的镜头 id(会话级:刷新恢复展开)
+  const LOGS = [];               // 任务进度日志(所有 status 同步进这里,面板可展开看全部)
+  let LOG_OPEN = false;          // 展开态(localStorage 记忆)
   let pendingRender = false;
   let charRefTarget = null;   // 文件选择器当前服务的角色 id
   let charRefInput = null;    // 由 init 创建(drama.html 中声明)
-  let RUNNING_QUEUE = false;  // 一键串跑进行中
 
   const ERRORS = {
     invalid_invite_code: '邀请码不正确',
@@ -44,9 +59,40 @@
   };
 
   function status(msg, isError) {
-    const el = $('#status');
-    el.textContent = msg;
-    el.classList.toggle('error', !!isError);
+    const elx = $('#status');
+    elx.textContent = msg;
+    elx.classList.toggle('error', !!isError);
+    log(msg, isError);
+  }
+
+  // 任务进度:status 每次都会把消息带时间戳写进 LOGS;面板常显最新一条,可展开看全部
+  function log(msg, isError) {
+    LOGS.push({ t: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+                msg: msg, err: !!isError });
+    if (LOGS.length > 80) LOGS.shift();
+    renderLog();
+  }
+
+  function renderLog() {
+    const panel = $('#logPanel');
+    if (!panel) return;
+    const latest = LOGS[LOGS.length - 1];
+    const latestEl = $('#logLatest');
+    latestEl.textContent = latest ? (latest.t + '  ' + latest.msg) : '就绪';
+    latestEl.classList.toggle('err', !!(latest && latest.err));
+    $('#logCount').textContent = LOGS.length ? ('(共 ' + LOGS.length + ' 条)') : '';
+    $('#logToggle').textContent = LOG_OPEN ? '收起 ▴' : '展开 ▾';
+    panel.classList.toggle('open', LOG_OPEN);
+    const list = $('#logList');
+    list.textContent = '';
+    if (LOG_OPEN) {
+      LOGS.slice().reverse().forEach(function (l) {
+        const line = el('div', 'log-line' + (l.err ? ' err' : ''));
+        line.appendChild(el('span', 't', l.t));
+        line.appendChild(document.createTextNode(l.msg));
+        list.appendChild(line);
+      });
+    }
   }
 
   function el(tag, cls, text) {
@@ -98,10 +144,12 @@
       }).catch(function () { /* 静默 */ });
   }
 
-  // 渲染保护:用户正在输入时不整树重渲染,等失焦后再补
+  // 渲染保护:用户正在输入(text/select 类元素持焦点)时不整树重渲染,失焦后补。
+  // 注意:按钮焦点不算"输入"——否则点折叠钮等只读控件会被误判挂起,看起来"点了没反应"。
   function editingBusy() {
     const ae = document.activeElement;
-    return !!(ae && ($('#shotList').contains(ae) || $('#charList').contains(ae) || $('#projForm').contains(ae)));
+    return !!(ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT')
+      && ($('#shotList').contains(ae) || $('#charList').contains(ae) || $('#projForm').contains(ae)));
   }
 
   function safeRender() {
@@ -146,7 +194,12 @@
         o.textContent = p.title + '(' + p.shotCount + '镜' + (p.clipCount ? ' · ' + p.clipCount + '片' : '') + ')';
         sel.appendChild(o);
       });
-      const want = selectId || (PROJECTS[0] && PROJECTS[0].id);
+      // 记住最后打开的项目:刷新后回到刚才在编辑的那部剧,而不是列表第一个
+      let lastId = null;
+      try { lastId = localStorage.getItem('ffDramaLast'); } catch (e) { lastId = null; }
+      const want = selectId
+        || (lastId && PROJECTS.some(function (x) { return x.id === lastId; }) ? lastId : null)
+        || (PROJECTS[0] && PROJECTS[0].id);
       if (want) {
         sel.value = want;
         loadProject(want);
@@ -159,6 +212,7 @@
   }
 
   function loadProject(pid) {
+    try { localStorage.setItem('ffDramaLast', pid); } catch (e) { /* 隐私模式忽略 */ }
     dGET('/' + pid).then(function (res) {
       if (!res.ok || !res.p.ok) { status('项目加载失败:' + (res.p.error || ''), true); return; }
       CUR = res.p.project;
@@ -171,7 +225,7 @@
     if (!CUR) return Promise.resolve(null);
     return dPOST('/' + CUR.id + '/update', {
       title: $('#pTitle').value, logline: $('#pLogline').value,
-      style: $('#pStyle').value, aspect: $('#pAspect').value,
+      style: $('#pStyle').value, aspect: $('#pAspect').value, beat: $('#pBeat').value,
     }).then(function (res) {
       if (!res.ok || !res.p.ok) { status('保存失败:' + (res.p.error || ''), true); return null; }
       CUR = res.p.project;
@@ -181,11 +235,15 @@
     });
   }
 
+  // 高级模式:默认开(露出首帧/运动提示词框);关掉只留画面描述,改描述时自动 reprompt 派生
+  let ADVANCED = true;
+  try { ADVANCED = localStorage.getItem('ffDramaAdvanced') !== '0'; } catch (e) { /* 无痕模式 */ }
+
   // ---------- 渲染 ----------
   function renderAll() {
     const has = !!CUR;
     $('#projForm').hidden = !has;
-    ['btnAddChar', 'btnCompose', 'btnPlayAll', 'btnAddShot', 'btnStoryboard', 'btnDelProj', 'btnIdea']
+    ['btnAddChar', 'btnCompose', 'btnPlayAll', 'btnAddShot', 'btnStoryboard', 'btnDelProj', 'btnIdea', 'btnRunAll', 'btnClearShots']
       .forEach(function (id) { $('#' + id).hidden = !has; });
     const empty = $('#shotEmpty');
     if (!has) {
@@ -200,7 +258,10 @@
     $('#pLogline').value = CUR.logline || '';
     $('#pStyle').value = CUR.style || '';
     $('#pAspect').value = CUR.aspect || '9:16';
+    $('#pBeat').value = CUR.beat || '';
     $('#pNShots').value = String($('#pNShots').value || '6');
+    $('#pAdvanced').checked = ADVANCED;
+    // pWithLines 不由 renderAll 重置:它是「本次起草」选项,勾选态只在页面加载时默认开
     empty.hidden = CUR.shots.length > 0;
     empty.textContent = '还没有镜头:填好左侧「一句话故事」后点「✨ 生成分镜」,或「+ 手动加镜」。';
     renderStyleChips();
@@ -301,6 +362,24 @@
       }
       if (refBar.children.length) main.appendChild(refBar);
 
+      // 配音音色:角色专属;台词按「角色名」匹配到这个音色
+      const voiceRow = el('div', 'char-ops');
+      const vLabel = el('span', 'muted', '配音音色');
+      const vSel = el('select');
+      (META.voices || []).forEach(function (v) {
+        const o = document.createElement('option');
+        o.value = v.id;
+        o.textContent = v.label;
+        if ((c.voice || 'default') === v.id) o.selected = true;
+        vSel.appendChild(o);
+      });
+      vSel.addEventListener('change', function () {
+        dPOST('/' + CUR.id + '/chars/' + c.id + '/update', { voice: vSel.value });
+        status('已把「' + c.name + '」的配音音色改为「' + vSel.options[vSel.selectedIndex].text + '」;重新点「生成配音」生效');
+      });
+      voiceRow.appendChild(vLabel); voiceRow.appendChild(vSel);
+      main.appendChild(voiceRow);
+
       const ops = el('div', 'char-ops');
       const gen = el('button', 'btn', c.asset ? '重roll定妆照' : '生成定妆照');
       gen.addEventListener('click', function () { genPortrait(c); });
@@ -386,39 +465,75 @@
     scene.addEventListener('change', function () { patchShot(s.id, { scene: scene.value }); });
     head.appendChild(scene);
     head.appendChild(el('span', 'st', shotBadge(s)));
+    // 折叠钮:收起后只留首行,长剧浏览不滚屏;本地瞬时 toggle(不依赖整树重渲染)
+    const fold = el('button', 'btn fold', COLLAPSED.has(s.id) ? '▸' : '▾');
+    fold.type = 'button';
+    fold.title = COLLAPSED.has(s.id) ? '展开本镜' : '收起本镜(只留场景行)';
+    fold.addEventListener('click', function () {
+      if (COLLAPSED.has(s.id)) COLLAPSED.delete(s.id); else COLLAPSED.add(s.id);
+      const collapsed = COLLAPSED.has(s.id);
+      fold.textContent = collapsed ? '▸' : '▾';
+      fold.title = collapsed ? '展开本镜' : '收起本镜(只留场景行)';
+      card.classList.toggle('collapsed', collapsed);
+    });
+    head.appendChild(fold);
+    if (COLLAPSED.has(s.id)) card.classList.add('collapsed');
     card.appendChild(head);
 
     const dLabel = el('label', 'f-label', '画面描述');
     const dTxt = el('textarea');
     dTxt.rows = 2;
     dTxt.value = s.desc || '';
-    dTxt.placeholder = '这一镜发生了什么(可空)';
-    dTxt.addEventListener('change', function () { patchShot(s.id, { desc: dTxt.value }); });
+    dTxt.placeholder = ADVANCED
+      ? '这一镜发生了什么(可空)'
+      : '一句话写清画面:谁在哪做什么。改动后约 2 秒自动重写下方提示词(不占生图额度)';
+    let rpTimer = null;
+    dTxt.addEventListener('change', function () {
+      patchShot(s.id, { desc: dTxt.value });
+      // 简单模式:desc 是唯一输入源,防抖 2 秒调 reprompt 自动重写首帧/运动提示词
+      if (!ADVANCED) {
+        if (rpTimer) clearTimeout(rpTimer);
+        rpTimer = setTimeout(function () {
+          const v = dTxt.value.trim();
+          if (!v) { status('画面描述为空,跳过提示词派生'); return; }
+          status('提示词派生中…(小模型重写,约 2~5 秒)');
+          dPOST('/' + CUR.id + '/shots/' + s.id + '/reprompt', { desc: v })
+            .then(function (res) {
+              if (!res.ok || !res.p.ok) { status('提示词派生失败:' + (res.p.error || '未知错误'), true); return; }
+              CUR = res.p.project;
+              safeRender();
+              status('提示词已按画面描述重写(可在高级模式下微调)');
+            }).catch(function () { status('提示词派生失败:网络错误', true); });
+        }, 2000);
+      }
+    });
     dLabel.appendChild(dTxt);
     card.appendChild(dLabel);
 
-    const fLabel = el('label', 'f-label', '首帧提示词(文生图,含角色外观与场景)');
-    const fTxt = el('textarea');
-    fTxt.rows = 2;
-    fTxt.value = s.firstPrompt || '';
-    fTxt.addEventListener('change', function () { patchShot(s.id, { firstPrompt: fTxt.value }); });
-    fLabel.appendChild(fTxt);
-    card.appendChild(fLabel);
+    if (ADVANCED) {
+      const fLabel = el('label', 'f-label', '首帧提示词(文生图,含角色外观与场景)');
+      const fTxt = el('textarea');
+      fTxt.rows = 2;
+      fTxt.value = s.firstPrompt || '';
+      fTxt.addEventListener('change', function () { patchShot(s.id, { firstPrompt: fTxt.value }); });
+      fLabel.appendChild(fTxt);
+      card.appendChild(fLabel);
 
-    const mLabel = el('label', 'f-label', '运动提示词(图生视频,只写动作与镜头)');
-    const mTxt = el('textarea');
-    mTxt.rows = 2;
-    mTxt.value = s.motionPrompt || '';
-    mTxt.addEventListener('change', function () { patchShot(s.id, { motionPrompt: mTxt.value }); });
-    mLabel.appendChild(mTxt);
-    card.appendChild(mLabel);
+      const mLabel = el('label', 'f-label', '运动提示词(图生视频,只写动作与镜头)');
+      const mTxt = el('textarea');
+      mTxt.rows = 2;
+      mTxt.value = s.motionPrompt || '';
+      mTxt.addEventListener('change', function () { patchShot(s.id, { motionPrompt: mTxt.value }); });
+      mLabel.appendChild(mTxt);
+      card.appendChild(mLabel);
+    }
 
     // 对白区:角色名:台词,一行一句;生成配音按钮 + 台词灵感
     const lRow = el('div', 'label-row');
     lRow.appendChild(el('label', null, '台词(一行一句「角色名:台词」;合成时自动配音+字幕)'));
     const bTtsIdea = el('button', 'btn', '💬');
     bTtsIdea.type = 'button';
-    bTtsIdea.title = '台词灵感(按情绪给示范)';
+    bTtsIdea.title = '台词灵感(先给通用示范,几秒后按本项目角色现编)';
     bTtsIdea.addEventListener('click', function () { showLineIdeas(s); });
     lRow.appendChild(bTtsIdea);
     card.appendChild(lRow);
@@ -430,6 +545,33 @@
     card.appendChild(lTxt);
 
     const ops = el('div', 'shot-ops');
+    const vModel = el('select');
+    vModel.title = '本镜视频模型;留默认用全剧设置';
+    [[null, '默认模型'], ['kwaivgi/kling-v3.0-pro', '可灵 3.0 Pro(开口)'],
+     ['kwaivgi/kling-v3.0-std', '可灵 3.0 标准(开口,便宜)'],
+     ['google/veo-3.1-fast', 'Veo 3.1 Fast(开口,英文最佳)']].forEach(function (pair) {
+      const o = document.createElement('option');
+      o.value = pair[0] || '';
+      o.textContent = pair[1];
+      if ((s.videoModel || '') === (pair[0] || '')) o.selected = true;
+      vModel.appendChild(o);
+    });
+    vModel.addEventListener('change', function () {
+      patchShot(s.id, { videoModel: vModel.value || null });
+    });
+    const ndChk = document.createElement('input');
+    ndChk.type = 'checkbox';
+    ndChk.checked = !!s.nativeDialog;
+    ndChk.title = '台词写进提示词,模型直接生成人物开口说话(带口型与声音);无需再点配音';
+    const ndLabel = el('label', null, '开口');
+    ndLabel.insertBefore(ndChk, ndLabel.firstChild);
+    ndLabel.title = '原生对白(零新增开销):用中转的 Veo 3.1 fast,人物真开口+口型同步;时长自动取 4/6/8s 档';
+    ndChk.addEventListener('change', function () {
+      patchShot(s.id, { nativeDialog: ndChk.checked });
+      status(ndChk.checked
+        ? '已勾「开口」:点「生视频」时台词会写进提示词,人物直接开口说'
+        : '已取消「开口」,恢复静音生成+后期配音');
+    });
     const dur = el('select');
     VID_DURATIONS.forEach(function (d) {
       const o = document.createElement('option');
@@ -449,6 +591,9 @@
     dur.addEventListener('change', function () { patchShot(s.id, { duration: Number(dur.value) }); });
     const bTts = el('button', 'btn', s.tts ? '🔁 重做配音' : '🎙 生成配音');
     bTts.addEventListener('click', function () { genTts(s); });
+    const bLip = el('button', 'btn', '👄 对口型');
+    bLip.title = '有成片+有配音时可用:调可灵官方对口型,让人物按台词动嘴(约0.7积分/镜,1~3分钟)';
+    bLip.addEventListener('click', function () { genLipsync(s, bLip); });
     const bFrame = el('button', 'btn', s.firstFrame ? '🎲 重roll首帧' : '🖼 生首帧');
     bFrame.addEventListener('click', function () { genFirstFrame(s); });
     const bClip = el('button', 'btn', s.clip ? '🎬 重roll成片' : '🎬 生视频');
@@ -464,7 +609,11 @@
       if (!confirm('删除第' + (i + 1) + '镜及其素材?')) return;
       dPOST('/' + CUR.id + '/shots/' + s.id + '/delete').then(function (res) { applyP(res, '镜头已删除'); });
     });
-    ops.appendChild(dur); ops.appendChild(bTts); ops.appendChild(bFrame); ops.appendChild(bClip);
+    ops.appendChild(vModel); ops.appendChild(ndLabel);
+    ops.appendChild(dur);
+    // 开口镜头人声由模型生成,配音/对口型不参与——不渲染(取消「开口」即回到配音路线)
+    if (!s.nativeDialog) { ops.appendChild(bTts); ops.appendChild(bLip); }
+    ops.appendChild(bFrame); ops.appendChild(bClip);
     ops.appendChild(up); ops.appendChild(down); ops.appendChild(del);
     card.appendChild(ops);
 
@@ -503,22 +652,44 @@
   }
 
   // ---------- 台词灵感 ----------
+  // 弹窗先展示通用灵感库(即时可用),同时按当前项目角色 LLM 现编 3 组;
+  // 现编回来刷新弹窗(已关闭则忽略),失败静默保留通用灵感。
   function showLineIdeas(shot) {
     const box = $('#ideaBox');
-    box.textContent = '';
-    box.appendChild(el('h3', null, '台词灵感(点击卡片填入本镜)'));
-    META.linesIdeas.forEach(function (idea) {
-      const card = el('div', 'idea-card');
-      card.appendChild(el('span', 'idea-style', idea.mood));
-      card.appendChild(el('p', null, idea.lines));
-      card.addEventListener('click', function () {
-        patchShot(shot.id, { lines: idea.lines });
-        $('#ideaModal').style.display = 'none';
-        status('已填入台词灵感,可继续手改');
+    const renderIdeas = function (ideas, custom) {
+      if (!ideas || !ideas.length) return;
+      box.textContent = '';
+      box.dataset.for = shot.id;
+      box.appendChild(el('h3', null, custom ? '按本项目角色现编的台词(点击卡片填入本镜)'
+                                            : '台词灵感(通用示范,点击卡片填入本镜)'));
+      ideas.forEach(function (idea) {
+        const card = el('div', 'idea-card');
+        card.appendChild(el('span', 'idea-style', idea.mood));
+        card.appendChild(el('p', null, idea.lines));
+        card.addEventListener('click', function () {
+          patchShot(shot.id, { lines: idea.lines });
+          $('#ideaModal').style.display = 'none';
+          status('已填入台词灵感,可继续手改');
+        });
+        box.appendChild(card);
       });
-      box.appendChild(card);
-    });
+    };
+    renderIdeas(META.linesIdeas, false);
     $('#ideaModal').style.display = 'flex';
+    if (!CUR) return;
+    const shotNow = CUR.shots.find(function (x) { return x.id === shot.id; });
+    fetch('/api/drama/projects/' + CUR.id + '/lines-ideas', {
+      method: 'POST', headers: AUTH(),
+      body: JSON.stringify({ seed: (shotNow && shotNow.lines) || '' }),
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (p) { return { ok: r.ok, p: p }; });
+    }).then(function (res) {
+      if (!res.ok || !res.p.ok || !(res.p.ideas || []).length) return;
+      // 弹窗仍开着且还是发起现编的那一镜才刷新(用户可能已选通用灵感/换镜重开)
+      if ($('#ideaModal').style.display !== 'flex' || box.dataset.for !== shot.id) return;
+      if (!box.textContent.includes('通用示范')) return;
+      renderIdeas(res.p.ideas, true);
+    }).catch(function () { /* 现编失败静默:通用灵感仍可用 */ });
   }
 
   function renderComposed() {
@@ -588,14 +759,6 @@
       });
   }
 
-  function refsForChars() {
-    const chars = (CUR.chars || []).filter(function (c) { return c.asset; });
-    if (!chars.length) return Promise.resolve([]);
-    return Promise.all(chars.slice(0, 5).map(function (c) {
-      return fileToDataURL(c.asset, 1024);
-    }));
-  }
-
   function genPortrait(ch) {
     if (!CUR) return;
     if (ch.portraitTaskId) { status('这一角色的定妆照正在生成中', true); return; }
@@ -626,35 +789,127 @@
       });
   }
 
+  // 首帧参考图构成(E·一致性三板斧):[上一镜首帧=相邻场景衔接] + [第1镜首帧=全剧风格锚]
+  // + [定妆照=角色锁脸],去重后 ≤5(上游上限)。返回 [{rel, role}]。
+  function firstFrameRefs(shot) {
+    const idx = CUR.shots.indexOf(shot);
+    const out = [];
+    const seen = {};
+    const pushRel = function (rel, role) {
+      if (!rel || seen[rel] || out.length >= 5) return;
+      seen[rel] = true;
+      out.push({ rel: rel, role: role });
+    };
+    const prev = idx > 0 ? CUR.shots[idx - 1] : null;
+    if (prev && prev.firstFrame) pushRel(prev.firstFrame, 'prev');
+    if (idx > 0 && CUR.shots[0].firstFrame) pushRel(CUR.shots[0].firstFrame, 'anchor');
+    const charSlots = out.length ? 3 : 5;   // 有画面锚时定妆照最多 3 张,留位给衔接
+    (CUR.chars || []).filter(function (c) { return c.asset; })
+      .slice(0, charSlots).forEach(function (c) { pushRel(c.asset, 'char'); });
+    return out;
+  }
+
+  // 提交首帧生成。返回 Promise<{ok, error?}> 供串跑判断;手动按钮同样可用。
   function genFirstFrame(shot) {
-    if (!CUR) return;
-    if (shot.firstTaskId) { status('这一镜的首帧正在生成中', true); return; }
-    if (!shot.firstPrompt.trim()) { status('先填首帧提示词', true); return; }
-    status('正在提交首帧生成…');
-    refsForChars().then(function (refs) {
-      const body = { model: IMG_MODEL, prompt: shot.firstPrompt.trim() + styleSuffix(),
-                     aspectRatio: CUR.aspect || '9:16', imageSize: '1K' };
-      if (refs.length) body.referenceImages = refs;
-      return studioSubmit(body);
-    }).then(function (res) {
-      if (!res.ok) { status('首帧提交失败:' + (ERRORS[res.p.error] || res.p.error || '未知错误'), true); return; }
-      poll[res.p.id] = { kind: 'first', id: shot.id, startedAt: Date.now() };
-      patchShot(shot.id, { firstTaskId: res.p.id });
-      status('首帧任务已提交,后台生成中');
-      refreshQuota();
+    if (!CUR) return Promise.resolve({ ok: false, error: '项目未加载' });
+    if (shot.firstTaskId) { status('这一镜的首帧正在生成中', true); return Promise.resolve({ ok: false, error: '该镜首帧已在生成中' }); }
+    if (!shot.firstPrompt.trim()) { status('先填首帧提示词', true); return Promise.resolve({ ok: false, error: '首帧提示词为空' }); }
+    const idx = CUR.shots.indexOf(shot);
+    const refs = firstFrameRefs(shot);
+    const hasPrev = refs.some(function (r) { return r.role === 'prev'; });
+    const hasAnchor = refs.some(function (r) { return r.role === 'anchor'; });
+    // 参考图语义声明:告诉模型每张图管什么(衔接/画风锚/长相)
+    let hint = '';
+    if (hasPrev && hasAnchor) {
+      hint = '第 1 张参考图是上一镜画面:延续它的色调、光线与画风(本镜场景按提示词安排);'
+        + '第 2 张是全剧第 1 镜画面:整体画风以它为准防漂移;'
+        + '其余为角色定妆照:严格保持长相一致。';
+    } else if (hasPrev) {
+      hint = '第 1 张参考图是上一镜画面:延续它的色调、光线与画风(本镜场景按提示词安排);'
+        + '其余参考图为角色定妆照:严格保持长相一致。';
+    } else if (hasAnchor) {
+      hint = '第 1 张参考图是全剧第 1 镜画面:整体画风与色调以它为准(本镜场景按提示词安排);'
+        + '其余参考图为角色定妆照:严格保持长相一致。';
+    } else if (refs.length) {
+      hint = '参考图为角色定妆照:严格保持长相一致。';
+    }
+    const prompt = hint + shot.firstPrompt.trim() + styleSuffix();
+    status('正在提交首帧生成…' + (hasPrev ? '(已锚定上一镜画面)' : ''));
+    return Promise.all(refs.map(function (r) { return fileToDataURL(r.rel, 1024); }))
+      .catch(function () { return []; })   // 参考图取不到就不带,别挡生成
+      .then(function (frames) {
+        const body = { model: IMG_MODEL, prompt: prompt,
+                       aspectRatio: CUR.aspect || '9:16', imageSize: '1K' };
+        const imgs = frames.filter(Boolean);
+        if (imgs.length) body.referenceImages = imgs;
+        return studioSubmit(body);
+      })
+      .then(function (res) {
+        if (!res.ok) {
+          const msg = ERRORS[res.p.error] || res.p.error || '未知错误';
+          status('首帧提交失败:' + msg, true);
+          return { ok: false, error: msg };
+        }
+        poll[res.p.id] = { kind: 'first', id: shot.id, startedAt: Date.now() };
+        patchShot(shot.id, { firstTaskId: res.p.id });
+        status('首帧任务已提交,后台生成中' + (hasPrev ? '(已锚定上一镜画面)' : ''));
+        refreshQuota();
+        return { ok: true };
+      });
+  }
+
+  // 原生对白提示词:模型自己出声+口型;台词用引号包住并注明语言
+  function voiceHintOf(name) {
+    const ch = (CUR.chars || []).find(function (c) { return (c.name || '').trim() === name; });
+    if (!ch) return '';
+    const preset = (META.voices || []).find(function (v) { return v.id === (ch.voice || 'default'); });
+    return preset && preset.hint ? (name + ' 的声音:' + preset.hint) : '';
+  }
+
+  function nativePrompt(shot) {
+    const lines = (shot.lines || '').split('\n').map(function (l) { return l.trim(); }).filter(Boolean)
+      .map(function (l) {
+        const who = l.indexOf(':') > 0 ? l.slice(0, l.indexOf(':')) : '';
+        const say = l.indexOf(':') > 0 ? l.slice(l.indexOf(':') + 1) : l;
+        return who ? (who + ' 用中文说: "' + say + '"') : ('说: "' + say + '"');
+      }).join(' 然后 ');
+    const speakers = [];
+    lines.forEach(function (l) {
+      const who = l.indexOf(':') > 0 ? l.slice(0, l.indexOf(':')).trim() : '';
+      if (who && speakers.indexOf(who) < 0) speakers.push(who);
     });
+    const hints = speakers.map(voiceHintOf).filter(Boolean);
+    return (shot.motionPrompt.trim() || '人物面对镜头自然对话') + '。' + lines
+      + (hints.length ? '。' + hints.join(';') : '')
+      + '。口型与台词精确同步,声画同步,不加字幕,不出现文字。';
   }
 
   function genClip(shot) {
     if (!CUR) return;
     if (shot.clipTaskId) { status('这一镜的成片正在生成中', true); return; }
     if (!shot.firstFrame) { status('先为这一镜生成首帧', true); return; }
-    if (!shot.motionPrompt.trim()) { status('先填运动提示词', true); return; }
-    status('正在提交视频生成…');
+    const native = shot.nativeDialog && shot.lines.trim();
+    if (!native && !shot.motionPrompt.trim()) { status('先填运动提示词(或勾选「人物开口说台词」)', true); return; }
+    if (native) {
+      status('正在提交「人物开口」镜头(Veo 3.1 fast 原生对白)…');
+    } else {
+      status('正在提交视频生成…');
+    }
+    // 开口镜头:Veo 3.1 fast 原生对白(音画一体,人物真开口);时长落到其支持档 4/6/8
+    const NATIVE_DURS = [4, 6, 8];
+    let dur = shot.duration || 5;
+    if (native) {
+      const need = shot.ttsDur ? Math.ceil(shot.ttsDur + 1.2) : dur;  // 台词时长(秒)+呼吸
+      dur = NATIVE_DURS.find(function (d) { return d >= need; })
+        || NATIVE_DURS[NATIVE_DURS.length - 1];
+    }
     fileToDataURL(shot.firstFrame, 1280).then(function (frame) {
-      return studioSubmit({ model: VID_MODEL, prompt: shot.motionPrompt.trim() + motionSuffix(),
-                            frameMode: 'first', duration: shot.duration || 5,
-                            referenceImages: [frame] });
+      const body = { model: native ? 'google/veo-3.1-fast' : (shot.videoModel || VID_MODEL),
+                     prompt: native ? nativePrompt(shot) : shot.motionPrompt.trim() + motionSuffix(),
+                     frameMode: 'first', duration: dur,
+                     referenceImages: [frame] };
+      if (native) { body.audio = true; body.resolution = '720p'; }
+      return studioSubmit(body);
     }).then(function (res) {
       if (!res.ok) { status('视频提交失败:' + (ERRORS[res.p.error] || res.p.error || '未知错误'), true); return; }
       poll[res.p.id] = { kind: 'clip', id: shot.id, startedAt: Date.now() };
@@ -683,18 +938,17 @@
     patchShot(entry.id, body);
   }
 
-  // studio 成功快照 data 项 → 素材落盘参数。v0.5: {"file","mime"}(结果在服务端磁盘,
-  // 换算 /api/studio/file/<taskId>/<index> 直链让服务端自己搬);兼容 b64_json / url 旧形状。
+  // studio 成功快照 data 项 → 素材落盘参数。v0.5: {"file","mime"}(结果在本机磁盘),
+  // 直接带任务号让服务端按 taskId/index 直读磁盘落盘——不能拼 /api/studio/file 直链让
+  // 服务端自取,那会被素材代取的 SSRF 防护按回环地址拒绝;兼容 b64_json / url 旧形状。
   function assetPayload(item, kind, taskId, index) {
     if (!item || typeof item !== 'object') return null;
     if (item.b64_json) {
       const mime = item.mime || (kind === 'clip' ? 'video/mp4' : 'image/png');
       return { dataUrl: 'data:' + mime + ';base64,' + item.b64_json };
     }
-    let url = '';
-    if (item.file) url = location.origin + '/api/studio/file/' + taskId + '/' + (index + 1);
-    else if (typeof item.url === 'string' && item.url) url = item.url;
-    if (url) return { url: url };
+    if (item.file) return { file: { taskId: taskId, index: index + 1 } };
+    if (typeof item.url === 'string' && item.url) return { url: item.url };
     return null;
   }
 
@@ -849,32 +1103,75 @@
     });
   }
 
+  function genLipsync(shot, btn) {
+    if (!CUR) return;
+    if (!shot.clip) { status('先为这一镜生成成片(🎬)', true); return; }
+    if (!shot.tts) { status('先生成配音(🎙):对口型需要台词音频', true); return; }
+    btn.disabled = true;
+    status('对口型提交中…(可灵官方,约 1~3 分钟,期间勿关页面)');
+    const line = document.querySelector('.shot[data-id="' + shot.id + '"] .shot-status');
+    if (line) line.textContent = '对口型进行中…';
+    dPOST('/' + CUR.id + '/shots/' + shot.id + '/lipsync', {}).then(function (res) {
+      btn.disabled = false;
+      if (!res.ok || !res.p.ok) { status('对口型失败:' + (res.p.error || ''), true); safeRender(); return; }
+      CUR = res.p.project;
+      safeRender();
+      syncSelTitle();
+      status('对口型完成:人物已按台词动嘴,成片已替换(重新合成即可出片)');
+    }).catch(function () {
+      btn.disabled = false;
+      status('对口型请求失败:网络错误', true);
+    });
+  }
+
   // ---------- 一键串跑:找全缺首帧/成片的镜头,限流排队自动补 ----------
   async function runAll() {
-    if (!CUR || RUNNING_QUEUE) return;
-    RUNNING_QUEUE = true;
+    if (!CUR || BUSY) return;
+    setBusy(true, '一键串跑执行中');
     const btn = $('#btnRunAll');
-    btn.disabled = true;
     try {
       let pass = 0;
+      const fails = [];
+      // 对白先行:有台词没配音的镜先生成配音(TTS 会自动把镜头时长校准到 ≥ 台词时长);
+      // 失败不再静默吞:记录并在结尾汇报(否则用户以为"有台词就该有配音",合成时才发现缺)
       for (const s of CUR.shots) {
+        if (s.lines && s.lines.trim() && !s.tts) {
+          status('串跑:生成第 ' + (CUR.shots.indexOf(s) + 1) + ' 镜配音(对白先行)…');
+          await dPOST('/' + CUR.id + '/shots/' + s.id + '/tts', {}).then(function (res) {
+            if (res.ok && res.p.ok) { CUR = res.p.project; pass++; }
+            else fails.push('第' + (CUR.shots.indexOf(s) + 1) + '镜配音:' + (res.p.error || '失败'));
+          }).catch(function () {
+            fails.push('第' + (CUR.shots.indexOf(s) + 1) + '镜配音:网络中断');
+          });
+        }
+      }
+      // 并行生成首帧(受上游并发限制,这里用 Promise.all 让所有缺首帧的镜同时提交)
+      const firstFramePromises = [];
+      CUR.shots.forEach((s) => {
         if (!s.firstFrame) {
-          status('串跑:生成第 ' + (CUR.shots.indexOf(s) + 1) + ' 镜首帧…');
-          await genFirstFrameAwait(s);
-          pass++;
+          firstFramePromises.push(genFirstFrameAwait(s));
         }
-      }
-      for (const s of CUR.shots) {
+      });
+      if (firstFramePromises.length) status('串跑:并行生成 ' + firstFramePromises.length + ' 镜首帧…');
+      await Promise.all(firstFramePromises);
+      pass += firstFramePromises.length;
+
+      // 首帧全部就绪后,并行生成成片
+      const clipPromises = [];
+      CUR.shots.forEach((s) => {
         if (s.firstFrame && !s.clip) {
-          status('串跑:生成第 ' + (CUR.shots.indexOf(s) + 1) + ' 镜成片…');
-          await genClipAwait(s);
-          pass++;
+          clipPromises.push(genClipAwait(s));
         }
-      }
-      status('串跑完成:' + pass + ' 个任务已提交/完成(限额每分钟 3 次,排队自动等)');
+      });
+      if (clipPromises.length) status('串跑:并行生成 ' + clipPromises.length + ' 镜成片…');
+      await Promise.all(clipPromises);
+      pass += clipPromises.length;
+      if (fails.length) status('串跑完成,但有失败(其余 ' + pass + ' 个任务正常):' + fails.join(';'), true);
+      else status('串跑完成:' + pass + ' 个任务已提交/完成(限额每分钟 3 次,排队自动等)');
+    } catch (e) {
+      status('串跑中断:' + (e && e.message ? e.message : '网络错误') + '。已生成的部分保留,再点一次会从缺的地方继续', true);
     } finally {
-      RUNNING_QUEUE = false;
-      btn.disabled = false;
+      setBusy(false);
     }
   }
 
@@ -921,6 +1218,15 @@
   }
 
   // ---------- 事件绑定 ----------
+  // 任务进度面板:点头部展开/收起(记忆到 localStorage);默认收起只显最新一条
+  try { LOG_OPEN = localStorage.getItem('ffDramaLogOpen') === '1'; } catch (e) { /* 无痕模式 */ }
+  $('#logHead').addEventListener('click', function () {
+    LOG_OPEN = !LOG_OPEN;
+    try { localStorage.setItem('ffDramaLogOpen', LOG_OPEN ? '1' : '0'); } catch (e) { /* 忽略 */ }
+    renderLog();
+  });
+  renderLog();
+
   $('#projSel').addEventListener('change', function () { loadProject(this.value); });
 
   $('#btnNew').addEventListener('click', function () {
@@ -944,27 +1250,66 @@
 
   $('#btnSaveProj').addEventListener('click', function () { saveProj(); });
 
-  $('#btnStoryboard').addEventListener('click', function () {
+  $('#btnClearShots').addEventListener('click', function () {
     if (!CUR) return;
+    if (!CUR.shots.length) { status('当前没有镜头'); return; }
+    if (!confirm('一键清空全部 ' + CUR.shots.length + ' 个镜头(连同首帧/成片/配音素材)?\n角色与定妆照保留。不可恢复!')) return;
+    COLLAPSED.clear();
+    dPOST('/' + CUR.id + '/shots/clear').then(function (res) {
+      if (!res.ok || !res.p.ok) { status('清空失败:' + (res.p.error || ''), true); return; }
+      CUR = res.p.project;
+      safeRender();
+      status('已清空全部分镜:改好故事梗概后点「✨ 生成分镜」重新起草');
+    });
+  });
+
+  $('#pAdvanced').addEventListener('change', function () {
+    ADVANCED = this.checked;
+    try { localStorage.setItem('ffDramaAdvanced', ADVANCED ? '1' : '0'); } catch (e) { /* 无痕模式 */ }
+    safeRender();
+    status(ADVANCED ? '高级模式:已显示首帧/运动提示词编辑框(可手改)'
+                    : '简单模式:每镜只写画面描述,提示词改动后 2 秒自动重写');
+  });
+
+  $('#pWithLines').addEventListener('change', function () {
+    status(this.checked ? '生成分镜时将按起/承/转/合章节起草并带台词'
+                        : '生成分镜时不写台词(纯画面分镜)');
+  });
+
+  $('#pBeat').addEventListener('change', function () {
+    const opt = this.options[this.selectedIndex];
+    status('剧本模板:' + (opt ? opt.textContent : '默认') + '(点「保存项目信息」或直接生成分镜后生效)');
+  });
+
+  $('#btnStoryboard').addEventListener('click', function () {
+    if (!CUR || BUSY) return;
     if (!$('#pLogline').value.trim()) { status('先填一句话故事', true); return; }
-    $('#btnStoryboard').disabled = true;
+    // 查重:90 秒内刚成功加过分镜,提醒防止上次"网络错误"但实际成功造成的重复
+    const recent = (CUR.updatedAt && (Date.now() - new Date(CUR.updatedAt).getTime()) < 90000
+      && CUR.shots.length > 0);
+    if (recent && !confirm('这个项目 90 秒内刚更新过(上次分镜可能已成功生成)。再点会追加新镜头,继续吗?(不确定就先刷新页面看看镜头数)')) return;
     const withLines = $('#pWithLines').checked;
-    status('保存项目信息并起草分镜…(约 10~30 秒' + (withLines ? ',带台词' : '') + ')');
+    setBusy(true, '保存项目信息并起草分镜…(约 10~30 秒' + (withLines ? ',带台词' : '') + ')');
     saveProj({ silent: true }).then(function (cur) {
-      if (!cur) { $('#btnStoryboard').disabled = false; return; }
+      if (!cur) { setBusy(false); return; }
       return dPOST('/' + CUR.id + '/storyboard', {
         nShots: Number($('#pNShots').value) || 6, withLines: withLines });
     }).then(function (res) {
-      $('#btnStoryboard').disabled = false;
+      setBusy(false);
       if (!res) return;
       if (!res.ok || !res.p.ok) { status('分镜失败:' + (res.p.error || '未知错误'), true); return; }
       CUR = res.p.project;
       safeRender();
       syncSelTitle();
-      status('已生成 ' + res.p.added.length + ' 个镜头:提示词/台词可手改,满意后逐镜生成或一键串跑');
+      const added = res.p.added || [];
+      const withL = added.filter(function (s) { return s.lines; }).length;
+      status('已生成 ' + added.length + ' 个镜头'
+        + (withL ? '(其中 ' + withL + ' 镜带台词,新镜头在对应章节分组下)' : '')
+        + ':提示词/台词可手改,满意后逐镜生成或一键串跑');
     }).catch(function () {
-      $('#btnStoryboard').disabled = false;
-      status('分镜请求失败:网络错误', true);
+      setBusy(false);
+      // 请求层中断(连接断/超时)≠ 确定失败:LLM 在服务端跑完落盘才回包,可能已加上
+      status('分镜请求中断(连接超时或断开)。镜头可能已在后台生成——先刷新页面核对镜头数,确认没加上再重试', true);
     });
   });
 
@@ -983,14 +1328,17 @@
   $('#btnCompose').addEventListener('click', function () {
     if (!CUR) return;
     $('#btnCompose').disabled = true;
-    status('ffmpeg 合成中…(镜头越多越久)');
-    dPOST('/' + CUR.id + '/compose').then(function (res) {
+    const burn = $('#pBurnSubs').checked;
+    status('ffmpeg 合成中…(镜头越多越久' + (burn ? ';烧录字幕' : ';不烧字幕') + ')');
+    dPOST('/' + CUR.id + '/compose', { burnSubs: burn }).then(function (res) {
       $('#btnCompose').disabled = false;
       if (!res.ok || !res.p.ok) { status('合成失败:' + (res.p.error || ''), true); return; }
       CUR = res.p.project;
       safeRender();
       syncSelTitle();
-      status('合成完成,可在「成片」区预览与下载');
+      const w = res.p.warnings || [];
+      status('合成完成,可在「成片」区预览与下载'
+        + (w.length ? ';⚠ ' + w.length + ' 镜台词可能被截断(配音 ' + w.map(function (x) { return x.scene + ' ' + x.ttsDur + 's>片' + x.clipDur + 's'; }).join(';') + '),建议拉长该镜时长后重roll' : ''));
     }).catch(function () {
       $('#btnCompose').disabled = false;
       status('合成请求失败:网络错误', true);
@@ -999,7 +1347,7 @@
 
   $('#btnPlayAll').addEventListener('click', playAll);
   $('#btnRunAll').addEventListener('click', function () {
-    if (!CUR || RUNNING_QUEUE) return;
+    if (!CUR || BUSY) return;
     if (!confirm('一键串跑:自动为全部缺首帧的镜头生成首帧,再为全部缺成片的镜头生成视频?\n将按限额排队(每分钟 3 次),期间请勿手动提交任务。')) return;
     runAll();
   });

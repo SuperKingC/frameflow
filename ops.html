@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>内容运营 — KK工作台</title>
+<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/gen.css">
+<link rel="stylesheet" href="css/ops.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="backlink" href="index.html">← 工作台</a>
+  <div class="brand"><span class="logo">K</span> KK工作台 <span class="ver">v0.4</span></div>
+  <span class="pagetitle">内容运营</span>
+</header>
+
+<main class="gen-main">
+  <div class="gen-gate" id="bootHint" style="width:auto"><p class="hint" style="margin:0">正在进入内容运营…</p></div>
+
+  <div id="app" hidden>
+    <div class="ops-tabs">
+      <button class="ops-tab active" id="tabCreate" type="button">🎨 创作</button>
+      <button class="ops-tab" id="tabResearch" type="button">🔍 调研</button>
+    </div>
+
+    <!-- ============ 创作 ============ -->
+    <div class="gen-grid" id="paneCreate">
+      <div class="gen-panel">
+        <h3>账号 · 人设卡</h3>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="personaSel" style="flex:1;min-width:0"></select>
+        </div>
+        <div id="personaForm" class="ops-persona">
+          <label class="f-label">账号名
+            <input id="pfName" class="txt" style="width:100%">
+          </label>
+          <label class="f-label">定位(一句话)
+            <textarea id="pfPositioning" rows="2" style="width:100%"></textarea>
+          </label>
+          <label class="f-label">目标人群
+            <textarea id="pfAudience" rows="2" style="width:100%"></textarea>
+          </label>
+          <label class="f-label">语气 / 口吻
+            <textarea id="pfTone" rows="2" style="width:100%"></textarea>
+          </label>
+          <label class="f-label">口头禅
+            <input id="pfCatchphrase" class="txt" style="width:100%" placeholder="如:汪!">
+          </label>
+          <label class="f-label">视觉风格(配图提示词的基调)
+            <textarea id="pfVisual" rows="4" style="width:100%"></textarea>
+          </label>
+          <label class="f-label">禁忌
+            <textarea id="pfTaboos" rows="2" style="width:100%"></textarea>
+          </label>
+          <button class="btn primary wide" id="btnSavePersona">保存人设</button>
+        </div>
+
+        <h3>话题标签库</h3>
+        <div class="label-row" style="gap:6px;flex-wrap:wrap">
+          <select id="tagPlat" style="width:auto"><option value="xhs">小红书</option><option value="dy">抖音</option></select>
+          <input id="tagNew" class="txt" style="flex:1;min-width:90px" placeholder="新标签(不带#)">
+          <select id="tagGroup" style="width:auto">
+            <option>流量</option><option>精准</option><option>人设</option><option>自定义</option>
+          </select>
+          <button class="btn" id="btnTagAdd" type="button">添加</button>
+        </div>
+        <div id="tagCloud" class="ops-tags"></div>
+
+        <h3>选题</h3>
+        <label class="f-label">这条内容讲什么
+          <textarea id="topicInput" rows="2" style="width:100%" placeholder="一句话选题;也可点下面选题库里的灵感"></textarea>
+        </label>
+        <div class="style-chips" id="topicChips"></div>
+        <div class="label-row" style="gap:10px;margin-top:8px;flex-wrap:wrap">
+          <label class="f-label" style="margin:0">支柱
+            <select id="pillarSel" style="width:auto"></select>
+          </label>
+          <label class="row" style="margin:0"><input type="checkbox" id="platXhs" checked> 小红书</label>
+          <label class="row" style="margin:0"><input type="checkbox" id="platDy" checked> 抖音</label>
+        </div>
+        <button class="btn primary wide" id="btnGenCopy" style="margin-top:10px" type="button">✨ 生成 3 版文案</button>
+        <div id="copyList" class="ops-copies"></div>
+      </div>
+
+      <div class="gen-stage">
+        <div id="postListView">
+          <div class="label-row">
+            <label style="margin:0;font-size:11.5px;letter-spacing:1.2px;color:var(--accent)">帖子</label>
+            <button class="btn" id="btnNewPost" type="button">＋ 新建空帖</button>
+          </div>
+          <div id="postList" class="ops-posts"></div>
+          <div class="gen-empty" id="postEmpty" hidden>还没有帖子:左侧选好选题点「✨ 生成 3 版文案」,挑一版「用这版」即建帖;或点「＋ 新建空帖」。</div>
+        </div>
+        <div id="postDetail" hidden></div>
+      </div>
+    </div>
+
+    <!-- ============ 调研 ============ -->
+    <div class="gen-grid" id="paneResearch" hidden>
+      <div class="gen-panel">
+        <h3>平台直达</h3>
+        <p class="hint" style="margin:0 0 6px">直达平台搜索/热榜页(新标签打开);数据人工看,本工具不代抓(两平台均无公开 API,且反爬严格)。</p>
+        <label class="f-label">关键词
+          <input id="kwInput" class="txt" style="width:100%" placeholder="如:中华田园犬 / 治愈系萌宠">
+        </label>
+        <div class="gen-grid2" style="margin-top:6px">
+          <button class="btn" id="btnXhsSearch" type="button">小红书 搜索</button>
+          <button class="btn" id="btnDySearch" type="button">抖音 搜索</button>
+        </div>
+        <div class="gen-grid2" style="margin-top:6px">
+          <button class="btn" id="btnXhsExplore" type="button">小红书 发现页</button>
+          <button class="btn" id="btnDyHot" type="button">抖音 热榜</button>
+        </div>
+
+        <h3>收藏对标</h3>
+        <div class="gen-grid2">
+          <label class="f-label">平台
+            <select id="rfPlatform"><option value="xhs">小红书</option><option value="dy">抖音</option></select>
+          </label>
+          <label class="f-label">分组
+            <select id="rfGroup"><option>对标</option><option>热点</option><option>素材</option></select>
+          </label>
+        </div>
+        <label class="f-label">链接
+          <input id="rfUrl" class="txt" style="width:100%" placeholder="https://www.xiaohongshu.com/explore/…">
+        </label>
+        <label class="f-label">标题
+          <input id="rfTitle" class="txt" style="width:100%" placeholder="对标标题(留空取链接前段)">
+        </label>
+        <label class="f-label">备注(好在哪/可抄什么)
+          <textarea id="rfNote" rows="2" style="width:100%"></textarea>
+        </label>
+        <div class="gen-grid3">
+          <label class="f-label">赞 <input id="rfLikes" class="txt" type="number" min="0" placeholder="0"></label>
+          <label class="f-label">藏 <input id="rfSaves" class="txt" type="number" min="0" placeholder="0"></label>
+          <label class="f-label">评 <input id="rfComments" class="txt" type="number" min="0" placeholder="0"></label>
+        </div>
+        <button class="btn wide" id="btnResearchAdd" type="button">＋ 收藏到对标库</button>
+
+        <h3>对标拆解(LLM)</h3>
+        <label class="f-label">粘贴对标笔记文字(标题+正文+标签)
+          <textarea id="anText" rows="6" style="width:100%" placeholder="把对标笔记的标题和正文复制粘贴到这里;平台数据要自己看,LLM 只拆文字。"></textarea>
+        </label>
+        <button class="btn primary wide" id="btnAnalyze" type="button">🔍 拆解这条内容</button>
+        <div id="analyzeResult"></div>
+      </div>
+
+      <div class="gen-stage">
+        <div class="label-row">
+          <label style="margin:0;font-size:11.5px;letter-spacing:1.2px;color:var(--accent)">选题库</label>
+          <button class="btn" id="btnTopicAdd" type="button">＋ 手动加选题</button>
+        </div>
+        <div id="topicList" class="ops-topics"></div>
+
+        <div class="label-row" style="margin-top:16px">
+          <label style="margin:0;font-size:11.5px;letter-spacing:1.2px;color:var(--accent)">对标库</label>
+        </div>
+        <div id="researchList" class="ops-research"></div>
+        <div class="gen-empty" id="researchEmpty" hidden>还没有收藏的对标:左侧填链接收藏,或先用「平台直达」去平台找爆款。</div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<div class="gen-lightbox" id="lightbox"><img id="lightboxImg" alt="预览"></div>
+<div class="gen-lightbox" id="libModal"><div id="libBox" class="ops-libbox"></div></div>
+
+<footer class="statusbar"><span id="status">就绪。</span></footer>
+
+<!-- 页内门禁兜底:直开本页时先验证邀请码;与生图/生视频同一把码,首页弹窗验证过则静默复验直进 -->
+<div class="gate-overlay" id="gateOverlay">
+  <div class="gate-dialog" role="dialog" aria-modal="true">
+    <h2>内容运营</h2>
+    <p class="hint">内部工作台,请输入邀请码进入;一天内错误 3 次将锁定到明天。</p>
+    <input type="password" class="gate-input" id="gateCode" autocomplete="off" placeholder="邀请码">
+    <button class="btn primary wide" id="gateGo">进入</button>
+    <p class="gate-error" id="gateError" hidden></p>
+  </div>
+</div>
+
+<script src="js/gate.js"></script>
+<script src="js/ops.js"></script>
+<script src="js/duoli_video.js"></script>
+<script src="js/duoli.js"></script>
+</body>
+</html>

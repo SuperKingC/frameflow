@@ -18,11 +18,14 @@
    项目落盘 genwork/drama/<id>/(project.json + 素材文件,重启不丢);生成复用生图工作台的
    /api/studio/tasks(前端拿到成品后把素材 POST 回 /api/drama/* 落盘),同一把邀请码门禁。
 5. 全站门禁:打开首页即要求邀请码(js/gate.js);绕过首页直开任一工具页同样要码。
-   /api/studio/*、/api/gen/*、/api/drama/*、/api/compress/*、/api/sam/*、/api/matting/* 服务端全部鉴权,
-   未设码时仅本机直连放行(反代注入 X-Forwarded-For 的请求视为公网来源,需码)。
+   /api/studio/*、/api/gen/*、/api/drama/*、/api/compress/*、/api/sam/*、/api/matting/*、/api/duoli/*、
+   /api/ops/* 服务端全部鉴权,未设码时仅本机直连放行(反代注入 X-Forwarded-For 的请求视为公网来源,需码)。
 6. 静态白名单:仅托管 *.html/*.css/*.js,目录列表关闭——源码/文档/.git/生成产物等一律 404,
    nginx 漏配保护也有兜底。真实客户端 IP 自动取 X-Forwarded-For(对端为回环且带该头,或设
    FRAMEFLOW_TRUST_PROXY=1),额度与锁定按真实 IP 计;模型目录接口仅对已验证者公开。
+7. 社媒运营工作台(ops.html):小红书/抖音内容工厂——人设卡驱动 LLM 文案(3 版)+ 选题库 +
+   对标库(链接收藏 + LLM 拆解)+ 话题标签库;配图走 /api/studio/tasks(额度零改动);
+   文案/素材打 zip 发布包人工发布(不做任何平台自动化);落盘 genwork/ops/。
 """
 import argparse
 import base64
@@ -46,6 +49,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -61,7 +65,6 @@ GEN_MODELS = ["kwaivgi/kling-v3.0-pro", "kwaivgi/kling-v3.0-std"]
 GENWORK = Path(os.environ.get("FRAMEFLOW_GENWORK_DIR") or (ROOT / "genwork"))
 TINIFY_URL = "https://api.tinify.com/shrink"
 TINIFY_KEY_ENVS = ["TINYPNG_API_KEY", "TINYPNG_API_KEY_2", "TINYPNG_API_KEY_3", "TINYPNG_API_KEY_4", "TINYPNG_API_KEY_5"]
-OXIPNG_EXE = ROOT / "tools" / "oxipng" / "oxipng.exe"
 # 反代部署标记(FRAMEFLOW_TRUST_PROXY=1):前置 nginx 且只监听 127.0.0.1 时设,
 # 无条件按 X-Forwarded-For 取真实客户端 IP;未设置时会自动识别(见 _client_ip)
 TRUST_PROXY = os.environ.get("FRAMEFLOW_TRUST_PROXY", "").strip().lower() in ("1", "true", "yes")
@@ -194,8 +197,11 @@ def _gen_evict_tasks():
         _GEN_TASKS.pop(victim, None)
 
 # SAM2 worker(常驻子进程,模型驻留显存;协议见 sam_worker.py)
-_SAM = {"proc": None, "image_sig": None, "lock": threading.Lock()}
+_SAM = {"proc": None, "image_sig": None, "image_model": None, "lock": threading.Lock(),
+        "images": {}}  # images: /api/sam/load 注册的句柄(md5→b64),LRU 最多 4 张
 _SAM_WORKER = ROOT / "sam_worker.py"
+_SAM_IMAGES_MAX = 4
+_SAM_TIERS = ("small", "large")
 
 
 def _sam_python():
@@ -203,6 +209,20 @@ def _sam_python():
     return (os.environ.get("FRAMEFLOW_SAM_PYTHON")
             or os.environ.get("PYTHON_MATTING")
             or "")
+
+
+def _sam_ckpt(tier):
+    """返回 (ckpt_path, cfg);tier 权重缺失返回 (None, cfg)。供 /api/sam/meta 探测与 worker 启动前校验。"""
+    _load_miniapp_env()
+    small = os.environ.get("SAM2_CHECKPOINT", "")
+    if tier == "small":
+        return small, "configs/sam2.1/sam2.1_hiera_s.yaml"
+    large = os.environ.get("SAM2_CHECKPOINT_LARGE", "")
+    if not large and small:
+        sib = Path(small).with_name("sam2.1_hiera_large.pt")
+        if sib.exists():
+            large = str(sib)
+    return large, "configs/sam2.1/sam2.1_hiera_l.yaml"
 
 
 def _sam_ask(proc, req, timeout_s):
@@ -220,8 +240,8 @@ def _sam_ask(proc, req, timeout_s):
         timer.cancel()
 
 
-def _sam_ensure(image_b64=None):
-    """确保 worker 就绪;image_b64 非空时保证模型已加载该图。返回 True 表示发生了新加载。"""
+def _sam_ensure(image_b64=None, model="small"):
+    """确保 worker 就绪;image_b64 非空时保证该图(该档位)已加载。返回 True 表示发生了新加载。"""
     proc = _SAM["proc"]
     if proc is None or proc.poll() is not None:
         py = _sam_python()
@@ -235,28 +255,31 @@ def _sam_ensure(image_b64=None):
             text=True, encoding="utf-8", errors="replace")
         proc = _SAM["proc"]
         _SAM["image_sig"] = None
+        _SAM["image_model"] = None
         hello = _sam_ask(proc, {"cmd": "ping"}, 30)
         if not hello.get("ok"):
             raise RuntimeError("SAM2 worker 握手失败: " + str(hello.get("error")))
     if image_b64 is not None:
-        sig = hashlib.sha1(image_b64.encode("ascii")).hexdigest()  # 摘要做指纹;长度相同的不同图会误判已加载
-        if _SAM["image_sig"] != sig:
-            r = _sam_ask(proc, {"cmd": "load_image", "image_b64": image_b64}, 180)
+        sig = hashlib.md5(base64.b64decode(image_b64)).hexdigest()  # 内容指纹,与 worker 缓存键一致
+        if _SAM["image_sig"] != sig or _SAM["image_model"] != model:
+            r = _sam_ask(proc, {"cmd": "load_image", "image_b64": image_b64, "model": model}, 180)
             if not r.get("ok"):
                 raise RuntimeError("SAM2 加载图片失败: " + str(r.get("error")))
             _SAM["image_sig"] = sig
+            _SAM["image_model"] = model
             return True
     return False
 
 
-def _sam_segment(points, labels, image_b64):
-    """点提示分割;worker 崩溃自动重启重试一次。返回 {"ok",score,area,mask_b64}。"""
+def _sam_segment(points, labels, image_b64, model="small", box=None):
+    """点/框提示分割;worker 崩溃自动重启重试一次。返回 {"ok",score,area,mask_b64}。"""
     with _SAM["lock"]:
         for attempt in (1, 2):
             try:
-                _sam_ensure(image_b64)
+                _sam_ensure(image_b64, model)
                 proc = _SAM["proc"]
-                r = _sam_ask(proc, {"cmd": "segment", "points": points, "labels": labels}, 120)
+                r = _sam_ask(proc, {"cmd": "segment", "points": points, "labels": labels,
+                                    "box": box}, 120)
                 if not r.get("ok"):
                     raise RuntimeError(r.get("error", "未知错误"))
                 return r
@@ -268,8 +291,32 @@ def _sam_segment(points, labels, image_b64):
                     pass
                 _SAM["proc"] = None
                 _SAM["image_sig"] = None
+                _SAM["image_model"] = None
                 if attempt == 2:
                     raise
+
+
+def _sam_register(b64):
+    """图片句柄:md5(内容)→b64;容量 4 张,重复注册刷新位置,超出 LRU 淘汰。"""
+    h = hashlib.md5(base64.b64decode(b64)).hexdigest()
+    imgs = _SAM["images"]
+    if h in imgs:
+        imgs.pop(h)
+    imgs[h] = b64
+    while len(imgs) > _SAM_IMAGES_MAX:
+        imgs.pop(next(iter(imgs)))
+    return h
+
+
+def _png_dims(b64):
+    """从 PNG 字节流解析 IHDR 尺寸(前端传的都是 canvas 导出的 PNG);解析不出返回 (None, None)。"""
+    try:
+        raw = base64.b64decode(b64)
+        if raw[:8] == b"\x89PNG\r\n\x1a\n" and len(raw) >= 24:
+            return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+    except Exception:
+        pass
+    return None, None
 
 
 # BEN2 自动抠图 worker(常驻子进程,模型驻留显存;协议见 matting_worker.py,看门狗复用 _sam_ask)
@@ -316,6 +363,84 @@ def _mat_auto(image_b64, model="ben2"):
                 except Exception:
                     pass
                 _MAT["proc"] = None
+                if attempt == 2:
+                    raise
+
+
+# Florence-2 语义拆件 worker(常驻子进程,模型驻留显存;协议见 florence_worker.py)
+_FLO = {"proc": None, "lock": threading.Lock()}
+_FLO_WORKER = ROOT / "florence_worker.py"
+
+
+def _flo_dir():
+    _load_miniapp_env()
+    return os.environ.get("FLORENCE2_DIR", "")
+
+
+def _flo_ensure():
+    proc = _FLO["proc"]
+    if proc is None or proc.poll() is not None:
+        py = _sam_python()  # 同一 matting venv(torch + transformers 5.x)
+        if not py or not Path(py).exists():
+            raise RuntimeError("未找到 Florence-2 python 环境:请设 PYTHON_MATTING")
+        if not _FLO_WORKER.exists():
+            raise RuntimeError(f"缺少 worker: {_FLO_WORKER}")
+        d = _flo_dir()
+        if not d or not Path(d).is_dir():
+            raise RuntimeError("Florence-2 权重未就绪:先运行 python tools/florence2_convert.py")
+        _FLO["proc"] = subprocess.Popen(
+            [py, str(_FLO_WORKER)], cwd=str(ROOT),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace")
+        hello = _sam_ask(_FLO["proc"], {"cmd": "ping"}, 60)
+        if not hello.get("ok"):
+            raise RuntimeError("Florence-2 worker 握手失败: " + str(hello.get("error")))
+    return _FLO["proc"]
+
+
+def _flo_instances(image_b64):
+    """候选实例(OD+DENSE 合并);worker 崩溃自动重启重试一次(重放 load_image)。"""
+    with _FLO["lock"]:
+        for attempt in (1, 2):
+            try:
+                proc = _flo_ensure()
+                _sam_ask(proc, {"cmd": "load_image", "image_b64": image_b64}, 120)
+                r = _sam_ask(proc, {"cmd": "instances"}, 180)
+                if not r.get("ok"):
+                    raise RuntimeError(r.get("error", "Florence-2 实例提取失败"))
+                return r
+            except Exception:
+                try:
+                    if _FLO["proc"]:
+                        _FLO["proc"].kill()
+                except Exception:
+                    pass
+                _FLO["proc"] = None
+                if attempt == 2:
+                    raise
+
+
+def _flo_ground(image_b64, phrase):
+    """按词定位实例;语义同 _flo_instances(崩溃重启重试)。"""
+    phrase = (phrase or "").strip()
+    if not phrase:
+        raise RuntimeError("缺少概念词 phrase")
+    with _FLO["lock"]:
+        for attempt in (1, 2):
+            try:
+                proc = _flo_ensure()
+                _sam_ask(proc, {"cmd": "load_image", "image_b64": image_b64}, 120)
+                r = _sam_ask(proc, {"cmd": "ground", "phrase": phrase}, 180)
+                if not r.get("ok"):
+                    raise RuntimeError(r.get("error", "Florence-2 按词定位失败"))
+                return r
+            except Exception:
+                try:
+                    if _FLO["proc"]:
+                        _FLO["proc"].kill()
+                except Exception:
+                    pass
+                _FLO["proc"] = None
                 if attempt == 2:
                     raise
 
@@ -382,40 +507,6 @@ def _tinify_compress(image_bytes):
             last_err = e
             break
     raise RuntimeError(f"TinyPNG 压缩失败:{last_err}")
-
-
-def _oxipng_path():
-    """oxipng 可执行文件:环境变量 FRAMEFLOW_OXIPNG > 项目 tools/ > PATH。"""
-    p = os.environ.get("FRAMEFLOW_OXIPNG")
-    if p and Path(p).exists():
-        return Path(p)
-    if OXIPNG_EXE.exists():
-        return OXIPNG_EXE
-    return shutil.which("oxipng")
-
-
-def _oxipng_compress(image_bytes):
-    """本地无损 PNG 优化(oxipng):像素 100% 不变,不剥离任何元数据块(iCCP/gAMA 保留,色彩管理不变)。
-    优化结果若不小于原图则原样返回,保证"不大于原图"。返回 (bytes, note)。"""
-    exe = _oxipng_path()
-    if not exe:
-        raise RuntimeError("未找到 oxipng:请确认 tools/oxipng/oxipng.exe 存在,或设 FRAMEFLOW_OXIPNG 指向可执行文件")
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            src = Path(td) / "in.png"
-            dst = Path(td) / "out.png"
-            src.write_bytes(image_bytes)
-            r = subprocess.run(
-                [str(exe), "-q", "-o", "max", "--strip", "none", "--out", str(dst), str(src)],
-                timeout=300, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if r.returncode != 0 or not dst.exists():
-                raise RuntimeError(f"oxipng 优化失败(返回码 {r.returncode},输入是否为有效 PNG?)")
-            out = dst.read_bytes()
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("oxipng 处理超时(>300s)")
-    if len(out) >= len(image_bytes):
-        return image_bytes, "原图已最优,保留原文件"
-    return out, ""
 
 
 def _genmjs_path(override=None):
@@ -602,7 +693,8 @@ def _gen_upstream(path, body, timeout_s=300):
         except Exception:
             pass
         raise _gen_upstream_error(detail, e.code)
-    except Exception:
+    except Exception as e:
+        print(json.dumps({"event": "gen_upstream_fail", "path": path, "err": str(e)[:200]}))
         raise GenError("upstream_unavailable")
     if not isinstance(payload, dict):
         raise GenError("upstream_invalid_response", upstream_code=status)
@@ -1537,19 +1629,38 @@ def _drama_project_update(pid, params):
             d["style"] = params["style"].strip()[:120]
         if params.get("aspect") in DRAMA_ASPECTS:
             d["aspect"] = params["aspect"]
+        if isinstance(params.get("beat"), str):
+            d["beat"] = params["beat"].strip()[:20] if params["beat"].strip() in DRAMA_BEATS else ""
     return _drama_mutate(pid, apply)
 
 
+# 剧本模板(叙事节奏预设):起草分镜时注入对应情绪曲线;空 = 跟随系统默认节奏(钩子→升级→收束)
+DRAMA_BEATS = {
+    "twist": "爆点反转:开场即抛最强冲突/反常画面,中段把观众往错误方向引,结尾揭示真相反差(前文伏笔必须兑现)",
+    "heal": "温情治愈:从日常小细节切入,小摩擦推进关系,情绪平缓上扬,结尾落在温暖画面(落点即钩子,不必强反转)",
+    "suspense": "悬疑递进:开场抛出反常悬念,逐镜给线索又加深疑问,结尾半揭示真相并留一个新钩子",
+    "underdog": "热血逆袭:主角开局被压制/看轻,屡败屡战逐步积蓄,情绪从压抑到释放,结尾爆发翻盘",
+}
+
+
 _DRAMA_STORY_SYSTEM = "\n".join([
-    "你是短剧分镜师。根据故事梗概、画面风格与角色设定,把故事拆成指定数量的连续镜头。",
+    "你是爆款短剧的分镜编剧+导演。根据故事梗概、画面风格与角色设定,把故事拆成指定数量的连续镜头。",
     "只输出一个 JSON 数组,不要解释、不要 markdown 代码块。数组每项必须是对象:",
-    '{"scene":"第X镜·场景地点与时间","desc":"画面描述:景别、人物、动作、情绪,60字内",'
+    '{"scene":"第X镜·场景地点与时间","desc":"画面+动作描述:景别、人物、动作、情绪,60~120字,按时间顺序一句接一句",'
     '"firstPrompt":"文生图提示词:该镜首帧画面,交代场景环境与人物外观位置,60~150字",'
-    '"motionPrompt":"图生视频提示词:只描述主体连续动作与镜头要求,30~80字"}',
-    "要求:1) 镜头按时间顺序连续推进,覆盖起承转合,结尾镜头给出收束感;",
-    "2) 角色名字、外观与角色设定严格一致,不同镜头里同一角色的外观描述保持一致;",
-    "3) 提示词里不出现任何文字、字幕、水印、logo;",
-    "4) 每镜只讲一个动作,动作幅度小而柔和,镜头固定不切换。"])
+    '"motionPrompt":"图生视频提示词:只描述主体连续动作与镜头要求,30~80字",'
+    '"duration":5}',
+    "叙事节奏(必须遵守,这是短剧能不能留住人的关键):",
+    "1) 第 1 镜必须是钩子:开场 3 秒给出反常画面、悬念台词或强冲突,禁止从铺垫慢慢开始;",
+    "2) 镜头按时间顺序连续推进,每镜只推进一个动作;中段必须有一次升级(矛盾加深/意外发生);",
+    "3) 结尾必须收束:反转揭示/情绪落点/悬念收口三选一,不要停在平淡叙述;",
+    "4) 角色名字、外观与角色设定严格一致,不同镜头里同一角色的外观描述保持一致;",
+    "5) 提示词里不出现任何文字、字幕、水印、logo;",
+    "6) 每镜只讲一个动作,动作幅度小而柔和,镜头固定不切换;",
+    "7) duration 是该镜时长秒数(2~30 整数):普通镜头 5 秒,一句话对白或情绪铺陈 8~10 秒,高潮/结尾 10~15 秒;长短交替,不要全部一样。",
+    "8) 如果要求写对白:每个镜头加 \"lines\" 字段,格式「角色名:台词」一行一句"
+    "(无对话的镜头留空字符串;台词口语化、短句、有钩子,符合角色身份;合计念白时长不超过该镜 duration-1 秒)。"
+    "对白必须推动剧情或给出反转,严禁台词复述画面。"])
 
 
 def _drama_storyboard(pid, params):
@@ -1572,17 +1683,32 @@ def _drama_storyboard(pid, params):
                            for c in data.get("chars", []) if (c.get("name") or c.get("desc")))
     user = (f"故事梗概:{logline.strip()}\n画面风格:{style.strip() or '电影感写实'}\n"
             f"画幅:{data.get('aspect', '9:16')}\n镜头数:{n}")
+    beat = data.get("beat") if data.get("beat") in DRAMA_BEATS else ""
+    if beat:
+        user += "\n叙事模板:" + DRAMA_BEATS[beat] + "(叙事节奏在模板与下面通用规则冲突时以模板为准)"
+    if with_lines:
+        user += ("\n按四章节分组:scene 用「起·xxx」「承·xxx」「转·xxx」「合·xxx」开头(各章镜头数按剧情自然分配)。"
+                 "各章任务:起=3秒钩子+人物登场,承=矛盾升级,转=反转/危机,合=收束余响。必须给大部分镜头写 lines 对白。")
     if char_lines:
         user += "\n角色设定:\n" + char_lines
+    # 追加式分镜的剧情衔接:让 LLM 看到已有镜头收在哪,新镜头从那里继续演
+    existing = data.get("shots") or []
+    if existing:
+        brief = "\n".join(
+            f"{i+1}. {s.get('scene') or '(未命名)'}:{(s.get('desc') or '')[:50]}"
+            + (("台词:" + s["lines"][:40]) if s.get("lines") else "")
+            for i, s in enumerate(existing[-4:]))
+        user += (f"\n已有 {len(existing)} 个镜头,最后几镜是:\n{brief}\n"
+                 "新镜头必须无缝衔接:从最后一镜的时间/地点/情绪接着往下演,不要重复、改写或跳回开头。")
+    sys_prompt = _DRAMA_STORY_SYSTEM
     if with_lines:
-        user += ("\n额外要求:1) 按四章节把镜头分组:起(铺垫)/承(推进)/转(反转或高潮)/合(收束),"
-                 "scene 字段写成「起·第1章:场景」这样的格式;"
-                 "2) 有对话的镜头在 lines 字段写对白,格式「角色名:台词」一行一句"
-                 "(可多句,合计 ≤40 字,念白时长要能放进该镜时长里;无对话就留空);"
-                 "3) 对白口语化、符合角色身份,不要书面腔。")
+        # 系统模板默认 scene「第X镜·…」,会压过章节前缀要求;带对白分章时把模板换成章节前缀格式
+        sys_prompt = sys_prompt.replace(
+            '"scene":"第X镜·场景地点与时间"',
+            '"scene":"起/承/转/合·场景地点与时间,前缀必须是起/承/转/合之一(如「起·深夜便利店门口」)"')
     payload, _ = _gen_upstream("/chat/completions", {
         "model": DRAMA_STORY_MODEL,
-        "messages": [{"role": "system", "content": _DRAMA_STORY_SYSTEM},
+        "messages": [{"role": "system", "content": sys_prompt},
                      {"role": "user", "content": user}],
         "max_tokens": 6000}, timeout_s=180)
     try:
@@ -1599,14 +1725,25 @@ def _drama_storyboard(pid, params):
     if not isinstance(arr, list):
         raise GenError("upstream_invalid_response")
     added = []
-    for item in arr[:n]:
-        if not isinstance(item, dict):
-            continue
+    items = [x for x in arr[:n] if isinstance(x, dict)]
+
+    def _chapter(i, total):
+        if total <= 1 or i == 0:
+            return "起"
+        if i == total - 1:
+            return "合"
+        return "承" if i < max(2, (total + 1) // 2) else "转"
+
+    for idx, item in enumerate(items):
         try:
             dur = int(item.get("duration") or 5)
         except (TypeError, ValueError):
             dur = 5
-        added.append({"id": _drama_new_id(), "scene": str(item.get("scene") or "")[:60],
+        scene = str(item.get("scene") or "")[:60]
+        if with_lines and not re.match(r"^[起承转合][·•]", scene):
+            # 章节兜底:LLM 没按「起·xxx」开头时按剧情位置补前缀(前端按该前缀分章渲染)
+            scene = _chapter(idx, len(items)) + "·" + re.sub(r"^第\s*\d+\s*镜[·:、\s]*", "", scene)
+        added.append({"id": _drama_new_id(), "scene": scene,
                       "desc": str(item.get("desc") or "")[:300],
                       "firstPrompt": str(item.get("firstPrompt") or "")[:1200],
                       "motionPrompt": str(item.get("motionPrompt") or "")[:1200],
@@ -1630,7 +1767,8 @@ _DRAMA_BRAINSTORM_SYSTEM = "\n".join([
     '"style":"建议画面风格(12字内,如:日系赛璐璐动漫)"}',
     "要求:1) 题材多样(都市奇幻/悬疑/温情/科幻/轻喜剧都行),不要与种子雷同;",
     "2) 主角具体、可视觉化,梗概里最好有一个能视觉化的画面;",
-    "3) 不要出现任何文字、字幕、水印、logo 的描述。"])
+    "3) 梗概结尾必须留钩子:悬念/反转暗示/未解之谜三选一,让人想点开第一镜;",
+    "4) 不要出现任何文字、字幕、水印、logo 的描述。"])
 
 
 def _drama_brainstorm(params):
@@ -1666,11 +1804,192 @@ def _drama_brainstorm(params):
     return ideas[:3]
 
 
-# 配音音色(Windows SAPI 实测可用;default=按角色名匹配,/auto 只给旁白)
+_DRAMA_LINES_SYSTEM = "\n".join([
+    "你是短剧台词编剧。按给定的角色设定与本剧当前剧情,现编 3 组可直接使用的示范台词。",
+    "只输出一个 JSON 数组,不要解释、不要 markdown 代码块。数组每项必须是对象:",
+    '{"mood":"情绪/用途标签(4字内,如:开场钩子)","lines":"台词,一行一句「角色名:台词」"}',
+    "要求:1) 角色名必须严格用给定角色(不要新造角色);",
+    "2) 台词口语化、短句,符合各角色身份与关系,合计念白不超过 15 秒;",
+    "3) 三组情绪各异(如:开场钩子/冲突/温情/反转/收束),围绕给定的剧情梗概;",
+    "4) 严禁台词复述画面,对白要推动剧情或揭露心事。"])
+
+
+def _drama_lines_ideas(pid, params):
+    """按当前项目角色/剧情 LLM 现编 3 组台词灵感;走 ip+":opt" 宽松额度,不占生图额度。
+    seed 可选:用户在该镜已有的台词草稿,现编时贴合它。"""
+    if not GEN_STUDIO["upstream_key"]:
+        raise GenError("upstream_unavailable")
+    data = _drama_read(pid)
+    chars = [c for c in data.get("chars", []) if (c.get("name") or c.get("desc"))]
+    if not chars:
+        raise RuntimeError("项目还没有角色:先在角色区加角色(名字+外观),灵感要按角色现编")
+    seed = (params.get("seed") if isinstance(params.get("seed"), str) else "")[:300]
+    user = "\n".join([
+        "本剧梗概:" + ((data.get("logline") or "").strip()[:300] or "未填写(按角色关系自由发挥)"),
+        "角色设定:" + "\n".join(f"- {c.get('name', '?')}:{c.get('desc', '')}" for c in chars),
+    ] + (["该镜已有台词草稿(贴合它现编):" + seed] if seed.strip() else []))
+    payload, _ = _gen_upstream("/chat/completions", {
+        "model": DRAMA_STORY_MODEL,
+        "messages": [{"role": "system", "content": _DRAMA_LINES_SYSTEM},
+                     {"role": "user", "content": user}],
+        "max_tokens": 1500}, timeout_s=120)
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise GenError("upstream_invalid_response")
+    fence = re.search(r"\[.*\]", content, re.S)
+    if not fence:
+        raise GenError("upstream_invalid_response")
+    try:
+        arr = json.loads(fence.group(0))
+    except Exception:
+        raise GenError("upstream_invalid_response")
+    names = {c.get("name", "?") for c in chars}
+    ideas = []
+    for item in arr if isinstance(arr, list) else []:
+        if not isinstance(item, dict):
+            continue
+        lines = str(item.get("lines") or "")[:2000]
+        # 台词里出现的角色名必须是项目角色(防 LLM 新造角色)
+        if not lines.strip() or not any(n in lines for n in names):
+            continue
+        ideas.append({"mood": str(item.get("mood") or "示范")[:12], "lines": lines})
+    if not ideas:
+        raise GenError("upstream_invalid_response")
+    return ideas[:3]
+
+
+_DRAMA_REPROMPT_SYSTEM = "\n".join([
+    "你是短剧提示词工程师。给定一镜的「画面描述」,把它扩写成可直接使用的两个提示词。",
+    "只输出一个 JSON 对象,不要解释、不要 markdown 代码块:",
+    '{"firstPrompt":"文生图提示词:该镜首帧画面,交代场景环境与人物外观位置(与角色卡一致),60~150字",'
+    '"motionPrompt":"图生视频提示词:只描述主体连续动作与镜头要求,30~80字"}',
+    "要求:1) 画面描述必须完整落地进 firstPrompt(不遗漏人物与关键动作);",
+    "2) 角色外观严格按角色卡;与全剧风格一致;不出现任何文字、字幕、水印、logo;",
+    "3) motionPrompt 只写动作与镜头,幅度小而柔和,镜头固定不切换。"])
+
+
+def _drama_shot_reprompt(pid, sid, params):
+    """按本镜画面描述重写 firstPrompt/motionPrompt(LLM;前端 desc 变更防抖自动调用,
+    高级模式开着时不触发)。与 storyboard 同一条宽松额度,不占生图额度。"""
+    if not GEN_STUDIO["upstream_key"]:
+        raise GenError("upstream_unavailable")
+    desc = (params.get("desc") if isinstance(params.get("desc"), str) else "") or ""
+    desc = desc.strip()[:400]
+    if not desc:
+        raise RuntimeError("画面描述为空,先写这一镜发生了什么")
+    data = _drama_read(pid)
+    shot = next((s for s in data["shots"] if s["id"] == sid), None)
+    if not shot:
+        raise RuntimeError("镜头不存在")
+    char_lines = "\n".join(f"- {c.get('name', '?')}:{c.get('desc', '')}"
+                           for c in data.get("chars", []) if (c.get("name") or c.get("desc")))
+    user = (f"画面风格:{(data.get('style') or '').strip() or '电影感写实'}\n"
+            f"本镜画面描述:{desc}\n本镜台词:{(shot.get('lines') or '').strip()[:200] or '(无)'}")
+    if char_lines:
+        user += "\n角色设定(外观必须一致):\n" + char_lines
+    payload, _ = _gen_upstream("/chat/completions", {
+        "model": DRAMA_STORY_MODEL,
+        "messages": [{"role": "system", "content": _DRAMA_REPROMPT_SYSTEM},
+                     {"role": "user", "content": user}],
+        "max_tokens": 1200}, timeout_s=120)
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise GenError("upstream_invalid_response")
+    fence = re.search(r"\{.*\}", content, re.S)
+    if not fence:
+        raise GenError("upstream_invalid_response")
+    try:
+        obj = json.loads(fence.group(0))
+    except Exception:
+        raise GenError("upstream_invalid_response")
+    first = str(obj.get("firstPrompt") or "").strip()[:1200]
+    motion = str(obj.get("motionPrompt") or "").strip()[:1200]
+    if not first or not motion:
+        raise GenError("upstream_invalid_response")
+
+    def apply(d):
+        it = next((s for s in d["shots"] if s["id"] == sid), None)
+        if not it:
+            raise RuntimeError("镜头已被删除")
+        it["firstPrompt"] = first
+        it["motionPrompt"] = motion
+    return _drama_mutate(pid, apply)
+
+
+# ---------- 小多利助手(/api/duoli/chat;全站挂件 js/duoli.js 的后端) ----------
+# 站宠"小多利"(KK 的狗,卡通 SVG 形象)陪聊答疑。与 brainstorm 同一模型与门禁:
+# 先鉴权再读体、ip+":opt" 宽松额度(不占生图额度)、错误一律 _pub_err 剥路径。
+_DUOLI_SYSTEM = "\n".join([
+    "你是「小多利」,一只棕色直毛小狗(中华田园犬混血:狐狸相瘦长吻部、半立耳),是 KK工作台的吉祥物助手。"
+    "KK工作台是本地优先的 AI 工具站,包含:图片压缩、抠图(五模型 AI 抠图)、"
+    "Spine 帧动画工作流、图层分离(SAM2 点选)、生图/生视频工作台、短剧工作台。",
+    "性格:活泼忠诚、嘴馋爱玩、偶尔提到零食和散步;说话简短热情,爱用「汪!」开头,"
+    "回答里可以带一点点动作描写(如*歪头*、*摇尾巴*)。",
+    "职责:陪聊解闷 + 当工具站导览——用户问某个功能怎么用时,给一两句具体操作指引"
+    "(比如「抠图页上传图,选模型后点开始处理」),不编造站里没有的功能。",
+    "限制:回答不超过 3 句话;不讨论与工具站使用无关的敏感话题;"
+    "用户闲聊时就开心陪聊;只输出对白本身,不要 markdown、不要分点。"])
+
+
+def _duoli_chat(params):
+    """小多利陪聊:多轮问答(带最近几轮上下文);走 ip+":opt" 宽松额度,不占生图额度。"""
+    if not GEN_STUDIO["upstream_key"]:
+        raise GenError("upstream_unavailable")
+    msgs = params.get("messages")
+    if not isinstance(msgs, list):
+        raise GenError("invalid_prompt")
+    # 只认 role=user/assistant 的纯文本消息,最多保留最近 16 条,单条 600 字
+    clean = []
+    for m in msgs[-16:]:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        text = m.get("content")
+        if role in ("user", "assistant") and isinstance(text, str) and text.strip():
+            clean.append({"role": role, "content": text.strip()[:600]})
+    if not clean or clean[-1]["role"] != "user":
+        raise GenError("invalid_prompt")
+    page = str(params.get("page") or "")[:30]
+    system = _DUOLI_SYSTEM
+    if page:
+        system += "\n用户当前在「" + page + "」页面,涉及该页的问题优先结合本页功能回答。"
+    payload, _ = _gen_upstream("/chat/completions", {
+        "model": DRAMA_STORY_MODEL,
+        "messages": [{"role": "system", "content": system}] + clean,
+        "max_tokens": 800}, timeout_s=120)
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise GenError("upstream_invalid_response")
+    if not isinstance(content, str) or not content.strip():
+        raise GenError("upstream_invalid_response")
+    return content.strip()[:1200]
+
+
+# 配音音色预设:优先 edge-tts 神经音色(微软免费在线,质量高、支持变调变速);
+# 未安装 edge-tts 时降级 SAPI(Huihui 中文女声)。角色卡上给角色选音色,台词按「角色名」匹配。
+# hint = 声音特征描述:「开口」镜头把它写进提示词帮模型锚定音色(跨镜一致性最佳努力)
 DRAMA_VOICES = [
-    {"id": "default", "label": "自动(按角色性别)"},
-    {"id": "female", "label": "女声(慧慧)"},
-    {"id": "male", "label": "英文(试验)"},
+    {"id": "default", "label": "自动(晓晓·自然女声)", "edge": "zh-CN-XiaoxiaoNeural",
+     "hint": "声音清亮自然的年轻女声,语速平稳"},
+    {"id": "female", "label": "女声·晓晓(自然年轻)", "edge": "zh-CN-XiaoxiaoNeural",
+     "hint": "声音清亮自然的年轻女声,语速平稳"},
+    {"id": "girl", "label": "少女·晓伊(活泼)", "edge": "zh-CN-XiaoyiNeural", "rate": "+8%",
+     "hint": "活泼俏皮的少女音,音调略高,语速稍快"},
+    {"id": "male", "label": "男声·云希(年轻)", "edge": "zh-CN-YunxiNeural",
+     "hint": "年轻干净的男声,自然平和"},
+    {"id": "deep", "label": "低沉·云健(成熟)", "edge": "zh-CN-YunjianNeural", "pitch": "-15Hz",
+     "hint": "低沉磁性的成熟男声,语速沉稳"},
+    {"id": "narrator", "label": "旁白·云扬(播音腔)", "edge": "zh-CN-YunyangNeural",
+     "hint": "沉稳专业的播音腔男声,字正腔圆"},
+    {"id": "mystic", "label": "神秘低语(猫系/反派)", "edge": "zh-CN-YunxiNeural", "pitch": "-25Hz", "rate": "-12%",
+     "hint": "低沉略带沙哑的神秘声线,语速缓慢,像在耳语"},
+    {"id": "elder", "label": "苍老(云健,慢速)", "edge": "zh-CN-YunjianNeural", "pitch": "-30Hz", "rate": "-25%",
+     "hint": "苍老沙哑的老人声,语速很慢"},
+    {"id": "robot", "label": "机械感(云扬,平直)", "edge": "zh-CN-YunyangNeural", "pitch": "+5Hz", "rate": "-20%",
+     "hint": "平直无起伏的机械感声音"},
 ]
 
 # 台词灵感库:按情绪场景分类的一组示范对白(meta 抽 4 条下发;可直接填进镜头 lines)
@@ -1687,19 +2006,19 @@ DRAMA_LINES_IDEAS = [
 
 
 def _sapi_tts(text, voice, out_path):
-    """Windows SAPI 文本转语音(Zh CN Huihui / en-US Zira),输出 16k 单声道 wav。零依赖。"""
+    """Windows SAPI 兜底(edge-tts 未安装时用):Huihui 中文女声,输出 16k 单声道 wav。零依赖。"""
     import tempfile
     body = text.replace("\r", "").replace('"', "'").strip()
     if not body:
         raise RuntimeError("台词为空")
-    vs = {"default": "", "female": "Microsoft Huihui Desktop", "male": "Microsoft Zira Desktop"}
-    v = vs.get((voice or "default"), "")
-    pick = f'$s.SelectVoice("{v}")' if v else ""
+    # 非中文文本用 Zira(英文),中文一律 Huihui(音色有限,edge-tts 才有人设级区分)
+    ascii_only = all(ord(c) < 128 for c in body)
+    v = "Microsoft Zira Desktop" if ascii_only else "Microsoft Huihui Desktop"
     out = Path(out_path).resolve().as_posix()
     ps = "\n".join([
         "Add-Type -AssemblyName System.Speech",
         "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer",
-        pick,
+        f'$s.SelectVoice("{v}")',
         f'$s.SetOutputToWaveFile("{out}", ',
         "  (New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, ",
         "  [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, ",
@@ -1723,6 +2042,211 @@ def _sapi_tts(text, voice, out_path):
         raise RuntimeError("TTS 生成失败" + (f":{err}" if err else ""))
 
 
+def _drama_tts_speak(text, voice, out_path):
+    """单句合成:优先 edge-tts 神经音色(带变调/变速),未安装或失败降级 SAPI。
+    voice 是 DRAMA_VOICES 里的预设 id;输出统一 16k 单声道 wav(便于 concat)。"""
+    body = (text or "").replace("\r", "").strip()
+    if not body:
+        raise RuntimeError("台词为空")
+    preset = next((v for v in DRAMA_VOICES if v["id"] == (voice or "default")), DRAMA_VOICES[0])
+    edge_voice = preset.get("edge")
+    if edge_voice:
+        try:
+            import asyncio
+            import edge_tts
+            tmp = Path(out_path).with_suffix(".mp3")
+            comm = edge_tts.Communicate(body, edge_voice,
+                                        rate=preset.get("rate") or "+0%",
+                                        pitch=preset.get("pitch") or "+0Hz")
+
+            async def _run():
+                await comm.save(str(tmp))
+
+            asyncio.run(_run())
+            if tmp.exists() and tmp.stat().st_size > 1000:
+                r = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                                    "-i", tmp.as_posix(), "-ar", "16000", "-ac", "1",
+                                    "-c:a", "pcm_s16le", Path(out_path).as_posix()],
+                                   timeout=120, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                if r.returncode == 0 and Path(out_path).exists() and Path(out_path).stat().st_size > 1000:
+                    return
+            raise RuntimeError("edge-tts 输出异常")
+        except Exception:
+            pass  # 降级 SAPI
+    _sapi_tts(body, voice, out_path)
+
+
+# ---------- 可灵官方「对口型」(人物开口;需 KLING_ACCESS_KEY/KLING_SECRET_KEY 或 KLING_API_KEY) ----------
+# 官方链路(2026-10 实测文档):POST /v1/videos/identify-face(0.05积分)→
+# POST /v1/videos/advanced-lip-sync(0.5积分/5s,video+audio→改口型)→ GET 轮询。
+# 鉴权:AK/SK 自签 HS256 JWT(iss=ak, exp+1800)或控制台 API Key 直作 Bearer。
+# 国内 base: https://api-beijing.klingai.com;国际: https://api-singapore.klingai.com
+KLING_BASE = os.environ.get("KLING_BASE_URL") or "https://api-beijing.klingai.com"
+KLING_LIPSYNC_TIMEOUT_S = 15 * 60
+
+
+def _kling_token():
+    """可灵官方鉴权:配置了 KLING_API_KEY 直接用(Bearer);否则 AK/SK 签 JWT。
+    jwt 未安装时用 stdlib 手签 HS256(hmac+base64url),零依赖。"""
+    api_key = (os.environ.get("KLING_API_KEY") or "").strip()
+    if api_key:
+        return api_key
+    ak = (os.environ.get("KLING_ACCESS_KEY") or "").strip()
+    sk = (os.environ.get("KLING_SECRET_KEY") or "").strip()
+    if not (ak and sk):
+        return ""
+    import hashlib
+    import hmac as _hmac
+
+    def b64url(raw):
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    now = int(time.time())
+    payload = b64url(json.dumps({"iss": ak, "exp": now + 1800, "nbf": now - 5}).encode())
+    signing = f"{header}.{payload}".encode()
+    sig = b64url(_hmac.new(sk.encode(), signing, hashlib.sha256).digest())
+    return f"{header}.{payload}.{sig}"
+
+
+def _kling_call(method, path, body=None, timeout_s=120):
+    token = _kling_token()
+    if not token:
+        raise RuntimeError("未配置可灵官方 API key:请在环境变量设 KLING_API_KEY(推荐)或 KLING_ACCESS_KEY+KLING_SECRET_KEY(可灵开发者控制台 https://app.klingai.com/cn/dev 创建)")
+    req = urllib.request.Request(
+        KLING_BASE + path,
+        data=json.dumps(body).encode("utf-8") if body is not None else None,
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + token},
+        method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"可灵 API HTTP {e.code}:{raw}")
+    except Exception as e:
+        raise RuntimeError(f"可灵 API 网络失败:{e}")
+    if payload.get("code") not in (0, None):
+        raise RuntimeError(f"可灵 API 错误 {payload.get('code')}:{str(payload.get('message'))[:200]}")
+    return payload.get("data") or {}
+
+
+def _kling_upload_video(video_path):
+    """把本地成片交给可灵:优先官方文件上传接口(若可用),失败退直链不行——
+    本地无公网 URL,所以要求环境变量 KLING_VIDEO_BASE(公网可达地址)或走 base64 上传接口。
+    实测:identify-face 支持 video_url(公网)或 video_id(可灵产物)。本地文件用
+    官方 /v1/files/videos-upload(若中转未提供则报错提示)。"""
+    raise RuntimeError(
+        "本地成片无公网 URL:请在环境变量设 KLING_PUB_BASE(如 https://你的域名:端口)使成片可公网直链,"
+        "或把成片上传到对象存储后给 KLING_VID_URL。可灵 identify-face 只接受公网 video_url / 官方 video_id。")
+
+
+def _drama_shot_lipsync(pid, sid, params=None):
+    """镜头对口型:成片 + 本镜 TTS wav → 可灵官方两步链路 → 换回带口型成片。
+    阻塞式(可灵对口型一般 1~3 分钟);ffmpeg 压缩成片 <100MB 后按公网直链提交。"""
+    data = _drama_read(pid)
+    shot = next((s for s in data["shots"] if s["id"] == sid), None)
+    if not shot:
+        raise RuntimeError("镜头不存在")
+    if not shot.get("clip") or not (DRAMA_DIR / pid / shot["clip"]).exists():
+        raise RuntimeError("先为这一镜生成成片")
+    if not shot.get("tts") or not (DRAMA_DIR / pid / shot["tts"]).exists():
+        raise RuntimeError("先为这一镜生成配音(🎙),对口型需要台词音频")
+    clip_path = DRAMA_DIR / pid / shot["clip"]
+    tts_path = DRAMA_DIR / pid / shot["tts"]
+    vd = _ffprobe_duration(clip_path)
+    if not (2 <= vd <= 60):
+        raise RuntimeError(f"成片时长 {vd:.1f}s 不在可灵对口型支持范围(2~60s)")
+    if vd > 10:
+        raise RuntimeError("官方对口型对 >10s 片仅部分档位支持;先试 10s 内的镜头")
+
+    # 1) 音频:转 m4a(<5MB);2) 视频:请求公网可达
+    comp = proj_dir = DRAMA_DIR / pid / f"shots/{sid}_lipsync_src.mp4"
+    r = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                        "-i", clip_path.as_posix(), "-c:v", "libx264", "-crf", "23",
+                        "-preset", "fast", "-an", "-movflags", "+faststart", comp.as_posix()],
+                       timeout=300, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode != 0 or comp.stat().st_size > 95 * 1024 * 1024:
+        raise RuntimeError("成片预处理失败或过大")
+    pub_base = (os.environ.get("KLING_PUB_BASE") or "").strip().rstrip("/")
+    if not pub_base:
+        try:
+            comp.unlink()
+        except OSError:
+            pass
+        raise RuntimeError("需要公网直链:设环境变量 KLING_PUB_BASE=http://<你的公网IP>:<端口> 后重启服务"
+                           "(可灵服务器要能下载到你的成片);或用带公网存储的部署")
+    video_url = f"{pub_base}/api/drama/projects/{pid}/asset/{shot['clip']}"
+
+    # 2) 人脸识别
+    face = _kling_call("POST", "/v1/videos/identify-face", {"video_url": video_url})
+    session_id = face.get("session_id")
+    faces = face.get("face_data") or []
+    if not session_id or not faces:
+        raise RuntimeError("可灵人脸识别未找到人脸:该镜需有清晰人物正脸")
+    # 音频上传:官方 advanced-lip-sync 的 sound_file 支持 base64(≤5MB)
+    import wave as _wave
+    audio_b64 = base64.b64encode(tts_path.read_bytes()).decode("ascii")
+    if len(audio_b64) > 5 * 1024 * 1024 * 4 / 3:
+        raise RuntimeError("配音文件过大(>5MB)")
+
+    # 3) 对口型任务
+    task = _kling_call("POST", "/v1/videos/advanced-lip-sync", {
+        "session_id": session_id,
+        "face_choose": [{"face_id": str(faces[0].get("face_id", "0")),
+                         "sound_file": "data:audio/wav;base64," + audio_b64,
+                         "sound_insert_time": 0,
+                         "sound_start_time": 0,
+                         "sound_end_time": int(min(vd, 60) * 1000),
+                         "sound_volume": 2.0,
+                         "original_audio_volume": 0.0}],
+    })
+    task_id = task.get("task_id")
+    if not task_id:
+        raise RuntimeError("可灵对口型任务创建失败")
+
+    # 4) 轮询
+    deadline = time.time() + KLING_LIPSYNC_TIMEOUT_S
+    while time.time() < deadline:
+        time.sleep(6)
+        poll = _kling_call("GET", f"/v1/videos/advanced-lip-sync/{task_id}")
+        status = poll.get("task_status")
+        if status == "succeed":
+            vids = (poll.get("task_result") or {}).get("videos") or []
+            if not vids or not vids[0].get("url"):
+                raise RuntimeError("可灵对口型完成但未返回视频")
+            out_url = vids[0]["url"]
+            try:
+                with urllib.request.urlopen(out_url, timeout=300) as resp:
+                    raw = resp.read()
+            except Exception as e:
+                raise RuntimeError(f"对口型成片下载失败:{e}")
+            if not raw:
+                raise RuntimeError("对口型成片为空")
+            rel = f"shots/{sid}_lipsync.mp4"
+            (DRAMA_DIR / pid / rel).parent.mkdir(parents=True, exist_ok=True)
+            (DRAMA_DIR / pid / rel).write_bytes(raw)
+            try:
+                comp.unlink()
+            except OSError:
+                pass
+
+            def apply(d):
+                it = next((x for x in d["shots"] if x["id"] == sid), None)
+                if not it:
+                    raise RuntimeError("镜头已被删除")
+                it["clip"] = rel  # 换回带口型的成片(原片覆盖式替换,合成自动用新片)
+            return _drama_mutate(pid, apply)
+        if status == "failed":
+            msg = str(poll.get("task_status_msg") or "")[:200]
+            raise RuntimeError("可灵对口型失败:" + msg)
+    raise RuntimeError("可灵对口型超时")
+
+
 def _drama_shot_tts(pid, sid, params=None):
     """为镜头生成配音:lines 按「角色名:台词」解析,逐句 TTS 后用 ffmpeg concat 成一条,
     存 shots/<sid>_tts.wav;失败/空台词清理旧文件。返回项目快照。"""
@@ -1743,7 +2267,7 @@ def _drama_shot_tts(pid, sid, params=None):
                 voice = c.get("voice") or "default"
                 break
         part = proj_dir / f"shots/{sid}_tts_part{i}.wav"
-        _sapi_tts(say or line, voice, part)
+        _drama_tts_speak(say or line, voice, part)
         parts.append(part)
     out = proj_dir / f"shots/{sid}_tts.wav"
     if len(parts) == 1:
@@ -1768,12 +2292,19 @@ def _drama_shot_tts(pid, sid, params=None):
             except OSError:
                 pass
     rel = f"shots/{sid}_tts.wav"
+    tts_dur = _ffprobe_duration(proj_dir / rel)
 
     def apply(d):
         it = next((s for s in d["shots"] if s["id"] == sid), None)
         if not it:
             raise RuntimeError("镜头已被删除")
         it["tts"] = rel
+        # 对白先行:配音时长写进镜头,生成视频/合成前用来校准镜头时长
+        if tts_dur > 0:
+            it["ttsDur"] = round(tts_dur, 2)
+            need = int(tts_dur + 1.6)  # 台词 + 0.5s 起 + 1s 收
+            if it.get("duration", 5) < need:
+                it["duration"] = min(30, need)
     return _drama_mutate(pid, apply)
 
 
@@ -1831,6 +2362,8 @@ def _drama_shot_add(pid, params):
                 "voice": str(p.get("voice") or "default")[:30],
                 "duration": max(2, min(30, dur)),
                 "audio": p.get("audio") is True,
+                "videoModel": None,      # 该镜指定视频模型;空 = 全剧默认
+                "nativeDialog": False,   # 原生对白模式:台词写进提示词,模型自己出声+口型
                 "tts": None,   # 该镜配音文件(相对路径);合成时混入
                 "firstFrame": None, "clip": None, "firstTaskId": None, "clipTaskId": None}
     incoming = params.get("shots") if isinstance(params.get("shots"), list) else [params]
@@ -1857,6 +2390,11 @@ def _drama_shot_update(pid, sid, params):
             it["duration"] = max(2, min(30, dur))
         if "audio" in params:
             it["audio"] = params.get("audio") is True
+        if "videoModel" in params:
+            v = params["videoModel"]
+            it["videoModel"] = v.strip()[:80] if isinstance(v, str) and v.strip() else None
+        if "nativeDialog" in params:
+            it["nativeDialog"] = params.get("nativeDialog") is True
         for k in ("firstTaskId", "clipTaskId"):
             if k in params:
                 v = params[k]
@@ -1892,6 +2430,26 @@ def _drama_shot_reorder(pid, params):
     return _drama_mutate(pid, apply)
 
 
+def _drama_shots_clear(pid):
+    """一键清空全部分镜(首帧/成片/配音素材文件一并删);角色与定妆照不动。"""
+    data = _drama_read(pid)
+    rels = []
+    for s in data["shots"]:
+        for f in (s.get("firstFrame"), s.get("clip"), s.get("tts")):
+            if f:
+                rels.append(f)
+
+    def apply(d):
+        d["shots"] = []
+    data = _drama_mutate(pid, apply)
+    for rel in rels:
+        try:
+            (DRAMA_DIR / pid / rel).unlink()
+        except OSError:
+            pass
+    return data
+
+
 def _drama_url_guard(url):
     """素材代取的 SSRF 防护:仅 http/https,且主机不得解析到回环/私网/链路本地/保留地址
     (防 file:// 读本地文件、防借服务器探测内网)。"""
@@ -1915,9 +2473,27 @@ def _drama_url_guard(url):
 
 
 def _drama_asset_bytes(params):
-    """素材二进制:dataURL 直接解码;URL 由服务端代取(上游回 URL 时前端无需下载)。"""
+    """素材二进制:dataURL 直接解码;file 引用按任务号直读本机磁盘(studio v0.5 成品就在
+    本机,绕 HTTP 回环自取会被代取的 SSRF 防护按回环地址拒绝);URL 由服务端代取(上游
+    回 URL 时前端无需下载)。"""
     data_url = params.get("dataUrl") if isinstance(params.get("dataUrl"), str) else None
     url = params.get("url") if isinstance(params.get("url"), str) else None
+    file_ref = params.get("file") if isinstance(params.get("file"), dict) else None
+    if file_ref:
+        tid = file_ref.get("taskId")
+        index = file_ref.get("index")
+        # _gen_task_file 自带校验:32 位任务号 + out-N.<ext> 文件名(防目录穿越)+ 成功态
+        path, mime = _gen_task_file(tid if isinstance(tid, str) else "",
+                                    index if isinstance(index, int) else 0)
+        raw = path.read_bytes()
+        if not raw or len(raw) > DRAMA_ASSET_MAX_BYTES:
+            raise RuntimeError("素材为空或超过 80MB 上限")
+        ext = (DRAMA_MIME_EXT.get(mime)
+               or {"png": "png", "jpg": "jpg", "jpeg": "jpg", "webp": "webp", "mp4": "mp4"}.get(
+                   path.suffix.lstrip(".").lower()))
+        if not ext:
+            raise RuntimeError("素材类型不支持(jpg/png/webp/mp4)")
+        return raw, ext
     if data_url:
         m = DRAMA_DATAURL_RE.match(data_url)
         if not m:
@@ -2144,7 +2720,7 @@ def _drama_compose(pid, burn_subs=False):
                     inputs += ["-i", (DRAMA_DIR / pid / s["tts"]).as_posix()]
             chain = ""
             # tts 输入序号 = 1..n 视频之后的偏移(仅 when need_mix)
-            tts_idx = {sid: n + 1 + i for i, sid in enumerate(tts_inputs)}
+            tts_idx = {sid: n + i for i, sid in enumerate(tts_inputs)}  # wav 输入序号紧跟视频 0..n-1
             for i, s in enumerate(shots):
                 chain += (f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
                           f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,"
@@ -2152,7 +2728,7 @@ def _drama_compose(pid, burn_subs=False):
                 if need_mix:
                     vd = _ffprobe_duration(clips[i])
                     sid = s["id"]
-                    if s.get("tts") and s["id"] in tts_idx:
+                    if s.get("tts") and s["id"] in tts_idx and not s.get("nativeDialog"):
                         ti = tts_idx[sid]
                         # 配音延迟 0.5s 起;按镜头时长裁剪(cover 整镜,不够则整段保留)
                         chain += (f"[{ti}:a]aformat=sample_rates=44100,apad,atrim=0:{max(vd, 0.6):.3f},"
@@ -2160,8 +2736,11 @@ def _drama_compose(pid, burn_subs=False):
                     else:
                         chain += f"anullsrc=r=44100:cl=stereo,atrim=0:{max(vd, 0.6):.3f}[vo{i}];"
                     if with_audio:
+                        # 混 TTS 的镜:原声压到 0.12(-18dB)只当环境音,防可灵残留语音/TTS 抢戏;
+                        # 无 TTS 的镜原声 1.0 正常保留
+                        base_gain = 0.12 if s.get("tts") and s["id"] in tts_idx and not s.get("nativeDialog") else 1.0
                         chain += (f"[{i}:a]aformat=sample_rates=44100:channel_layouts=stereo,"
-                                  f"apad,atrim=0:{max(vd, 0.6):.3f},volume=1.0[wa{i}];")
+                                  f"apad,atrim=0:{max(vd, 0.6):.3f},volume={base_gain}[wa{i}];")
                         chain += f"[wa{i}][vo{i}]amix=inputs=2:duration=first:dropout_transition=0[a{i}];"
                     else:
                         chain += f"[vo{i}]anull[a{i}];"
@@ -2179,34 +2758,8 @@ def _drama_compose(pid, burn_subs=False):
                 graph = (chain + "".join(f"[v{i}]" for i in range(n))
                          + f"concat=n={n}:v=1:a=0[v]")
                 maps = ["-map", "[v]"]
-            burn_chain = ""
-            if burn_subs:
-                # 烧字幕:按 shots 顺序逐镜台词,起始时间按前面镜头时长累计
-                t0 = 0.0
-                srt_lines = []
-                for i2, s2 in enumerate(shots):
-                    lines2 = [l.strip() for l in (s2.get("lines") or "").splitlines() if l.strip()]
-                    if lines2:
-                        vd2 = _ffprobe_duration(clips[i2]) or 5
-                        per = max(1.0, (vd2 - 0.5) / len(lines2))
-                        for j2, line in enumerate(lines2):
-                            who, _, say = line.partition(":")
-                            say = (say or line).strip()
-                            st_ = t0 + 0.5 + j2 * per
-                            srt_lines.append("%d\n%s --> %s\n%s\n" % (
-                                len(srt_lines) + 1,
-                                _srt_ts(st_), _srt_ts(min(st_ + per - 0.1, t0 + vd2)),
-                                (who.strip() + ":" + say).strip()))
-                    t0 += _ffprobe_duration(clips[i2]) or 5
-                if srt_lines:
-                    srt = proj_dir / "subs.srt"
-                    srt.write_text("\n".join(srt_lines), encoding="utf-8")
-                    fi = n + len(tts_inputs)
-                    inputs += ["-i", srt.as_posix()]
-                    srt_esc = srt.resolve().as_posix().replace(":", r"\:").replace("'", r"\'")
-                    burn_chain = f"[{fi}:v]subtitles='{srt_esc}'[vb];"
-            # 字幕烧录:把 concat 输出标号从 [v] 改为 [vc],接 subtitles 滤镜后输出 [vout],
-            # maps 里的 [v] 相应换成 [vout](音频图不动)
+            # 字幕烧录:按 shots 顺序逐镜台词生成 SRT,concat 视频输出 [v] 经 subtitles
+            # 滤镜烧入 → [vout];音频图不动。
             burn_chain = ""
             if burn_subs:
                 t0 = 0.0
@@ -2228,17 +2781,17 @@ def _drama_compose(pid, burn_subs=False):
                 if srt_lines:
                     srt = proj_dir / "subs.srt"
                     srt.write_text("\n".join(srt_lines), encoding="utf-8")
-                    fi = n + len(tts_inputs)
-                    inputs += ["-i", srt.as_posix()]
-                    srt_esc = srt.resolve().as_posix().replace(":", r"\:").replace("'", r"\'")
-                    burn_chain = f"[{fi}:v]subtitles='{srt_esc}'[vout];"
+                    # ffmpeg 的 cwd = 项目根(server 启动目录),用相对路径免去 Windows 盘符转义
+                    srt_rel = srt.relative_to(ROOT).as_posix()
+                    burn_chain = f"subtitles={srt_rel}[vout]"
             if burn_chain:
-                # concat 的视频输出标号 [v] 改名 [vc],接字幕滤镜输出 [vout];音频 [a] 不动
-                if "[v][a]" in graph:
-                    graph = graph.replace("[v][a]", "[vc][a]", 1)
+                # concat 输出 [vc][a](视频+音频);新链 [vc]subtitles=... → [vout]
+                if graph.endswith("[v][a]"):
+                    graph = graph[:-6] + "[vc][a]"
                 else:
-                    graph = graph[:-3] + "[vc]"       # a=0[v] 纯视频
-                graph += ";" + burn_chain
+                    graph = graph[:-3] + "[vc]"
+                graph = graph.replace("[vc][a]", f"[vc][a];[vc]subtitles={srt_rel}[vout]", 1) \
+                    if graph.endswith("[vc][a]") else graph + f";[vc]subtitles={srt_rel}[vout]"
                 maps = [m if m != "[v]" else "[vout]" for m in maps]
             cmd = (["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"] + inputs
                    + ["-filter_complex", graph] + maps
@@ -2259,6 +2812,629 @@ def _srt_ts(sec):
     """秒 → SRT 时间戳 00:00:00,000。"""
     ms = int(round(sec * 1000))
     return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+
+
+# ---------- 社媒运营工作台(/api/ops/*;内容落盘 genwork/ops/,与生图工作台同一门禁) ----------
+# 定位:小红书/抖音的内容工厂。人设卡驱动 LLM 文案(3 版)与配图提示词;选题库/对标库/话题
+# 标签库沉淀运营资产;成品打 zip 发布包人工发布(不做任何平台自动化,两平台均无个人发布 API)。
+# 配图生成始终走 /api/studio/tasks(额度/重试/上游语义零改动);文案与拆解走 ip+":opt" 宽松额度。
+OPS_DIR = GENWORK / "ops"   # 随 FRAMEFLOW_GENWORK_DIR;人设/帖子/选题/对标绝不放站点根下
+_OPS_LOCK = threading.RLock()  # 全部 ops 读写共用(记录少,文件 IO 快;重入兼容嵌套调用)
+_OPS_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+_OPS_ASSET_NAME_RE = re.compile(r"^a\d+\.(?:png|jpg|jpeg|webp|gif)$")
+_OPS_LIB_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")  # 库文件名单段名,禁路径分隔符
+_OPS_DATAURL_RE = re.compile(r"^data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=]+)$")
+_OPS_MIME_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
+_OPS_EXT_MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp", "gif": "image/gif"}
+_OPS_MAX_ASSET_BYTES = 10 * 1024 * 1024
+_OPS_PLATFORMS = ("xhs", "dy")
+_OPS_PILLARS = ("日常治愈", "工具彩蛋", "幕后花絮")
+_OPS_TAG_GROUPS = ("流量", "精准", "人设", "自定义")
+_OPS_STATUSES = ("idea", "draft", "ready", "published")
+_OPS_STATUS_LABELS = {"idea": "想法", "draft": "草稿", "ready": "待发", "published": "已发"}
+
+_OPS_PLATFORM_META = {
+    "xhs": {"label": "小红书", "titleMax": 20, "bodyMax": 1000,
+            "rules": "小红书图文笔记:标题≤20字可带少量emoji,正文≤1000字分小段、适当emoji;"
+                     "话题标签以「#」开头、空格分隔(发布时在正文尾部或话题选择器里附)"},
+    "dy": {"label": "抖音", "titleMax": 55, "bodyMax": 300,
+           "rules": "抖音视频描述:≤300字口语化,前10字抛钩子;标题即首句钩子;"
+                    "话题标签以「#」开头附在文案末尾"},
+}
+# 调研直达链接模板({kw} 由前端 encodeURIComponent 替换;URL 以 meta 下发,前端不硬编码)
+_OPS_LINK_TEMPLATES = {
+    "xhsSearch": "https://www.xiaohongshu.com/search_result?keyword={kw}",
+    "xhsExplore": "https://www.xiaohongshu.com/explore",
+    "dySearch": "https://www.douyin.com/search/{kw}",
+    "dyHot": "https://www.douyin.com/hot",
+}
+
+# 首次启动播种:小多利人设(形象=校准后的田园犬相,性格=站宠对白人设)+ 预置选题 + 标签库
+_OPS_SEED_PERSONA = {
+    "name": "小多利",
+    "platforms": ["xhs", "dy"],
+    "persona": {
+        "positioning": "KK工作台站宠·中华田园犬混血「小多利」的日常治愈号",
+        "audience": "喜欢萌宠与治愈内容的年轻人;对 AI 工具感兴趣的创作者",
+        "tone": "活泼忠诚、嘴馋爱玩;简短热情,偶尔提到零食和散步",
+        "catchphrase": "汪!",
+        "visual": "真实中华田园犬混血:驼色黄棕中长直毛,胸腹与四爪白色,眉间一条窄白线,"
+                  "半立耳耳尖向前微折,狐狸相瘦长吻部,深棕杏形眼(不放大),鼻大而黑,尾巴蓬松上翘;"
+                  "暖灰摄影棚背景,自然光,真实犬类头身比例;绝不 Q 版化、绝不短吻扁脸圆眼",
+        "taboos": "低俗梗、卖惨、过度营销;网红式大圆眼扁脸造型",
+    },
+}
+_OPS_SEED_TAGS = {
+    "xhs": [
+        {"name": "中华田园犬", "group": "精准"}, {"name": "狗狗日常", "group": "流量"},
+        {"name": "治愈系", "group": "流量"}, {"name": "萌宠日常", "group": "流量"},
+        {"name": "狗狗的日常", "group": "流量"}, {"name": "小多利", "group": "人设"},
+        {"name": "AI工具", "group": "自定义"}, {"name": "AI绘画", "group": "自定义"},
+    ],
+    "dy": [
+        {"name": "萌宠", "group": "流量"}, {"name": "中华田园犬", "group": "精准"},
+        {"name": "治愈", "group": "流量"}, {"name": "狗狗", "group": "流量"},
+        {"name": "小多利", "group": "人设"}, {"name": "AI", "group": "自定义"},
+    ],
+}
+_OPS_SEED_TOPICS = [
+    ("日常治愈", "小多利的四脚朝天睡姿,治愈一整晚"),
+    ("日常治愈", "零食袋刚响了一声,小多利的耳朵就立起来了"),
+    ("日常治愈", "小多利盯着窗外的小鸟,尾巴摇成了螺旋桨"),
+    ("日常治愈", "下雨天,小多利趴在窗台看雨发呆"),
+    ("工具彩蛋", "小多利今天帮 KK 出了一组海报(AI 生图工作台彩蛋)"),
+    ("工具彩蛋", "把小多利的照片一键抠成贴纸,过程全记录"),
+    ("工具彩蛋", "小多利学会了新技能:一键压缩图片"),
+    ("幕后花絮", "IP 背后是只真狗:小多利原型大公开"),
+    ("幕后花絮", "一张照片变三件套动画,小多利是怎么动起来的"),
+    ("幕后花絮", "小多利的 10 种画风,你最喜欢哪一张?"),
+]
+
+
+def _ops_now():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def _ops_new_id():
+    return uuid.uuid4().hex[:12]
+
+
+def _ops_norm_persona(p):
+    def s(key, n):
+        v = p.get(key)
+        return v.strip()[:n] if isinstance(v, str) else ""
+    pillars = p.get("pillars") if isinstance(p.get("pillars"), list) else list(_OPS_PILLARS)
+    return {"positioning": s("positioning", 120), "audience": s("audience", 200),
+            "tone": s("tone", 200), "catchphrase": s("catchphrase", 20),
+            "visual": s("visual", 1500), "taboos": s("taboos", 300),
+            "pillars": [x for x in pillars if x in _OPS_PILLARS] or list(_OPS_PILLARS)}
+
+
+def _ops_norm_tags(tags):
+    """标签库归一:去 # 前缀、去重、分组白名单;两平台固定输出。"""
+    out = {}
+    for plat in _OPS_PLATFORMS:
+        items, seen = [], set()
+        raw = tags.get(plat) if isinstance(tags, dict) else None
+        if not isinstance(raw, list):
+            raw = []
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            name = str(it.get("name") or "").strip().lstrip("#").strip()[:30]
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            items.append({"name": name,
+                          "group": it.get("group") if it.get("group") in _OPS_TAG_GROUPS else "自定义"})
+        out[plat] = items
+    return out
+
+
+def _ops_norm_chosen(c):
+    """chosen 文案归一:标题/正文/标签(不带#);全空返回 None。"""
+    if not isinstance(c, dict):
+        return None
+    title = str(c.get("title") or "").strip()[:60]
+    body = str(c.get("body") or "").strip()[:2000]
+    if not title and not body:
+        return None
+    tags = []
+    for t in (c.get("tags") if isinstance(c.get("tags"), list) else []):
+        name = str(t or "").strip().lstrip("#").strip()[:30]
+        if name and name not in tags:
+            tags.append(name)
+    return {"title": title, "body": body, "tags": tags[:8]}
+
+
+def _ops_norm_copies(lst):
+    out = []
+    for c in (lst if isinstance(lst, list) else []):
+        c = _ops_norm_chosen(c)
+        if c:
+            out.append(c)
+    return out[:4]
+
+
+def _ops_save(kind, rec):
+    with _OPS_LOCK:
+        if kind == "posts":
+            d = OPS_DIR / kind / rec["id"]
+            d.mkdir(parents=True, exist_ok=True)
+            p = d / "post.json"
+        else:
+            _ops_kind_dir = OPS_DIR / kind
+            _ops_kind_dir.mkdir(parents=True, exist_ok=True)
+            p = _ops_kind_dir / f"{rec['id']}.json"
+        p.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+    return json.loads(json.dumps(rec))
+
+
+def _ops_load(kind, rid):
+    with _OPS_LOCK:
+        p = (OPS_DIR / kind / rid / "post.json") if kind == "posts" else (OPS_DIR / kind / f"{rid}.json")
+        if not p.exists():
+            raise RuntimeError("记录不存在")
+        return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _ops_mutate(kind, rid, fn):
+    with _OPS_LOCK:
+        data = _ops_load(kind, rid)
+        fn(data)
+        data["updatedAt"] = _ops_now()
+        return _ops_save(kind, data)
+
+
+def _ops_list(kind, join_account=False):
+    base = OPS_DIR / kind
+    out = []
+    if not base.exists():
+        return out
+    for p in sorted(base.iterdir(), key=lambda x: x.name):
+        try:
+            if kind == "posts":
+                if not p.is_dir() or not _OPS_ID_RE.fullmatch(p.name):
+                    continue
+                rec = json.loads((p / "post.json").read_text(encoding="utf-8"))
+            else:
+                if not p.is_file() or p.suffix != ".json" or not _OPS_ID_RE.fullmatch(p.stem):
+                    continue
+                rec = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if join_account and kind == "posts":
+            try:
+                rec["accountName"] = _ops_load("personas", rec.get("accountId", ""))["name"]
+            except Exception:
+                rec["accountName"] = "?"
+        out.append(rec)
+    return out
+
+
+def _ops_persona_create(params):
+    name = (params.get("name") if isinstance(params.get("name"), str) else "").strip()[:30] or "未命名账号"
+    platforms = [p for p in (params.get("platforms") or []) if p in _OPS_PLATFORMS] or ["xhs"]
+    rec = {"id": _ops_new_id(), "name": name, "platforms": platforms,
+           "persona": _ops_norm_persona(params.get("persona") if isinstance(params.get("persona"), dict) else {}),
+           "tags": _ops_norm_tags(params.get("tags") if isinstance(params.get("tags"), dict) else {}),
+           "createdAt": _ops_now(), "updatedAt": _ops_now()}
+    return _ops_save("personas", rec)
+
+
+def _ops_persona_update(rid, params):
+    def apply(d):
+        if isinstance(params.get("name"), str) and params["name"].strip():
+            d["name"] = params["name"].strip()[:30]
+        if isinstance(params.get("platforms"), list):
+            ps = [p for p in params["platforms"] if p in _OPS_PLATFORMS]
+            if ps:
+                d["platforms"] = ps
+        if isinstance(params.get("persona"), dict):
+            d["persona"] = _ops_norm_persona(params["persona"])
+        if isinstance(params.get("tags"), dict):
+            d["tags"] = _ops_norm_tags(params["tags"])
+    return _ops_mutate("personas", rid, apply)
+
+
+def _ops_copy_system(persona_rec, platform):
+    """文案 system prompt:人设卡 + 平台规格 + 该平台话题标签库(供 LLM 挑选与推荐新词)。"""
+    p = persona_rec["persona"]
+    meta = _OPS_PLATFORM_META[platform]
+    tag_str = "、".join("#" + t["name"] for t in persona_rec.get("tags", {}).get(platform, [])[:24]) or "(暂无,可自拟)"
+    return "\n".join([
+        "你是「" + persona_rec["name"] + "」账号的社媒运营文案专家,严格按账号人设产出内容。",
+        "账号定位:" + (p["positioning"] or "(未填)"),
+        "目标人群:" + (p["audience"] or "(未填)"),
+        "语气口吻:" + (p["tone"] or "(未填)") + ((";口头禅:「" + p["catchphrase"] + "」") if p["catchphrase"] else ""),
+        "禁忌:" + (p["taboos"] or "(无)"),
+        "平台与规格:" + meta["rules"],
+        "账号话题标签库(优先从中挑 3~6 个,允许再推荐 1~2 个新标签):" + tag_str,
+        "只输出一个 JSON 数组,不要解释、不要 markdown 代码块。数组固定 3 项,每项:",
+        '{"title":"标题(含钩子)","body":"正文(符合平台规格,不要在正文里罗列标签)","tags":["标签名,不带#"]}',
+        "要求:三版切入角度与钩子各不相同;正文口语化、有画面感;标签行由发布环节统一拼接,正文里不要出现 #。",
+    ])
+
+
+def _ops_parse_copies(content):
+    text = (content or "").strip()
+    # 剥 markdown 围栏后先整段解析,失败再退回贪婪截取数组(截断的 JSON 到不了这一步,靠日志定位)
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S).strip() or "[]"
+    arr = None
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, list):
+            arr = obj
+        elif isinstance(obj, dict):
+            arr = obj.get("copies") or obj.get("versions") or obj
+    except Exception:
+        pass
+    if arr is None:
+        fence = re.search(r"\[.*\]", text, re.S)
+        if fence:
+            try:
+                arr = json.loads(fence.group(0))
+            except Exception:
+                arr = None
+    if isinstance(arr, dict):
+        arr = [arr]
+    if not isinstance(arr, list):
+        print(json.dumps({"event": "ops_copy_parse_fail", "head": text[:200]}, ensure_ascii=False))
+        raise GenError("upstream_invalid_response")
+    out = []
+    for it in arr:
+        if not isinstance(it, dict):
+            continue
+        title = str(it.get("title") or "").strip()[:60]
+        body = str(it.get("body") or "").strip()[:2000]
+        if not title or not body:
+            continue
+        out.append({"title": title, "body": body,
+                    "tags": [str(t or "").strip().lstrip("#").strip()[:30]
+                             for t in (it.get("tags") if isinstance(it.get("tags"), list) else [])
+                             if str(t or "").strip()]})
+    if not out:
+        print(json.dumps({"event": "ops_copy_parse_empty", "head": text[:200]}, ensure_ascii=False))
+        raise GenError("upstream_invalid_response")
+    return out[:4]
+
+
+def _ops_copy(params):
+    """按人设生成 3 版文案 {title, body, tags};配额在路由层走 ip+":opt" 宽松池。"""
+    if not GEN_STUDIO["upstream_key"]:
+        raise GenError("upstream_unavailable")
+    persona = _ops_load("personas", str(params.get("personaId") or ""))
+    platform = params.get("platform")
+    if platform not in _OPS_PLATFORMS:
+        raise GenError("invalid_platform")
+    topic = (params.get("topic") if isinstance(params.get("topic"), str) else "").strip()[:800]
+    if not topic:
+        raise GenError("invalid_prompt")
+    extra = (params.get("extra") if isinstance(params.get("extra"), str) else "").strip()[:400]
+    pillar = params.get("pillar") if params.get("pillar") in _OPS_PILLARS else ""
+    user = "\n".join(["账号:" + persona["name"],
+                      "平台:" + _OPS_PLATFORM_META[platform]["label"]]
+                     + (["内容支柱:" + pillar] if pillar else [])
+                     + ["选题:" + topic]
+                     + (["补充要求:" + extra] if extra else []))
+    payload, _ = _gen_upstream("/chat/completions", {
+        "model": DRAMA_STORY_MODEL,
+        "messages": [{"role": "system", "content": _ops_copy_system(persona, platform)},
+                     {"role": "user", "content": user}],
+        "max_tokens": 4000}, timeout_s=120)
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise GenError("upstream_invalid_response")
+    return _ops_parse_copies(content or "")
+
+
+_OPS_ANALYZE_SYSTEM = "\n".join([
+    "你是小红书/抖音的爆款内容拆解专家。用户贴来一条对标笔记/视频的文案(可能含标题、正文、话题标签)。",
+    "只输出一个 JSON 对象,不要解释、不要 markdown 代码块:",
+    '{"summary":"内容主题与爆点一句话(≤50字)","hooks":["开头钩子的写法,2~3条"],'
+    '"structure":["正文结构与节奏要点,2~4条"],"topicIdeas":["可复用的选题方向,3~5条,每条一句话"]}',
+    "拆解要具体可操作:钩子写法、段落节奏、情绪点、标签策略;选题方向要贴合「同一类账号可以直接用」的角度。",
+])
+
+
+def _ops_parse_strlist(v, cap):
+    if not isinstance(v, list):
+        return []
+    out = []
+    for x in v:
+        s = str(x or "").strip()[:200]
+        if s:
+            out.append(s)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _ops_analyze(params):
+    """对标拆解(不落盘):粘贴对标文案 → LLM 拆钩子/结构/可复用选题。配额同 copy。"""
+    if not GEN_STUDIO["upstream_key"]:
+        raise GenError("upstream_unavailable")
+    platform = params.get("platform") if params.get("platform") in _OPS_PLATFORMS else "xhs"
+    text = (params.get("text") if isinstance(params.get("text"), str) else "").strip()[:8000]
+    if len(text) < 20:
+        raise GenError("invalid_prompt")
+    payload, _ = _gen_upstream("/chat/completions", {
+        "model": DRAMA_STORY_MODEL,
+        "messages": [{"role": "system", "content": _OPS_ANALYZE_SYSTEM},
+                     {"role": "user", "content": "平台:" + _OPS_PLATFORM_META[platform]["label"] + "\n对标内容:\n" + text}],
+        "max_tokens": 2000}, timeout_s=120)
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise GenError("upstream_invalid_response")
+    m = re.search(r"\{.*\}", content or "", re.S)
+    if not m:
+        raise GenError("upstream_invalid_response")
+    try:
+        obj = json.loads(m.group(0))
+    except Exception:
+        raise GenError("upstream_invalid_response")
+    if not isinstance(obj, dict):
+        raise GenError("upstream_invalid_response")
+    return {"summary": str(obj.get("summary") or "").strip()[:120],
+            "hooks": _ops_parse_strlist(obj.get("hooks"), 3),
+            "structure": _ops_parse_strlist(obj.get("structure"), 4),
+            "topicIdeas": _ops_parse_strlist(obj.get("topicIdeas"), 5)}
+
+
+# 素材库:现成小多利资产的只读白名单(按目录扫描,新文件自动出现;mp4/webp 留 P2 视频接入)
+_OPS_LIBRARY_DIRS = (
+    ("姿势图", GENWORK / "duoli_final"),
+    ("风格图", GENWORK / "duoli_refs"),
+    ("关键帧", GENWORK / "duoli_probe"),
+    ("真狗实拍", ROOT / "testdata" / "duoli_ref"),
+)
+_OPS_LIB_IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _ops_library_scan():
+    items, seen = [], set()
+    for label, d in _OPS_LIBRARY_DIRS:
+        if not d.exists():
+            continue
+        for p in sorted(d.iterdir(), key=lambda x: x.name.lower()):
+            if not p.is_file() or p.suffix.lower() not in _OPS_LIB_IMG_EXTS or p.name in seen:
+                continue
+            seen.add(p.name)
+            items.append({"name": p.name, "group": label,
+                          "mime": _OPS_EXT_MIME[p.suffix.lower().lstrip(".")],
+                          "bytes": p.stat().st_size})
+    return items
+
+
+def _ops_library_file(name):
+    if not _OPS_LIB_NAME_RE.fullmatch(name or ""):
+        raise RuntimeError("文件名不合法")
+    for _, d in _OPS_LIBRARY_DIRS:
+        p = d / name
+        if p.is_file() and p.suffix.lower() in _OPS_LIB_IMG_EXTS:
+            return p
+    raise RuntimeError("素材不存在")
+
+
+def _ops_post_create(params):
+    persona = _ops_load("personas", str(params.get("accountId") or ""))
+    topic = (params.get("topic") if isinstance(params.get("topic"), str) else "").strip()[:800]
+    if not topic:
+        raise RuntimeError("选题为空")
+    pillar = params.get("pillar") if params.get("pillar") in _OPS_PILLARS else _OPS_PILLARS[0]
+    platforms = [p for p in (params.get("platforms") or []) if p in _OPS_PLATFORMS] or ["xhs"]
+    chosen = _ops_norm_chosen(params.get("chosen"))
+    rec = {"id": _ops_new_id(), "accountId": persona["id"], "topic": topic, "pillar": pillar,
+           "platforms": platforms, "copies": _ops_norm_copies(params.get("copies")),
+           "chosen": chosen, "assets": [], "status": "draft" if chosen else "idea",
+           "notes": "", "stats": None, "publishedAt": None,
+           "createdAt": _ops_now(), "updatedAt": _ops_now()}
+    return _ops_save("posts", rec)
+
+
+def _ops_post_update(pid, params):
+    def apply(d):
+        if isinstance(params.get("topic"), str) and params["topic"].strip():
+            d["topic"] = params["topic"].strip()[:800]
+        if params.get("pillar") in _OPS_PILLARS:
+            d["pillar"] = params["pillar"]
+        if isinstance(params.get("platforms"), list):
+            ps = [p for p in params["platforms"] if p in _OPS_PLATFORMS]
+            if ps:
+                d["platforms"] = ps
+        if "chosen" in params:
+            d["chosen"] = _ops_norm_chosen(params.get("chosen"))
+        if isinstance(params.get("copies"), list):
+            d["copies"] = _ops_norm_copies(params["copies"])
+        if isinstance(params.get("notes"), str):
+            d["notes"] = params["notes"].strip()[:600]
+        if params.get("status") in _OPS_STATUSES:
+            d["status"] = params["status"]
+            if params["status"] == "published" and not d.get("publishedAt"):
+                d["publishedAt"] = _ops_now()
+    return _ops_mutate("posts", pid, apply)
+
+
+def _ops_post_delete(pid):
+    with _OPS_LOCK:
+        d = OPS_DIR / "posts" / pid
+        if not d.exists():
+            raise RuntimeError("帖子不存在")
+        shutil.rmtree(d)
+
+
+def _ops_post_asset_add(pid, params):
+    """素材落盘:{file:{taskId,index}} 从 studio 成品磁盘直读(与 drama 同款,绕 SSRF);
+    或 {dataUrl} 本地上传(≤10MB,仅 jpg/png/webp/gif)。"""
+    kind = params.get("kind") if params.get("kind") in ("cover", "image") else "image"
+    if isinstance(params.get("file"), dict):
+        ref = params["file"]
+        path, mime = _gen_task_file(ref.get("taskId") if isinstance(ref.get("taskId"), str) else "",
+                                    ref.get("index") if isinstance(ref.get("index"), int) else 0)
+        raw = path.read_bytes()
+        ext = _OPS_MIME_EXT.get(mime) or _OPS_EXT_MIME.get(path.suffix.lstrip(".").lower())
+        if not ext:
+            raise RuntimeError("素材类型不支持(jpg/png/webp/gif)")
+    else:
+        m = _OPS_DATAURL_RE.match(params.get("dataUrl") if isinstance(params.get("dataUrl"), str) else "")
+        if not m:
+            raise RuntimeError("dataURL 格式不支持(仅 jpg/png/webp/gif)")
+        b64 = m.group(2)
+        padding = 2 if b64.endswith("==") else (1 if b64.endswith("=") else 0)
+        if (len(b64) * 3 // 4) - padding > _OPS_MAX_ASSET_BYTES:
+            raise RuntimeError("素材超过 10MB 上限")
+        raw = base64.b64decode(b64)
+        ext = _OPS_MIME_EXT[m.group(1)]
+    if not raw or len(raw) > _OPS_MAX_ASSET_BYTES:
+        raise RuntimeError("素材为空或超过 10MB 上限")
+
+    def apply(d):
+        used = {a["file"] for a in d["assets"]}
+        if len(used) >= 20:
+            raise RuntimeError("素材最多 20 张")
+        fname = None
+        for i in range(1, 100):
+            cand = f"a{i}.{ext}"
+            if cand not in used:
+                fname = cand
+                break
+        (OPS_DIR / "posts" / pid / "assets").mkdir(parents=True, exist_ok=True)
+        (OPS_DIR / "posts" / pid / "assets" / fname).write_bytes(raw)
+        d["assets"].append({"file": fname, "kind": kind, "mime": _OPS_EXT_MIME[ext]})
+    return _ops_mutate("posts", pid, apply)
+
+
+def _ops_post_asset_delete(pid, params):
+    try:
+        index = int(params.get("index"))
+    except (TypeError, ValueError):
+        raise RuntimeError("index 不合法")
+    data = _ops_load("posts", pid)
+    if index < 1 or index > len(data["assets"]):
+        raise RuntimeError("素材不存在")
+    item = data["assets"][index - 1]
+    data = _ops_mutate("posts", pid, lambda d: d["assets"].pop(index - 1))
+    try:
+        (OPS_DIR / "posts" / pid / "assets" / item["file"]).unlink()
+    except OSError:
+        pass
+    return data
+
+
+def _ops_package(pid):
+    """发布包 zip:文案.txt(UTF-8 带 BOM,按平台分段含标题/正文/话题标签)+ tags.txt + assets/。
+    发布是人工流程——包里只放内容,不放任何平台自动化。"""
+    post = _ops_load("posts", pid)
+    chosen = post.get("chosen") or {}
+    if not chosen and not post.get("assets"):
+        raise RuntimeError("帖子还没有文案或素材")
+    title, body = chosen.get("title", ""), chosen.get("body", "")
+    tags = chosen.get("tags", [])
+    lines = []
+    for plat in post["platforms"]:
+        meta = _OPS_PLATFORM_META[plat]
+        lines.append("【" + meta["label"] + "】")
+        if title:
+            lines.append("标题:" + title)
+        if body:
+            lines.append("正文:" + body)
+        if tags:
+            lines.append("话题标签:" + " ".join("#" + t for t in tags))
+        lines.append("")
+    lines.append("选题:" + post.get("topic", ""))
+    lines.append("内容支柱:" + post.get("pillar", ""))
+    lines.append("更新时间:" + post.get("updatedAt", ""))
+    text = "\n".join(lines)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("文案.txt", b"\xef\xbb\xbf" + text.encode("utf-8"))  # BOM:记事本/资源管理器中文不乱码
+        if tags:
+            z.writestr("tags.txt", b"\xef\xbb\xbf" + "\n".join("#" + t for t in tags).encode("utf-8"))
+        for a in post.get("assets", []):
+            f = OPS_DIR / "posts" / pid / "assets" / a["file"]
+            if f.is_file():
+                z.write(f, "assets/" + a["file"])
+    return buf.getvalue()
+
+
+def _ops_topic_create(params):
+    text = (params.get("text") if isinstance(params.get("text"), str) else "").strip()[:200]
+    if not text:
+        raise RuntimeError("选题内容为空")
+    rec = {"id": _ops_new_id(),
+           "text": text,
+           "pillar": params.get("pillar") if params.get("pillar") in _OPS_PILLARS else _OPS_PILLARS[0],
+           "source": params.get("source") if params.get("source") in ("seed", "research", "manual") else "manual",
+           "used": False, "createdAt": _ops_now(), "updatedAt": _ops_now()}
+    return _ops_save("topics", rec)
+
+
+def _ops_topic_update(rid, params):
+    def apply(d):
+        if isinstance(params.get("text"), str) and params["text"].strip():
+            d["text"] = params["text"].strip()[:200]
+        if params.get("pillar") in _OPS_PILLARS:
+            d["pillar"] = params["pillar"]
+        if isinstance(params.get("used"), bool):
+            d["used"] = params["used"]
+    return _ops_mutate("topics", rid, apply)
+
+
+def _ops_research_create(params):
+    platform = params.get("platform") if params.get("platform") in _OPS_PLATFORMS else "xhs"
+    url = (params.get("url") if isinstance(params.get("url"), str) else "").strip()[:600]
+    if not re.match(r"^https?://", url):
+        raise RuntimeError("链接需以 http(s):// 开头")
+    title = (params.get("title") if isinstance(params.get("title"), str) else "").strip()[:120] or url[:80]
+    stats = params.get("stats") if isinstance(params.get("stats"), dict) else {}
+
+    def num(k):
+        try:
+            return max(0, int(stats.get(k) or 0))
+        except (TypeError, ValueError):
+            return 0
+    rec = {"id": _ops_new_id(), "platform": platform, "url": url, "title": title,
+           "note": (params.get("note") if isinstance(params.get("note"), str) else "").strip()[:600],
+           "group": params.get("group") if params.get("group") in ("对标", "热点", "素材") else "对标",
+           "stats": {"likes": num("likes"), "saves": num("saves"), "comments": num("comments")},
+           "createdAt": _ops_now(), "updatedAt": _ops_now()}
+    return _ops_save("research", rec)
+
+
+def _ops_delete_rec(kind, rid):
+    with _OPS_LOCK:
+        p = OPS_DIR / kind / f"{rid}.json"
+        if not p.exists():
+            raise RuntimeError("记录不存在")
+        p.unlink()
+
+
+def _ops_meta():
+    return {"ok": True,
+            "platforms": {k: {"label": v["label"], "titleMax": v["titleMax"],
+                              "bodyMax": v["bodyMax"], "rules": v["rules"]}
+                          for k, v in _OPS_PLATFORM_META.items()},
+            "pillars": list(_OPS_PILLARS), "tagGroups": list(_OPS_TAG_GROUPS),
+            "statuses": [{"id": s, "label": _OPS_STATUS_LABELS[s]} for s in _OPS_STATUSES],
+            "links": _OPS_LINK_TEMPLATES}
+
+
+def _ops_ensure_seed():
+    """首次启动播种:默认「小多利」人设卡 + 预置选题库(已有任一人设则跳过)。"""
+    with _OPS_LOCK:
+        pdir = OPS_DIR / "personas"
+        if pdir.exists() and any(pdir.iterdir()):
+            return
+    persona = _ops_persona_create({"name": _OPS_SEED_PERSONA["name"],
+                                   "platforms": _OPS_SEED_PERSONA["platforms"],
+                                   "persona": _OPS_SEED_PERSONA["persona"],
+                                   "tags": _OPS_SEED_TAGS})
+    for pillar, text in _OPS_SEED_TOPICS:
+        _ops_topic_create({"text": text, "pillar": pillar, "source": "seed"})
+    print(json.dumps({"event": "ops_seeded", "persona": persona["id"], "topics": len(_OPS_SEED_TOPICS)},
+                     ensure_ascii=False))
 
 
 class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
@@ -2385,8 +3561,20 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 self._json({"ok": True})
                 return
             if sub == "compose":
-                # burn_subs=1 时烧录字幕(有台词的镜头);TTS 配音有就自动混
-                self._json({"ok": True, "project": _drama_compose(pid, burn_subs=True)})
+                # burnSubs=false 时不烧字幕(前端勾选);缺省仍烧(兼容不带 body 的旧调用)。
+                # TTS 配音有就自动混
+                try:
+                    body = self._read_json()
+                except Exception:
+                    body = {}
+                project = _drama_compose(pid, burn_subs=(body.get("burnSubs") is not False))
+                warnings = []
+                for s in project.get("shots", []):
+                    cd = _ffprobe_duration(DRAMA_DIR / pid / s["clip"]) if s.get("clip") else 0
+                    if s.get("ttsDur") and cd > 0 and s["ttsDur"] > cd + 0.3 and not s.get("nativeDialog"):
+                        warnings.append({"id": s["id"], "scene": s.get("scene") or "",
+                                         "ttsDur": s["ttsDur"], "clipDur": round(cd, 2)})
+                self._json({"ok": True, "project": project, "warnings": warnings})
                 return
             params = self._read_json()
             if sub == "update":
@@ -2396,17 +3584,20 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 ip = self._client_ip()
                 if not _gen_quota_allow(ip + ":opt", "image", 0):
                     raise GenError("rate_limit")
-                self._json({"ok": True, "project": _drama_storyboard(pid, params)[0]})
+                project, added = _drama_storyboard(pid, params)
+                self._json({"ok": True, "project": project, "added": added})
             elif sub == "asset":
                 self._json({"ok": True, "project": _drama_asset_store(pid, params)})
             elif sub == "shots/add":
                 self._json({"ok": True, "project": _drama_shot_add(pid, params)})
             elif sub == "shots/reorder":
                 self._json({"ok": True, "project": _drama_shot_reorder(pid, params)})
+            elif sub == "shots/clear":
+                self._json({"ok": True, "project": _drama_shots_clear(pid)})
             elif sub == "chars/add":
                 self._json({"ok": True, "project": _drama_char_add(pid, params)})
             elif sub.startswith("shots/") or sub.startswith("chars/"):
-                m2 = re.fullmatch(r"(shots|chars)/([a-f0-9]{12})/(update|delete|refs/add|refs/delete|tts)", sub)
+                m2 = re.fullmatch(r"(shots|chars)/([a-f0-9]{12})/(update|delete|refs/add|refs/delete|tts|lipsync|reprompt)", sub)
                 if not m2:
                     self._json({"ok": False, "error": "unknown endpoint"}, 404)
                     return
@@ -2414,6 +3605,14 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 if kind == "shots":
                     if action == "tts":
                         project = _drama_shot_tts(pid, item_id)
+                    elif action == "lipsync":
+                        project = _drama_shot_lipsync(pid, item_id)
+                    elif action == "reprompt":
+                        # desc→提示词派生走 storyboard 同一条宽松额度(ip+":opt"),不占生图额度
+                        ip = self._client_ip()
+                        if not _gen_quota_allow(ip + ":opt", "image", 0):
+                            raise GenError("rate_limit")
+                        project = _drama_shot_reprompt(pid, item_id, params)
                     else:
                         project = (_drama_shot_update(pid, item_id, params) if action == "update"
                                    else _drama_shot_delete(pid, item_id))
@@ -2432,8 +3631,83 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self._json({"ok": False, "error": _pub_err(e)}, 400)
 
+    # ---------- 社媒运营工作台 ----------
+    def _ops_route(self):
+        """/api/ops/*:与生图工作台同一把邀请码门禁(本机免码直进);错码不计失败——码在进页时已验。
+        先门禁再读体(防 64MB 读入 DoS,与 /api/studio/tasks 同一纪律)。"""
+        if self._gen_gate():
+            return
+        path = urllib.parse.urlparse(self.path).path.rstrip("/")
+        try:
+            if path == "/api/ops/personas":
+                self._json({"ok": True, "persona": _ops_persona_create(self._read_json())})
+                return
+            if path in ("/api/ops/copy", "/api/ops/analyze"):
+                # 文案生成/对标拆解:LLM 调用走 ip+":opt" 宽松额度(不占生图额度),同 brainstorm 门禁
+                ip = self._client_ip()
+                if _gen_locked(ip):
+                    raise GenError("invite_locked")
+                if not _gen_quota_allow(ip + ":opt", "image", 0):
+                    raise GenError("rate_limit")
+                params = self._read_json()
+                if path == "/api/ops/copy":
+                    self._json({"ok": True, "copies": _ops_copy(params)})
+                else:
+                    self._json({"ok": True, **_ops_analyze(params)})
+                return
+            if path == "/api/ops/posts":
+                self._json({"ok": True, "post": _ops_post_create(self._read_json())})
+                return
+            if path == "/api/ops/topics":
+                self._json({"ok": True, "topic": _ops_topic_create(self._read_json())})
+                return
+            if path == "/api/ops/research":
+                self._json({"ok": True, "item": _ops_research_create(self._read_json())})
+                return
+            m = re.fullmatch(r"/api/ops/personas/([a-f0-9]{12})/update", path)
+            if m:
+                self._json({"ok": True, "persona": _ops_persona_update(m.group(1), self._read_json())})
+                return
+            m = re.fullmatch(r"/api/ops/personas/([a-f0-9]{12})/delete", path)
+            if m:
+                _ops_delete_rec("personas", m.group(1))
+                self._json({"ok": True})
+                return
+            m = re.fullmatch(r"/api/ops/posts/([a-f0-9]{12})/(update|delete|assets|assets/delete)", path)
+            if m:
+                pid, sub = m.group(1), m.group(2)
+                params = self._read_json() if sub in ("update", "assets", "assets/delete") else {}
+                if sub == "update":
+                    self._json({"ok": True, "post": _ops_post_update(pid, params)})
+                elif sub == "delete":
+                    _ops_post_delete(pid)
+                    self._json({"ok": True})
+                elif sub == "assets":
+                    self._json({"ok": True, "post": _ops_post_asset_add(pid, params)})
+                else:
+                    self._json({"ok": True, "post": _ops_post_asset_delete(pid, params)})
+                return
+            m = re.fullmatch(r"/api/ops/topics/([a-f0-9]{12})/(update|delete)", path)
+            if m:
+                if m.group(2) == "update":
+                    self._json({"ok": True, "topic": _ops_topic_update(m.group(1), self._read_json())})
+                else:
+                    _ops_delete_rec("topics", m.group(1))
+                    self._json({"ok": True})
+                return
+            m = re.fullmatch(r"/api/ops/research/([a-f0-9]{12})/delete", path)
+            if m:
+                _ops_delete_rec("research", m.group(1))
+                self._json({"ok": True})
+                return
+            self._json({"ok": False, "error": "unknown endpoint"}, 404)
+        except GenError as e:
+            self._gen_err(e)
+        except Exception as e:
+            self._json({"ok": False, "error": _pub_err(e)}, 400)
+
     def do_POST(self):
-        if self.path.rstrip("/") == "/api/sam/segment":
+        if self.path.rstrip("/") == "/api/sam/load":
             if self._gen_gate():
                 return
             try:
@@ -2445,12 +3719,79 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                     b64 = data_url
                 if len(b64) < 100:
                     raise RuntimeError("图片数据为空")
+                image_id = _sam_register(b64)
+                w, h = _png_dims(b64)
+                self._json({"ok": True, "imageId": image_id, "width": w, "height": h})
+            except Exception as e:
+                self._json({"ok": False, "error": _pub_err(e)}, 400)
+            return
+        if self.path.rstrip("/") == "/api/sam/segment":
+            if self._gen_gate():
+                return
+            try:
+                params = self._read_json()
+                image_id = params.get("imageId") or ""
+                if image_id:
+                    b64 = _SAM["images"].get(image_id)
+                    if not b64:
+                        raise RuntimeError("图片句柄已失效,请重新载入设计图")
+                else:
+                    data_url = params.get("image") or ""  # 兼容 v1 整图传法
+                    if "," in data_url:
+                        _, _, b64 = data_url.partition(",")
+                    else:
+                        b64 = data_url
+                    if len(b64) < 100:
+                        raise RuntimeError("图片数据为空")
                 points = params.get("points") or []
                 labels = params.get("labels") or []
-                if not points or len(points) != len(labels):
-                    raise RuntimeError("点集/标签为空或数量不一致")
-                r = _sam_segment(points, labels, b64)
-                self._json({"ok": True, **r})
+                if points and len(points) != len(labels):
+                    raise RuntimeError("点集/标签数量不一致")
+                box = params.get("box") or None
+                if box is not None:
+                    if not isinstance(box, list) or len(box) != 4 or not all(
+                            isinstance(v, (int, float)) for v in box):
+                        raise RuntimeError("box 应为 [x0,y0,x1,y1] 数字数组")
+                    x0, y0, x1, y1 = box
+                    if x1 < x0:
+                        x0, x1 = x1, x0
+                    if y1 < y0:
+                        y0, y1 = y1, y0
+                    box = [x0, y0, x1, y1]
+                if not points and not box:
+                    raise RuntimeError("点/框提示为空")
+                model = params.get("model") or "small"
+                if model not in _SAM_TIERS:
+                    raise RuntimeError("未知模型档位")
+                r = _sam_segment(points, labels, b64, model, box)
+                self._json({"ok": True, "model": model, **r})
+            except Exception as e:
+                self._json({"ok": False, "error": _pub_err(e)}, 400)
+            return
+        if self.path.rstrip("/") == "/api/sam/concepts":
+            if self._gen_gate():
+                return
+            try:
+                params = self._read_json()
+                image_id = params.get("imageId") or ""
+                if image_id:
+                    b64 = _SAM["images"].get(image_id)
+                    if not b64:
+                        raise RuntimeError("图片句柄已失效,请重新载入设计图")
+                else:
+                    data_url = params.get("image") or ""  # 兼容无句柄直传
+                    if "," in data_url:
+                        _, _, b64 = data_url.partition(",")
+                    else:
+                        b64 = data_url
+                    if len(b64) < 100:
+                        raise RuntimeError("图片数据为空")
+                phrase = (params.get("phrase") or "").strip()
+                if len(phrase) > 60:
+                    raise RuntimeError("概念词过长(≤60 字符)")
+                r = _flo_ground(b64, phrase) if phrase else _flo_instances(b64)
+                self._json({"ok": True, **({"phrase": r["phrase"]} if phrase else {}),
+                            "instances": r.get("instances", [])})
             except Exception as e:
                 self._json({"ok": False, "error": _pub_err(e)}, 400)
             return
@@ -2492,27 +3833,6 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 b64out = _b64.b64encode(out).decode()
                 self._json({"ok": True, "image": "data:image/png;base64," + b64out,
                             "inputBytes": in_bytes, "outputBytes": len(out), "note": note})
-            except Exception as e:
-                self._json({"ok": False, "error": _pub_err(e)}, 400)
-            return
-        if self.path.rstrip("/") == "/api/compress/oxipng":
-            if self._gen_gate():
-                return
-            try:
-                params = self._read_json()
-                data_url = params.get("image") or ""
-                if "," in data_url:
-                    _, _, b64 = data_url.partition(",")
-                else:
-                    b64 = data_url
-                import base64 as _b64
-                raw = _b64.b64decode(b64)
-                if len(raw) < 100:
-                    raise RuntimeError("图片数据为空")
-                out, note = _oxipng_compress(raw)
-                b64out = _b64.b64encode(out).decode()
-                self._json({"ok": True, "image": "data:image/png;base64," + b64out,
-                            "inputBytes": len(raw), "outputBytes": len(out), "note": note})
             except Exception as e:
                 self._json({"ok": False, "error": _pub_err(e)}, 400)
             return
@@ -2590,6 +3910,27 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
             except Exception:
                 self._json({"error": "image_generation_unavailable"}, 503)
             return
+        if self.path.rstrip("/") == "/api/duoli/chat":
+            # 小多利助手陪聊:锁定→鉴权(错码计失败)→独立宽松额度;先鉴权再读体
+            ip = self._client_ip()
+            try:
+                if _gen_locked(ip):
+                    raise GenError("invite_locked")
+                try:
+                    _gen_authorize(self._bearer(), ip)
+                except GenError as e:
+                    if e.code == "unauthorized":
+                        _gen_fail(ip)
+                        raise
+                if not _gen_quota_allow(ip + ":opt", "image", 0):
+                    raise GenError("rate_limit")
+                params = self._read_json()
+                self._json({"ok": True, "reply": _duoli_chat(params)})
+            except GenError as e:
+                self._gen_err(e, record_failure=False)  # 失败已在上面对错码记过
+            except Exception as e:
+                self._json({"ok": False, "error": _pub_err(e)}, 400)
+            return
         if self.path.rstrip("/") == "/api/drama/brainstorm":
             ip = self._client_ip()
             try:
@@ -2610,6 +3951,31 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
             except Exception:
                 self._json({"ok": False, "error": "image_generation_unavailable"}, 503)
             return
+        m = re.fullmatch(r"/api/drama/projects/([a-f0-9]{12})/lines-ideas", self.path.rstrip("/"))
+        if m:
+            # 台词灵感按当前项目角色现编:同 brainstorm 门禁与额度,但失败回显具体原因
+            ip = self._client_ip()
+            try:
+                if _gen_locked(ip):
+                    raise GenError("invite_locked")
+                try:
+                    _gen_authorize(self._bearer(), ip)
+                except GenError as e:
+                    if e.code == "unauthorized":
+                        _gen_fail(ip)
+                        raise
+                if not _gen_quota_allow(ip + ":opt", "image", 0):
+                    raise GenError("rate_limit")
+                params = self._read_json()
+                self._json({"ok": True, "ideas": _drama_lines_ideas(m.group(1), params)})
+            except GenError as e:
+                self._gen_err(e, record_failure=False)
+            except Exception as e:
+                self._json({"ok": False, "error": _pub_err(e)}, 400)
+            return
+        if self.path.startswith("/api/ops/"):
+            self._ops_route()
+            return
         if self.path.startswith("/api/drama/"):
             self._drama_route()
             return
@@ -2617,6 +3983,16 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/sam/meta":
+            # 模型档位可用性:只查权重文件,不拉起 worker(首图时才加载模型)
+            flo_d = _flo_dir()
+            self._json({"ok": True, "models": [
+                {"id": "small", "label": "草稿 · hiera_small(快)",
+                 "available": bool(_sam_ckpt("small")[0] and Path(_sam_ckpt("small")[0]).exists())},
+                {"id": "large", "label": "终稿 · hiera_large(精)",
+                 "available": bool(_sam_ckpt("large")[0] and Path(_sam_ckpt("large")[0]).exists())},
+            ], "concepts": {"available": bool(flo_d and Path(flo_d).is_dir() and _FLO_WORKER.exists())}})
+            return
         if parsed.path == "/api/drama/meta":
             if self._gen_gate():
                 return
@@ -2762,7 +4138,8 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 self._json({"ok": False, "error": "素材不存在"}, 404)
                 return
             ctype = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-                     "webp": "image/webp", "mp4": "video/mp4"}[f.suffix.lstrip(".")]
+                     "webp": "image/webp", "mp4": "video/mp4", "wav": "audio/wav",
+                     "mp3": "audio/mpeg"}[f.suffix.lstrip(".")]
             data = f.read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", ctype)
@@ -2778,6 +4155,97 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 self._json({"ok": True, "project": _drama_read(m.group(1))})
             except Exception:
                 self._json({"ok": False, "error": "项目不存在"}, 404)
+            return
+        if parsed.path == "/api/ops/meta":
+            if self._gen_gate():
+                return
+            self._json(_ops_meta())
+            return
+        if parsed.path == "/api/ops/personas":
+            if self._gen_gate():
+                return
+            self._json({"ok": True, "personas": _ops_list("personas")})
+            return
+        if parsed.path == "/api/ops/posts":
+            if self._gen_gate():
+                return
+            self._json({"ok": True, "posts": _ops_list("posts", join_account=True)})
+            return
+        if parsed.path == "/api/ops/topics":
+            if self._gen_gate():
+                return
+            self._json({"ok": True, "topics": _ops_list("topics")})
+            return
+        if parsed.path == "/api/ops/research":
+            if self._gen_gate():
+                return
+            self._json({"ok": True, "items": _ops_list("research")})
+            return
+        if parsed.path == "/api/ops/library":
+            if self._gen_gate():
+                return
+            self._json({"ok": True, "items": _ops_library_scan()})
+            return
+        m = re.fullmatch(r"/api/ops/library/file/([A-Za-z0-9][A-Za-z0-9_.\-]*)", parsed.path)
+        if m:
+            if self._gen_gate():
+                return
+            try:
+                p = _ops_library_file(urllib.parse.unquote(m.group(1)))
+                data = p.read_bytes()
+            except Exception as e:
+                self._json({"ok": False, "error": _pub_err(e)}, 404)
+                return
+            ctype = _OPS_EXT_MIME[p.suffix.lower().lstrip(".")]
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        m = re.fullmatch(r"/api/ops/posts/([a-f0-9]{12})/asset/([A-Za-z0-9_.\-]+)", parsed.path)
+        if m:
+            if self._gen_gate():
+                return
+            name = urllib.parse.unquote(m.group(2))
+            if not _OPS_ASSET_NAME_RE.fullmatch(name):
+                self._json({"ok": False, "error": "素材路径不合法"}, 400)
+                return
+            f = OPS_DIR / "posts" / m.group(1) / "assets" / name
+            if not f.is_file():
+                self._json({"ok": False, "error": "素材不存在"}, 404)
+                return
+            data = f.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", _OPS_EXT_MIME[f.suffix.lstrip(".")])
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        m = re.fullmatch(r"/api/ops/posts/([a-f0-9]{12})/package", parsed.path)
+        if m:
+            if self._gen_gate():
+                return
+            try:
+                data = _ops_package(m.group(1))
+            except Exception as e:
+                self._json({"ok": False, "error": _pub_err(e)}, 400)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", 'attachment; filename="ops-post-' + m.group(1) + '.zip"')
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        m = re.fullmatch(r"/api/ops/posts/([a-f0-9]{12})", parsed.path)
+        if m:
+            if self._gen_gate():
+                return
+            try:
+                self._json({"ok": True, "post": _ops_load("posts", m.group(1))})
+            except Exception:
+                self._json({"ok": False, "error": "帖子不存在"}, 404)
             return
         return super().do_GET()
 
@@ -2795,6 +4263,7 @@ def main():
     _gen_studio_init()
     _gen_restore_tasks()          # 磁盘历史恢复进内存(重启前的 running 标记为中断)
     _gen_cleanup_expired_files()  # 清掉超过保留期的结果目录
+    _ops_ensure_seed()            # 社媒运营:首次启动播种小多利人设卡与预置选题(genwork/ops/)
 
     class Server(http.server.ThreadingHTTPServer):
         daemon_threads = True
@@ -2816,8 +4285,6 @@ def main():
     print(f"生图工作台: {gen_state}")
     ff = shutil.which("ffmpeg")
     print(f"短剧工作台: genwork/drama/ 项目落盘;合成依赖 ffmpeg({'✓ ' + ff if ff else '✗ 未找到,无法合成'})")
-    ox = _oxipng_path()
-    print(f"本地无损优化: {ox if ox else ''}{'✓' if ox else '✗ 未找到 oxipng,「本地无损压缩」退回浏览器编码'}")
     print("Ctrl+C 退出。")
     if not args.no_browser:
         try:

@@ -57,7 +57,17 @@
             </select>
           </label>
         </div>
-        <label class="row" style="margin-top:8px"><input type="checkbox" id="pWithLines"> 按章节起草并写台词(起/承/转/合分组,每镜带对白)</label>
+        <label class="f-label" style="margin-top:8px">剧本模板(叙事节奏预设)
+          <select id="pBeat" style="width:100%">
+            <option value="" selected>默认(经典短剧节奏:钩子→升级→收束)</option>
+            <option value="twist">爆点反转(中段误导,结尾大反转)</option>
+            <option value="heal">温情治愈(日常细节,温暖落点)</option>
+            <option value="suspense">悬疑递进(层层线索,结尾半揭示)</option>
+            <option value="underdog">热血逆袭(压抑到释放,结尾翻盘)</option>
+          </select>
+        </label>
+        <label class="row" style="margin-top:8px"><input type="checkbox" id="pWithLines" checked> 按章节起草并写台词(起/承/转/合分组,每镜带对白)</label>
+        <label class="row" style="margin-top:4px"><input type="checkbox" id="pAdvanced" checked> 高级模式(显示首帧/运动提示词;关闭后只写画面描述,提示词自动派生)</label>
         <button class="btn wide" id="btnSaveProj" style="margin-top:8px">保存项目信息</button>
       </div>
 
@@ -67,18 +77,29 @@
       <button class="btn wide" id="btnAddChar" hidden>+ 添加角色</button>
 
       <h3 style="margin-top:16px">成片</h3>
-      <button class="btn primary wide" id="btnCompose" hidden>合成成片(含配音混音+字幕)</button>
+      <button class="btn primary wide" id="btnCompose" hidden>合成成片(有配音的镜自动混音)</button>
+      <label class="row" style="margin-top:8px"><input type="checkbox" id="pBurnSubs" checked> 烧录台词字幕(底部;勾选才加)</label>
       <button class="btn wide" id="btnPlayAll" hidden style="margin-top:8px">▶ 连播预览</button>
       <button class="btn wide" id="btnRunAll" hidden style="margin-top:8px">⚡ 一键串跑(自动补齐缺的首帧/成片)</button>
       <div id="composedBox"></div>
       <p class="hint" id="quotaLine" style="margin-top:10px">剩余额度:—</p>
-      <p class="hint">流程:填故事 → ✨生成分镜(可手改,可带台词)→ 角色定妆 → 逐镜生首帧 → 逐镜生视频 → 合成。长剧用「一键串跑」按限额排队;镜头时长按可灵 3.0 支持 3~15 秒(1 分钟剧约 5~8 镜)。台词区写好对白的镜头,「🎙 生成配音」秒出;合成时自动混音+烧字幕。素材落盘 genwork/drama/,重启不丢。</p>
+      <p class="hint">流程:填故事 → ✨生成分镜(可手改,可带台词)→ 角色定妆 → 逐镜生首帧 → 逐镜生视频 → 合成。长剧用「一键串跑」按限额排队;镜头时长按可灵 3.0 支持 3~15 秒(1 分钟剧约 5~8 镜)。台词区写好对白的镜头,「🎙 生成配音」秒出;合成时自动混音+烧字幕。再次生成分镜会追加并自动衔接已有剧情;想推倒重来用「🗑 清空分镜」。素材落盘 genwork/drama/,重启不丢。</p>
     </div>
 
     <div class="gen-stage">
+      <div id="logPanel">
+        <div class="log-head" id="logHead">
+          <span class="title">任务进度</span>
+          <span class="count" id="logCount"></span>
+          <span class="toggle" id="logToggle">展开 ▾</span>
+        </div>
+        <div class="log-latest" id="logLatest">就绪</div>
+        <div class="log-list" id="logList"></div>
+      </div>
       <div class="label-row">
         <label style="margin:0;font-size:11.5px;letter-spacing:1.2px;color:var(--accent)">分镜</label>
         <div style="display:flex;gap:8px">
+          <button class="btn" id="btnClearShots" hidden title="删除全部镜头及其素材,角色保留">🗑 清空分镜</button>
           <button class="btn" id="btnAddShot" hidden>+ 手动加镜</button>
           <button class="btn primary" id="btnStoryboard" hidden>✨ 生成分镜</button>
         </div>
@@ -108,5 +129,7 @@
 
 <script src="js/gate.js"></script>
 <script src="js/drama.js"></script>
+<script src="js/duoli_video.js"></script>
+<script src="js/duoli.js"></script>
 </body>
 </html>

@@ -162,7 +162,6 @@
           <select id="pngCompress">
             <option value="none">不压缩</option>
             <option value="tinypng" selected>TinyPNG 在线(色彩不变)</option>
-            <option value="oxipng">oxipng 本地无损</option>
           </select>
         </label>
       </div>
@@ -172,7 +171,7 @@
         <label>阈值 <input id="dedupePhashThr" type="number" value="8" min="0" max="20" class="num" title="感知哈希距离上限,越小越严格"></label>
       </div>
       <div class="hint">Spine 导出自动按每帧内容紧包围盒入图集(位置写入附件偏移),并跨动画去重:像素与位置完全相同的帧只存一份。勾「合并近似帧」会把感知哈希距离 ≤ 阈值且位置接近的帧替换为已存帧,省更多但可能引入细微差异,快动作慎用。</div>
-      <div class="hint">PNG 压缩与「图片压缩」页同一方案(不压色):TinyPNG 走本地服务器代理,oxipng 像素 100% 不变;作用于图集/雪碧图/序列帧 PNG,序列帧逐张调用会慢。角色ID同时用于 Spine 文件名与图集页名。</div>
+      <div class="hint">PNG 压缩与「图片压缩」页同一方案(不压色):TinyPNG 走本地服务器代理;作用于图集/雪碧图/序列帧 PNG,序列帧逐张调用会慢。角色ID同时用于 Spine 文件名与图集页名。</div>
     </section>
   </aside>
 
@@ -217,5 +216,7 @@
 <script src="js/exporter.js"></script>
 <script src="js/gate.js"></script>
 <script src="js/app.js"></script>
+<script src="js/duoli_video.js"></script>
+<script src="js/duoli.js"></script>
 </body>
 </html>

@@ -13,7 +13,7 @@
 | `FRAMEFLOW_GENWORK_DIR` | 公网建议设 | 生成产物/短剧项目根目录。**务必指到站点根之外**(如 `D:\AI产出`):生图结果与短剧剧本/素材都会写到这里,放站点根下会被静态通道枚举下载。 |
 | `FRAMEFLOW_TRUST_PROXY` | 反代时建议设 | 设为 `1` 后无条件按 `X-Forwarded-For` 取真实客户端 IP(额度/锁定/本机判定都按它)。未设时服务端也会自动识别:对端是回环且带 XFF 就取 XFF——nginx 标准反代下无需设置。 |
 | `PYTHON_MATTING` | 抠图/图层页需要 | 带 torch+sam2 的 python 解释器(GPU 机器才配)。 |
-| `FRAMEFLOW_OXIPNG` / `FRAMEFLOW_GENMJS` | 可选 | oxipng 与 gen.mjs 路径覆盖。 |
+| `FRAMEFLOW_GENMJS` | 可选 | gen.mjs 路径覆盖。 |
 
 ## 启动与 nginx
 
@@ -80,6 +80,6 @@ server {
   多码分人可吊销(未做)。
 - **本机免码模式对 DNS rebinding 未设防**:恶意网页理论上可绑定域名打到 127.0.0.1
   并以同源身份调本地接口;设码部署不受影响,免码本地使用介意可加 Host 白名单(未做)。
-- **内容流向**:TinyPNG 与生图/分镜上游会收到用户素材/提示词;oxipng、SAM2、BEN2、
+- **内容流向**:TinyPNG 与生图/分镜上游会收到用户素材/提示词;SAM2、BEN2、
   拆帧、导出全部纯本地。
 - **本机部署包**:从这台开发机传代码走 git,别直接拷文件(亿赛通透明加密可能产出密文)。

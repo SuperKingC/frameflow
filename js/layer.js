@@ -1,4 +1,5 @@
-// FrameFlow - 图层分离页(SAM2 点选:正/负点 → 掩码预览 → 收下为图层 → 导出 ZIP)
+// FrameFlow - 图层分离页 v2(SAM2 点选/拖框:一键主体 → 掩码预览 → 收下为图层 → 导出 ZIP)
+// v2:一键主体层(BEN2)、box 拖框提示、模型双档(草稿 small/终稿 large)、收层羽化、未覆盖像素自检
 (function () {
   'use strict';
 
@@ -9,12 +10,17 @@
     canvas: null,        // 原图画布
     name: '',
     points: [],          // {x, y, label:1|0}
-    preview: null,       // {maskData: ImageData(L), score, area}
-    layers: [],          // {name, canvas(RGBA), area, bbox}
+    box: null,           // {x0,y0,x1,y1} 拖框提示(与点互斥使用)
+    dragging: null,      // 拖框中的实时矩形
+    preview: null,       // {maskData: Uint8Array(L), score, area, kind:'points'|'box'}
+    layers: [],          // {name, canvas(RGBA), area, bbox, feather}
     busy: false,
+    imageId: null,       // /api/sam/load 句柄(点击只传 id,不传整图)
+    samModel: localStorage.getItem('layerSamModel') || 'small',
+    concepts: [],        // Florence-2 候选实例 [{label,score,bbox}]
+    pendingGround: null, // 刚按词拆分的概念词(收层时作为图层名)
   };
-  const MASK_KEY = 'layermask';
-  let imageB64 = null;
+  let imageB64 = null; // 兜底:句柄失效时重注册用
 
   function status(msg, isError) {
     const el = $('#status');
@@ -23,14 +29,14 @@
   }
   function setBusy(b) { st.busy = b; document.body.classList.toggle('busy', b); }
 
-  function maskColor() { return $('#maskColor').value; }
+  const MASK_TINT = { r: 34, g: 211, b: 238 }; // 预览掩码叠加色(固定青色,与 UI 主色一致)
 
   // ---------- 加载 ----------
   function load(file) {
     if (!file || !/^image\//.test(file.type)) { status('请选择图片文件。', true); return; }
     const url = URL.createObjectURL(file);
     const img = new Image();
-    img.onload = function () {
+    img.onload = async function () {
       const canvas = document.createElement('canvas');
       canvas.width = img.naturalWidth;
       canvas.height = img.naturalHeight;
@@ -38,16 +44,41 @@
       st.canvas = canvas;
       st.name = file.name.replace(/\.[^.]+$/, '');
       st.points = [];
+      st.box = null;
+      st.dragging = null;
       st.preview = null;
       st.layers = [];
+      st.imageId = null;
+      imageB64 = null;
       renderLayers();
       drawView();
       $('#imgInfo').textContent = file.name + ' · ' + canvas.width + '×' + canvas.height;
       URL.revokeObjectURL(url);
-      status('已加载。左键点元素本体,Shift/右键点排除区;每次点击自动算掩码。');
+      status('已加载。拖框或点选元素,SAM2 出精确边界;或先「一键主体层」。');
+      // 预注册句柄(后台进行,不阻塞;失败静默,点击时兜底重传)
+      registerImage().catch(function () { });
     };
     img.onerror = function () { status('图片无法解码:' + file.name, true); };
     img.src = url;
+  }
+
+  async function ensureImageB64() {
+    if (!imageB64) imageB64 = await FS.blobToBase64(await FS.canvasToBlobPng(st.canvas));
+    return imageB64;
+  }
+
+  async function registerImage() {
+    if (!st.canvas) return null;
+    const b64 = await ensureImageB64();
+    const resp = await fetch('/api/sam/load', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', authorization: 'Bearer ' + ((window.FFGate && FFGate.code) || '') },
+      body: JSON.stringify({ image: 'data:image/png;base64,' + b64 }),
+    });
+    const r = await resp.json();
+    if (!r.ok) throw new Error(r.error ? FS.gateError(r.error) : 'HTTP ' + resp.status);
+    st.imageId = r.imageId;
+    return r.imageId;
   }
 
   // ---------- 视图 ----------
@@ -77,14 +108,14 @@
     if (!st.canvas) {
       ctx.fillStyle = '#6d727d';
       ctx.font = '14px sans-serif';
-      ctx.fillText('拖入设计图,然后用点把每个元素标出来', 24, 40);
+      ctx.fillText('拖入设计图,然后拖框或点选每个元素', 24, 40);
       return;
     }
     const { k, ox, oy } = fit();
     ctx.drawImage(st.canvas, ox, oy, st.canvas.width * k, st.canvas.height * k);
     // 掩码叠加
     if (st.preview) {
-      const mc = hexToRgb(maskColor());
+      const mc = MASK_TINT;
       const md = st.preview.maskData;
       ctx.save();
       ctx.globalAlpha = 0.5;
@@ -113,14 +144,23 @@
       ctx.strokeStyle = '#101215';
       ctx.stroke();
     });
+    // 拖框(进行中或已提交)
+    const b = st.dragging || st.box;
+    if (b) {
+      const x0 = ox + b.x0 * k, y0 = oy + b.y0 * k;
+      const w = (b.x1 - b.x0) * k, h = (b.y1 - b.y0) * k;
+      ctx.save();
+      ctx.strokeStyle = '#22d3ee';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(x0, y0, w, h);
+      ctx.fillStyle = 'rgba(34, 211, 238, 0.12)';
+      ctx.fillRect(x0, y0, w, h);
+      ctx.restore();
+    }
   }
 
-  function hexToRgb(hex) {
-    const v = parseInt(hex.slice(1), 16);
-    return { r: (v >> 16) & 255, g: (v >> 8) & 255, b: v & 255 };
-  }
-
-  function viewToImg(e) {
+  function viewPoint(e) {
     const view = $('#view');
     const rect = view.getBoundingClientRect();
     const { k, ox, oy } = fit();
@@ -130,44 +170,53 @@
     return [x, y];
   }
 
-  // ---------- SAM2 分割 ----------
-  async function segment() {
-    if (!st.canvas || st.busy || !st.points.length) return;
-    setBusy(true);
-    try {
-      if (!imageB64) {
-        imageB64 = await FS.blobToBase64(await FS.canvasToBlobPng(st.canvas));
-      }
-      const resp = await fetch('/api/sam/segment', {
+  // ---------- 工具请求(带鉴权 + 句柄失效自动重注册) ----------
+  async function samFetch(path, body) {
+    if (!st.imageId) await registerImage();
+    body.imageId = st.imageId;
+    let resp = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', authorization: 'Bearer ' + ((window.FFGate && FFGate.code) || '') },
+      body: JSON.stringify(body),
+    });
+    let r = await resp.json();
+    if (!r.ok && /句柄已失效/.test(r.error || '')) {
+      // LRU 淘汰兜底:重新注册再试一次
+      await registerImage();
+      body.imageId = st.imageId;
+      resp = await fetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', authorization: 'Bearer ' + ((window.FFGate && FFGate.code) || '') },
-        body: JSON.stringify({
-          image: 'data:image/png;base64,' + imageB64,
-          points: st.points.map(function (p) { return [p.x, p.y]; }),
-          labels: st.points.map(function (p) { return p.label; }),
-        }),
+        body: JSON.stringify(body),
       });
-      const r = await resp.json();
-      if (!r.ok) throw new Error(r.error ? FS.gateError(r.error) : 'HTTP ' + resp.status);
-      // mask_b64 → 单通道数据
-      const maskImg = new Image();
-      await new Promise(function (resolve, reject) {
-        maskImage.onload = resolve;
-        maskImage.onerror = function () { reject(new Error('掩码解码失败')); };
-        maskImage.src = 'data:image/png;base64,' + r.mask_b64;
-      });
-      maskCanvas.width = st.canvas.width;
-      maskCanvas.height = st.canvas.height;
-      const mctx = maskCanvas.getContext('2d', { willReadFrequently: true });
-      mctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-      mctx.drawImage(maskImage, 0, 0);
-      const md = mctx.getImageData(0, 0, st.canvas.width, st.canvas.height).data;
-      const alpha = new Uint8Array(st.canvas.width * st.canvas.height);
-      for (let i = 0; i < st.canvas.width * st.canvas.height; i++) alpha[i] = md[i * 4];
-      st.preview = { maskData: alpha, score: r.score, area: r.area };
+      r = await resp.json();
+    }
+    if (!r.ok) throw new Error(r.error ? FS.gateError(r.error) : 'HTTP ' + resp.status);
+    return r;
+  }
+
+  // ---------- SAM2 分割 ----------
+  async function segment() {
+    if (!st.canvas || st.busy) return;
+    const hasBox = st.box && (st.box.x1 - st.box.x0) > 2 && (st.box.y1 - st.box.y0) > 2;
+    if (!st.points.length && !hasBox) return;
+    setBusy(true);
+    try {
+      const body = {
+        model: st.samModel,
+        points: st.points.map(function (p) { return [p.x, p.y]; }),
+        labels: st.points.map(function (p) { return p.label; }),
+      };
+      if (hasBox) {
+        body.box = [st.box.x0, st.box.y0, st.box.x1, st.box.y1];
+        body.points = []; // 框提示独立成提示,点集清空(一次手势钉死目标)
+      }
+      const r = await samFetch('/api/sam/segment', body);
+      const alpha = await decodeMask(r.mask_b64);
+      st.preview = { maskData: alpha, score: r.score, area: r.area, kind: hasBox ? 'box' : 'points' };
       $('#keepBtn').disabled = false;
-      const warn = r.score < 0.5 ? ' score 较低(' + r.score + '),建议补点。' : '';
-      status('掩码已更新 score=' + r.score + ',面积 ' + r.area + ' px。' + warn);
+      const warn = r.score < 0.5 ? ' score 较低(' + r.score + '),建议精修。' : '';
+      status('掩码已更新(' + (hasBox ? '框' : '点') + ') score=' + r.score + ',面积 ' + r.area + ' px。' + warn);
       drawView();
     } catch (e) {
       status('SAM2 分割失败:' + e.message, true);
@@ -176,23 +225,176 @@
     }
   }
 
-  const maskCanvas = document.createElement('canvas');
-  const maskImage = new Image();
+  async function decodeMask(maskB64) {
+    const maskImg = new Image();
+    await new Promise(function (resolve, reject) {
+      maskImg.onload = resolve;
+      maskImg.onerror = function () { reject(new Error('掩码解码失败')); };
+      maskImg.src = 'data:image/png;base64,' + maskB64;
+    });
+    maskCanvas.width = st.canvas.width;
+    maskCanvas.height = st.canvas.height;
+    const mctx = maskCanvas.getContext('2d', { willReadFrequently: true });
+    mctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+    mctx.drawImage(maskImg, 0, 0);
+    const md = mctx.getImageData(0, 0, st.canvas.width, st.canvas.height).data;
+    const alpha = new Uint8Array(st.canvas.width * st.canvas.height);
+    for (let i = 0; i < alpha.length; i++) alpha[i] = md[i * 4];
+    return alpha;
+  }
 
-  // ---------- 收下图层 ----------
-  function keepLayer() {
-    if (!st.preview) return;
-    const mc = maskCanvas.getContext('2d');
-    const md = mc.getImageData(0, 0, st.canvas.width, st.canvas.height).data;
+  const maskCanvas = document.createElement('canvas');
+
+  // ---------- 一键主体层(BEN2) ----------
+  async function autoSubject() {
+    if (!st.canvas || st.busy) return;
+    setBusy(true);
+    try {
+      const b64 = await ensureImageB64();
+      const resp = await fetch('/api/matting/auto', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', authorization: 'Bearer ' + ((window.FFGate && FFGate.code) || '') },
+        body: JSON.stringify({ image: 'data:image/png;base64,' + b64, model: 'ben2' }),
+      });
+      const r = await resp.json();
+      if (!r.ok) throw new Error(r.error ? FS.gateError(r.error) : 'HTTP ' + resp.status);
+      const rgba = await decodeRgba(r.image);
+      const area = keepFromRgba(rgba, '主体', 0);
+      status('已收下一键主体层(BEN2,' + area + ' px)。继续拖框/点选其余元素。');
+    } catch (e) {
+      status('一键主体失败:' + e.message, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function decodeRgba(dataUrl) {
+    const img = new Image();
+    await new Promise(function (resolve, reject) {
+      img.onload = resolve;
+      img.onerror = function () { reject(new Error('抠图结果解码失败')); };
+      img.src = dataUrl;
+    });
+    const c = document.createElement('canvas');
+    c.width = st.canvas.width; c.height = st.canvas.height;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0, c.width, c.height);
+    return ctx.getImageData(0, 0, c.width, c.height);
+  }
+
+  // ---------- 语义概念拆分(Florence-2 定位 → SAM2 精确掩码) ----------
+  async function conceptInstances() {
+    if (!st.canvas || st.busy) return;
+    setBusy(true);
+    try {
+      const r = await samFetch('/api/sam/concepts', {});
+      renderChips(r.instances || []);
+      const n = (r.instances || []).length;
+      status(n ? '概念候选 ' + n + ' 个:点 chip 直接按词拆出掩码;也可在下面输入自定义词。'
+               : '没拆出候选实例;直接在下面输入概念词(如 主角、猫、招牌),或拖框点选。');
+    } catch (e) {
+      status('概念候选失败:' + e.message, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function renderChips(instances) {
+    const box = $('#conceptChips');
+    box.innerHTML = '';
+    st.concepts = instances.slice();
+    if (!instances.length) { box.style.display = 'none'; return; }
+    instances.forEach(function (inst, i) {
+      const b = document.createElement('button');
+      b.className = 'btn';
+      b.textContent = (inst.label || '实例' + (i + 1)) + (inst.score != null ? ' ·' + Math.round(inst.score * 100) + '%' : '');
+      b.title = 'bbox x=' + inst.bbox[0] + ' y=' + inst.bbox[1] + ' w=' + inst.bbox[2] + ' h=' + inst.bbox[3];
+      b.addEventListener('click', function () { conceptGround(inst.label); });
+      box.appendChild(b);
+    });
+    box.style.display = 'flex';
+  }
+
+  async function conceptGround(phrase) {
+    phrase = (phrase || '').trim();
+    if (!st.canvas || st.busy || !phrase) return;
+    setBusy(true);
+    try {
+      const r = await samFetch('/api/sam/concepts', { phrase: phrase });
+      const inst = (r.instances || [])[0];
+      if (!inst) {
+        status('没找到「' + phrase + '」对应的元素;换个说法,或直接拖框/点选。', true);
+        return;
+      }
+      // 概念命中 → 实例包围盒作 box 提示,SAM2 出精确掩码;收层时以概念词命名
+      st.box = { x0: inst.bbox[0], y0: inst.bbox[1], x1: inst.bbox[0] + inst.bbox[2] - 1, y1: inst.bbox[1] + inst.bbox[3] - 1 };
+      st.points = [];
+      st.dragging = null;
+      st.pendingGround = phrase;
+      drawView();
+    } catch (e) {
+      status('按词拆失败:' + e.message, true);
+    } finally {
+      setBusy(false);
+    }
+    await segment();
+    if (st.pendingGround === phrase && st.preview) {
+      status('「' + phrase + '」已定位出掩码 score=' + st.preview.score + ',面积 ' + st.preview.area + ' px;满意点「收下」,不满意继续补点。');
+    }
+  }
+
+  // ---------- 收层 ----------
+  function featherAlpha(alpha, w, h, radius) {
+    // 盒式模糊近似高斯:横向+纵向两趟,半径 1~2px;把 0/255 硬边变 8→247 渐变
+    if (!radius) return alpha;
+    let a = alpha;
+    for (let pass = 0; pass < 2; pass++) {
+      const out = new Uint8Array(a.length);
+      const r = radius;
+      // 横向
+      for (let y = 0; y < h; y++) {
+        const row = y * w;
+        for (let x = 0; x < w; x++) {
+          let s = 0, c = 0;
+          for (let dx = -r; dx <= r; dx++) {
+            const xx = x + dx;
+            if (xx >= 0 && xx < w) { s += a[row + xx]; c++; }
+          }
+          out[row + x] = s / c;
+        }
+      }
+      // 纵向
+      const out2 = new Uint8Array(a.length);
+      for (let x = 0; x < w; x++) {
+        for (let y = 0; y < h; y++) {
+          let s = 0, c = 0;
+          for (let dy = -r; dy <= r; dy++) {
+            const yy = y + dy;
+            if (yy >= 0 && yy < h) { s += out[yy * w + x]; c++; }
+          }
+          out2[y * w + x] = s / c;
+        }
+      }
+      a = out2;
+    }
+    return a;
+  }
+
+  function keepFromRgba(rgba, name, featherPx) {
+    // rgba: ImageData(BEN2 结果);按其 alpha 收层(可选羽化),推入图层列表
+    let alpha = new Uint8Array(st.canvas.width * st.canvas.height);
+    const src = rgba.data;
+    for (let i = 0; i < alpha.length; i++) alpha[i] = src[i * 4 + 3];
+    if (featherPx) alpha = featherAlpha(alpha, st.canvas.width, st.canvas.height, featherPx);
     const layer = document.createElement('canvas');
     layer.width = st.canvas.width;
     layer.height = st.canvas.height;
     const lctx = layer.getContext('2d');
     const out = lctx.createImageData(st.canvas.width, st.canvas.height);
+    const orig = st.canvas.getContext('2d').getImageData(0, 0, st.canvas.width, st.canvas.height).data;
     let minX = Infinity, minY = Infinity, maxX = -1, maxY = -1, area = 0;
-    const src = st.canvas.getContext('2d').getImageData(0, 0, st.canvas.width, st.canvas.height).data;
-    for (let i = 0, n = st.canvas.width * st.canvas.height; i < n; i++) {
-      const a = md[i * 4];
+    for (let i = 0, n = alpha.length; i < n; i++) {
+      const a = alpha[i];
       if (a > 0) {
         area++;
         const x = i % st.canvas.width, y = (i / st.canvas.width) | 0;
@@ -200,21 +402,103 @@
         if (x > maxX) maxX = x;
         if (y < minY) minY = y;
         if (y > maxY) maxY = y;
-        out.data[i * 4] = src[i * 4];
-        out.data[i * 4 + 1] = src[i * 4 + 1];
-        out.data[i * 4 + 2] = src[i * 4 + 2];
-        out.data[i * 4 + 3] = Math.max(a, 0);
+        out.data[i * 4] = orig[i * 4];
+        out.data[i * 4 + 1] = orig[i * 4 + 1];
+        out.data[i * 4 + 2] = orig[i * 4 + 2];
+        out.data[i * 4 + 3] = a;
       }
     }
     lctx.putImageData(out, 0, 0);
-    const name = '图层' + (st.layers.length + 1);
-    st.layers.push({ name: name, canvas: layer, area: area, bbox: { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 } });
+    const label = name || ('图层' + (st.layers.length + 1));
+    st.layers.push({ name: label, canvas: layer, area: area, bbox: { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 }, feather: featherPx || 0 });
     st.points = [];
+    st.box = null;
     st.preview = null;
     renderLayers();
     drawView();
     $('#keepBtn').disabled = true;
-    status('已收下「' + name + '」(' + area + ' px)。继续点下一个元素。');
+    return area;
+  }
+
+  function keepLayer() {
+    if (!st.preview) return;
+    const feather = $('#featherToggle').checked ? 2 : 0;
+    let alpha = st.preview.maskData;
+    if (feather) alpha = featherAlpha(alpha, st.canvas.width, st.canvas.height, feather);
+    const layer = document.createElement('canvas');
+    layer.width = st.canvas.width;
+    layer.height = st.canvas.height;
+    const lctx = layer.getContext('2d');
+    const out = lctx.createImageData(st.canvas.width, st.canvas.height);
+    const orig = st.canvas.getContext('2d').getImageData(0, 0, st.canvas.width, st.canvas.height).data;
+    let minX = Infinity, minY = Infinity, maxX = -1, maxY = -1, area = 0;
+    for (let i = 0, n = alpha.length; i < n; i++) {
+      const a = alpha[i];
+      if (a > 0) {
+        area++;
+        const x = i % st.canvas.width, y = (i / st.canvas.width) | 0;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        out.data[i * 4] = orig[i * 4];
+        out.data[i * 4 + 1] = orig[i * 4 + 1];
+        out.data[i * 4 + 2] = orig[i * 4 + 2];
+        out.data[i * 4 + 3] = a;
+      }
+    }
+    lctx.putImageData(out, 0, 0);
+    const name = st.pendingGround || '图层' + (st.layers.length + 1);
+    st.layers.push({ name: name, canvas: layer, area: area, bbox: { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 }, feather: feather, grounded: st.pendingGround || null });
+    st.pendingGround = null;
+    st.points = [];
+    st.box = null;
+    st.preview = null;
+    renderLayers();
+    drawView();
+    $('#keepBtn').disabled = true;
+    status('已收下「' + name + '」(' + area + ' px' + (feather ? ',羽化' + feather + 'px' : '') + ')。继续下一个元素。');
+  }
+
+  // ---------- 未覆盖像素自检 ----------
+  function uncovered() {
+    if (!st.canvas || !st.layers.length) { status('先收下至少一个图层。', true); return; }
+    const w = st.canvas.width, h = st.canvas.height;
+    const cov = new Uint8Array(w * h);
+    st.layers.forEach(function (l) {
+      const d = l.canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+      for (let i = 0; i < w * h; i++) if (d[i * 4 + 3] > 8) cov[i] = 1;
+    });
+    let cnt = 0;
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    const src = st.canvas.getContext('2d').getImageData(0, 0, w, h);
+    for (let i = 0; i < w * h; i++) {
+      if (!cov[i]) {
+        cnt++;
+        // 未覆盖像素以品红高亮,其余压暗
+        src.data[i * 4] = (src.data[i * 4] + 255 * 3) / 4;
+        src.data[i * 4 + 1] = src.data[i * 4 + 1] / 4;
+        src.data[i * 4 + 2] = (src.data[i * 4 + 2] + 255 * 2) / 4;
+      } else {
+        src.data[i * 4] /= 3; src.data[i * 4 + 1] /= 3; src.data[i * 4 + 2] /= 3;
+      }
+    }
+    ctx.putImageData(src, 0, 0);
+    // 新窗口展示
+    const win = window.open('', '_blank');
+    if (!win) { FS.canvasToBlobPng(c).then(function (b) { FS.downloadBlob(b, st.name + '_uncovered.png'); }); return; }
+    win.document.title = '未覆盖像素 ' + cnt + ' px';
+    win.document.body.style.margin = '0';
+    win.document.body.style.background = '#131417';
+    c.toBlob(function (b) {
+      const u = URL.createObjectURL(b);
+      const im = win.document.createElement('img');
+      im.src = u; im.style.maxWidth = '100%';
+      win.document.body.appendChild(im);
+    }, 'image/png');
+    status('未覆盖像素 ' + cnt + ' px' + (cnt === 0 ? ',全部收齐 ✅' : ',已用品红高亮(其余压暗)。可在新窗口查看。'));
   }
 
   // ---------- 图层列表 ----------
@@ -245,7 +529,7 @@
       const down = document.createElement('button');
       down.className = 'btn'; down.textContent = '↓'; down.disabled = i === st.layers.length - 1;
       down.addEventListener('click', function () {
-        [st.layers[i], st.layers[i + 1]] = [st.layers[i + 1], st.layers[i]];
+        [st.layers[i], st.layers[i + 1]] = [st.layers[i], st.layers[i + 1]];
         renderLayers();
       });
       const del = document.createElement('button');
@@ -261,6 +545,7 @@
     });
     $('#dlZip').disabled = !st.layers.length;
     $('#dlOverlay').disabled = !st.layers.length;
+    $('#uncoveredBtn').disabled = !st.layers.length;
     $('#layerCount').textContent = st.layers.length;
   }
 
@@ -270,23 +555,21 @@
     setBusy(true);
     try {
       const files = [];
-      st.layers.forEach(function (l, i) {
-        files.push({ name: 'layers/' + String(i + 1).padStart(2, '0') + '_' + FS.sanitizeName(l.name, 'layer') + '.png', data: null });
-      });
-      // canvas → PNG 需逐层编码
       const manifest = {
         format: 'frameflow-layers',
+        version: 2,
         source: st.name,
         width: st.canvas.width,
         height: st.canvas.height,
-        layers: st.layers.map(function (l, i) { return { order: i, name: l.name, file: '', bbox: l.bbox, area: l.area }; }),
+        samModel: st.samModel,
+        layers: st.layers.map(function (l, i) { return { order: i, name: l.name, file: '', bbox: l.bbox, area: l.area, feather: l.feather, grounded: l.grounded || null }; }),
       };
       for (let i = 0; i < st.layers.length; i++) {
         const blob = await FS.canvasToBlobPng(st.layers[i].canvas);
         const fname = String(i + 1).padStart(2, '0') + '_' + FS.sanitizeName(st.layers[i].name, 'layer') + '.png';
         st.layers[i].file = fname;
         manifest.layers[i].file = fname;
-        files[i] = { name: 'layers/' + fname, data: await FS.blobToUint8(blob) };
+        files.push({ name: 'layers/' + fname, data: await FS.blobToUint8(blob) });
       }
       // 叠加预览
       const overlay = document.createElement('canvas');
@@ -318,14 +601,12 @@
   }
 
   function exportOverlay() {
-    const view = $('#view');
     const c = document.createElement('canvas');
     c.width = st.canvas.width; c.height = st.canvas.height;
     const ctx = c.getContext('2d');
     ctx.drawImage(st.canvas, 0, 0);
-    // 简版预览:当前掩码叠加
     if (st.preview) {
-      const mc = hexToRgb(maskColor());
+      const mc = MASK_TINT;
       const md = st.preview.maskData;
       const im = ctx.getImageData(0, 0, c.width, c.height);
       for (let i = 0; i < st.canvas.width * st.canvas.height; i++) {
@@ -340,17 +621,7 @@
     c.toBlob(function (b) { FS.downloadBlob(b, st.name + '_mask_preview.png'); }, 'image/png');
   }
 
-  // ---------- 绑定 ----------
-  function viewPoint(e) {
-    const view = $('#view');
-    const rect = view.getBoundingClientRect();
-    const { k, ox, oy } = fit();
-    const x = Math.round(((e.clientX - rect.left) * (view.width / rect.width) - ox) / k);
-    const y = Math.round(((e.clientY - rect.top) * (view.height / rect.height) - oy) / k);
-    if (!st.canvas || x < 0 || y < 0 || x >= st.canvas.width || y >= st.canvas.height) return null;
-    return [x, y];
-  }
-
+  // ---------- 交互:点/框 ----------
   function bind() {
     $('#imgBtn').addEventListener('click', function () { $('#imgInput').click(); });
     $('#imgInput').addEventListener('change', function (e) {
@@ -364,26 +635,94 @@
       if (e.dataTransfer.files[0]) load(e.dataTransfer.files[0]);
     });
     view.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+    // 拖框优先:按下后移动>4px 视为拖框,否则视为点选
+    let pressPt = null;
     view.addEventListener('pointerdown', function (e) {
+      if (st.busy) return;
       const p = viewPoint(e);
       if (!p) return;
-      const label = (e.shiftKey || e.button === 2) ? 0 : 1;
-      if (st.busy) return;
-      st.points.push({ x: p[0], y: p[1], label: label });
+      pressPt = { x: p[0], y: p[1], shift: e.shiftKey || e.button === 2, id: e.pointerId };
+      view.setPointerCapture(e.pointerId);
+    });
+    view.addEventListener('pointermove', function (e) {
+      if (!pressPt) return;
+      const p = viewPoint(e);
+      if (!p) return;
+      if (Math.abs(p[0] - pressPt.x) > 4 || Math.abs(p[1] - pressPt.y) > 4) {
+        st.dragging = { x0: pressPt.x, y0: pressPt.y, x1: p[0], y1: p[1] };
+        drawView();
+      }
+    });
+    view.addEventListener('pointerup', function (e) {
+      if (!pressPt) return;
+      const p = viewPoint(e);
+      const d = st.dragging;
+      pressPt = null;
+      if (d) {
+        st.dragging = null;
+        // 归一化四角
+        const x0 = Math.min(d.x0, d.x1), x1 = Math.max(d.x0, d.x1);
+        const y0 = Math.min(d.y0, d.y1), y1 = Math.max(d.y0, d.y1);
+        if (x1 - x0 > 2 && y1 - y0 > 2) {
+          st.box = { x0: x0, y0: y0, x1: x1, y1: y1 };
+          st.points = [];
+          st.pendingGround = null; // 手动拖框 = 新意图,概念命名失效
+          drawView();
+          segment();
+        } else {
+          st.dragging = null;
+          drawView();
+        }
+        return;
+      }
+      if (!p) return;
+      // 点选:正点/负点(Shift 或右键)
+      st.points.push({ x: p[0], y: p[1], label: pressShiftOrRight(e) ? 0 : 1 });
+      st.box = null;
+      st.pendingGround = null; // 手动点选 = 新意图,概念命名失效
       drawView();
       segment();
     });
+    function pressShiftOrRight() { return pressPt && pressPt.shift; }
     $('#clearPts').addEventListener('click', function () {
       st.points = [];
+      st.box = null;
       st.preview = null;
       $('#keepBtn').disabled = true;
       drawView();
     });
+    $('#autoBtn').addEventListener('click', autoSubject);
+    $('#conceptBtn').addEventListener('click', conceptInstances);
+    $('#phraseGo').addEventListener('click', function () { conceptGround($('#phraseInput').value); });
+    $('#phraseInput').addEventListener('keydown', function (e) { if (e.key === 'Enter') conceptGround($('#phraseInput').value); });
     $('#keepBtn').addEventListener('click', keepLayer);
+    $('#uncoveredBtn').addEventListener('click', uncovered);
     $('#dlZip').addEventListener('click', exportZip);
     $('#dlOverlay').addEventListener('click', exportOverlay);
-    $('#maskColor').addEventListener('input', drawView);
+    $('#samModel').value = st.samModel;
+    $('#samModel').addEventListener('change', function (e) {
+      st.samModel = e.target.value;
+      localStorage.setItem('layerSamModel', st.samModel);
+      // 换档后模型重建,旧句柄图需重新编码:直接让下一次 segment 重传(load_image 带新 model)
+      // 句柄仍在,worker 会因 tier 变化自动重编码
+      status('已切换模型档位:' + (st.samModel === 'large' ? '终稿 hiera_large' : '草稿 hiera_small') + '(下次分割生效,首图重新编码)。');
+    });
     drawView();
+    // 模型可用性探测(不拉起 worker)
+    fetch('/api/sam/meta', { headers: { authorization: 'Bearer ' + ((window.FFGate && FFGate.code) || '') } })
+      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        if (!r.ok) return;
+        (r.models || []).forEach(function (m) {
+          const opt = $('#samModel').querySelector('option[value="' + m.id + '"]');
+          if (opt && !m.available) { opt.disabled = true; opt.textContent = m.label.replace(/\(.*\)/, '(权重未下载)'); }
+        });
+        // 语义拆件可用 → 显示概念按钮/输入行(默认隐藏,免得没装 Florence-2 时碍事)
+        if (r.concepts && r.concepts.available) {
+          $('#conceptRow').style.display = '';
+          $('#phraseRow').style.display = '';
+        }
+      }).catch(function () { });
   }
 
   document.addEventListener('DOMContentLoaded', bind);

@@ -85,11 +85,10 @@
     return c;
   }
 
-  // PNG 压缩:不压色,走「图片压缩」页同款方案。
-  // 'tinypng' = 在线智能压缩(经本地服务器代理,色彩不变);'oxipng' = 本地无损(像素 100% 不变);
-  // 其他值/服务不可用 → 浏览器直接编码
+  // PNG 压缩:不压色,走「图片压缩」页同款方案(TinyPNG 在线,经本地服务器代理)。
+  // 非 'tinypng' / 服务不可用 → 浏览器直接编码
   FS.compressPng = async function (canvas, mode) {
-    if (mode !== 'tinypng' && mode !== 'oxipng') return FS.canvasToBlobPng(canvas);
+    if (mode !== 'tinypng') return FS.canvasToBlobPng(canvas);
     const plain = await FS.canvasToBlobPng(canvas);
     try {
       const resp = await fetch('/api/compress/' + mode, {

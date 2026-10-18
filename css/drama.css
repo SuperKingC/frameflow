@@ -1,5 +1,41 @@
 /* 短剧工作台(drama.js 配套;复用设计系统变量与 gen.css 布局) */
 
+/* ---------- 任务进度面板:所有 status 都进日志,常显最新一条,可展开看全部 ---------- */
+#logPanel {
+  border: 1px solid var(--line); border-radius: var(--radius-s);
+  background: var(--panel); margin-bottom: 14px; overflow: hidden;
+}
+.log-head {
+  display: flex; align-items: center; gap: 8px; padding: 6px 12px;
+  cursor: pointer; user-select: none;
+  background: rgba(255, 255, 255, .02);
+}
+.log-head .title { font-size: 12px; font-weight: 700; color: var(--accent); }
+.log-head .count { font-size: 11px; color: var(--text-3); }
+.log-head .toggle { margin-left: auto; font-size: 11px; color: var(--text-3); }
+.log-head:hover .toggle { color: var(--text-2); }
+.log-latest {
+  padding: 5px 12px 6px; font-size: 12.5px; color: var(--text-2);
+  border-top: 1px solid var(--line); min-height: 18px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.log-latest.err { color: var(--danger); }
+.log-list {
+  display: none; max-height: 260px; overflow-y: auto;
+  border-top: 1px solid var(--line); padding: 4px 12px 8px;
+}
+#logPanel.open .log-list { display: block; }
+.log-line {
+  font-size: 11.5px; padding: 3px 0; color: var(--text-2);
+  border-bottom: 1px dashed rgba(255, 255, 255, .04);
+}
+.log-line:last-child { border-bottom: 0; }
+.log-line .t {
+  color: var(--text-3); margin-right: 8px;
+  font-family: Consolas, monospace; font-size: 10.5px;
+}
+.log-line.err { color: var(--danger); }
+
 .f-label {
   display: flex; flex-direction: column; gap: 4px;
   font-size: 12px; color: var(--text-2);
@@ -54,6 +90,10 @@
 }
 .shot-status { font-size: 11px; margin-top: 6px; color: var(--text-3); min-height: 14px; }
 .shot-status.err { color: var(--danger); }
+/* 折叠:收起后只留首行(场景+状态+折叠钮),长剧浏览不滚屏 */
+.shot-head .fold { font-size: 11px; padding: 2px 9px; margin: 0; }
+.shot.collapsed > :not(.shot-head) { display: none; }
+.shot.collapsed { padding-bottom: 8px; }
 
 /* ---------- 成片 / 连播 ---------- */
 #composedBox video { width: 100%; border-radius: 8px; border: 1px solid var(--line); margin-top: 8px; background: #000; }

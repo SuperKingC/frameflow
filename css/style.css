@@ -107,7 +107,8 @@ a { color: var(--accent); text-decoration: none; }
 .btn.wide { width: 100%; }
 .btn:disabled { opacity: 0.4; cursor: default; box-shadow: none; }
 
-input[type="number"], input.txt, textarea, select {
+/* 文本框统一深色:含无 type 与 type="text" 的裸输入框(部分页面 JS 动态创建时不带 type) */
+input[type="number"], input[type="text"], input:not([type]), input.txt, textarea, select {
   background: #24262d;
   border: 1px solid var(--line-strong);
   color: var(--text);

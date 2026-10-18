@@ -4,11 +4,12 @@ import base64
 import json
 import subprocess
 import sys
+import time
 import urllib.request
 import uuid
 from pathlib import Path
 
-BASE = "http://127.0.0.1:8438"
+BASE = "http://127.0.0.1:8437"
 
 
 def call(method, path, body=None, raw=False):
@@ -49,6 +50,10 @@ st, r = call("GET", f"/api/drama/projects/{pid}")
 check("get project", st == 200 and r["project"]["title"] == "接口联调短剧", r)
 st, r = call("POST", f"/api/drama/projects/{pid}/update", {"style": "日系赛璐璐动漫,柔和光影,霓虹夜色"})
 check("update project", st == 200 and r["project"]["style"].endswith("霓虹夜色"), r)
+st, r = call("POST", f"/api/drama/projects/{pid}/update", {"beat": "twist"})
+check("beat set", st == 200 and r["project"]["beat"] == "twist", r.get("project", {}).get("beat"))
+st, r = call("POST", f"/api/drama/projects/{pid}/update", {"beat": "bogus"})
+check("beat invalid cleared", st == 200 and r["project"]["beat"] == "", r.get("project", {}).get("beat"))
 
 # 3. 角色
 st, r = call("POST", f"/api/drama/projects/{pid}/chars/add", {"name": "小满", "desc": "22岁打工女孩,短发,便利店制服"})
@@ -159,31 +164,83 @@ st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s2}/update", {"duration"
 proj = r["project"]
 check("duration clamped", st == 200 and next(s for s in proj["shots"] if s["id"] == s2)["duration"] == 30, r)
 
-# 8. 分镜 LLM(真实调用一次,验证解析链路)
-st, r = call("POST", f"/api/drama/projects/{pid}/storyboard", {"nShots": 4})
-shots = r.get("project", {}).get("shots", []) if isinstance(r, dict) else []
-check("storyboard", st == 200 and r.get("ok") and len(shots) >= 4 and all(s.get("firstPrompt") for s in shots[-4:]),
+# 8. 分镜 LLM(真实调用一次;上游偶发 503 或 LLM 少给/漏 firstPrompt,失败自动重试一次)
+added = []
+for attempt in (1, 2):
+    st, r = call("POST", f"/api/drama/projects/{pid}/storyboard", {"nShots": 4})
+    added = (r.get("added") or []) if isinstance(r, dict) else []
+    if st == 200 and r.get("ok") and len(added) >= 4 and all(s.get("firstPrompt") for s in added):
+        break
+check("storyboard", st == 200 and r.get("ok") and len(added) >= 4
+      and all(s.get("firstPrompt") for s in added),
       {"st": st, "err": r.get("error") if isinstance(r, dict) else r,
-       "first": {k: shots[-4][k][:40] for k in ("scene", "desc")} if len(shots) >= 4 else r})
+       "added": len(added), "noPrompt": sum(1 for s in added if not s.get("firstPrompt"))})
 
-# 8.5 brainstorm 现编(真实调用一次)
-st, r = call("POST", "/api/drama/brainstorm", {"seed": "便利店"})
+# 8.4 reprompt(真实调用一次;按 desc 重写 firstPrompt/motionPrompt;上游偶发 503 重试一次)
+for attempt in (1, 2):
+    st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s2}/reprompt",
+                 {"desc": "小满在便利店货架间挑饭团,黑猫蹲在收银台上"})
+    if st == 200 and r.get("ok"):
+        break
+    if st == 429 and attempt == 1:
+        time.sleep(65)  # 等分钟池重置
+rp_shot = next((s for s in r.get("project", {}).get("shots", []) if s["id"] == s2), {})
+check("shot reprompt", st == 200 and r.get("ok") and rp_shot.get("firstPrompt") and rp_shot.get("motionPrompt"),
+      {"st": st, "err": r.get("error") if isinstance(r, dict) else r,
+       "fp": (rp_shot.get("firstPrompt") or "")[:40]})
+
+# 8.5 brainstorm 现编(真实调用一次;opt 档撞 429 等下一分钟窗口)
+for attempt in (1, 2):
+    st, r = call("POST", "/api/drama/brainstorm", {"seed": "便利店"})
+    if st == 200 and r.get("ok"):
+        break
+    if st == 429 and attempt == 1:
+        time.sleep(65)
 ideas = r.get("ideas", []) if isinstance(r, dict) else []
 check("brainstorm", st == 200 and r.get("ok") and len(ideas) >= 1
       and all(x.get("logline") for x in ideas),
       {"st": st, "err": r.get("error") if isinstance(r, dict) else r,
        "t0": ideas[0].get("title") if ideas else r})
 
-# 8.6 带台词章节分镜(withLines=true;真实调用一次,验证 lines/章节 scene)
-st, r = call("POST", f"/api/drama/projects/{pid}/storyboard", {"nShots": 4, "withLines": True})
-shots = r.get("project", {}).get("shots", []) if isinstance(r, dict) else []
-last4 = shots[-4:] if len(shots) >= 4 else []
-check("storyboard withLines", st == 200 and r.get("ok") and len(last4) == 4
-      and all(s.get("firstPrompt") for s in last4)
-      and all(s.get("lines") for s in last4)
-      and all(s["scene"][:1] in "起承转合" for s in last4),
+# 8.6 带台词章节分镜(withLines=true;真实调用;opt 档 3 次/分钟,撞 429 等到下一分钟窗口再试一次)
+for attempt in (1, 2):
+    st, r = call("POST", f"/api/drama/projects/{pid}/storyboard", {"nShots": 4, "withLines": True})
+    shots = r.get("project", {}).get("shots", []) if isinstance(r, dict) else []
+    added = [s for s in shots if s.get("lines") and len(s["scene"]) > 1 and s["scene"][0] in "起承转合"]
+    if st == 200 and r.get("ok") and len(added) >= 2 and all(s.get("firstPrompt") for s in added):
+        break
+    if st == 429 and attempt == 1:
+        time.sleep(65)  # 等分钟池重置
+check("storyboard withLines", st == 200 and r.get("ok") and len(added) >= 2
+      and all(s.get("firstPrompt") for s in added),
       {"st": st, "err": r.get("error") if isinstance(r, dict) else r,
-       "sample": {k: (last4[0][k][:40] if last4 else "") for k in ("scene", "lines")}})
+       "chapters": [s["scene"][:12] for s in added][:4]})
+
+# 8.7 台词灵感按项目角色现编(真实调用一次;opt 档撞 429 等下一分钟窗口)
+for attempt in (1, 2):
+    st, r = call("POST", f"/api/drama/projects/{pid}/lines-ideas", {"seed": "小满在收银台打瞌睡"})
+    if st == 200 and r.get("ok") and r.get("ideas"):
+        break
+    if st == 429 and attempt == 1:
+        time.sleep(65)  # 等分钟池重置
+li = r.get("ideas", []) if isinstance(r, dict) else []
+check("lines ideas", st == 200 and r.get("ok") and len(li) >= 1
+      and all(x.get("lines") for x in li),
+      {"st": st, "err": r.get("error") if isinstance(r, dict) else r,
+       "moods": [x.get("mood") for x in li][:3]})
+
+# 8.8 shots/clear:一键清空镜头并删素材文件;角色/定妆照保留
+clip_path = Path(f"genwork/drama/{pid}/shots/{s1}_clip.mp4")
+tts_path = Path(f"genwork/drama/{pid}/shots/{s1}_tts.wav")
+char_path = Path(f"genwork/drama/{pid}/chars/{cid}.png")
+st, r = call("POST", f"/api/drama/projects/{pid}/shots/clear", {})  # 服务端统一先读 JSON 体,空对象即可
+proj = r.get("project", {}) if isinstance(r, dict) else {}
+check("shots clear", st == 200 and r.get("ok") and proj.get("shots") == []
+      and not clip_path.exists() and not tts_path.exists() and char_path.exists(),
+      {"st": st, "err": r.get("error") if isinstance(r, dict) else r,
+       "shots": len(proj.get("shots", [])),
+       "clipGone": not clip_path.exists(), "ttsGone": not tts_path.exists(),
+       "charKept": char_path.exists()})
 
 # 9. 清理:删除联调项目
 st, r = call("POST", f"/api/drama/projects/{pid}/delete")
