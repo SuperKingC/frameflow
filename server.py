@@ -1810,12 +1810,22 @@ DRAMA_BEATS = {
 }
 
 
+DRAMA_SHOT_TYPES = {
+    "static": "static=固定机位(默认,人物小动作)",
+    "push": "push=镜头缓慢向前推近(聚焦主体/情绪)",
+    "pan": "pan=镜头缓慢横向平移跟随主体(交代环境)",
+    "handheld": "handheld=手持跟拍(轻微晃动的纪实感)",
+    "closeup": "closeup=面部特写(以微表情与眼神为主)",
+}
+
+
 _DRAMA_STORY_SYSTEM = "\n".join([
     "你是爆款短剧的分镜编剧+导演。根据故事梗概、画面风格与角色设定,把故事拆成指定数量的连续镜头。",
     "只输出一个 JSON 数组,不要解释、不要 markdown 代码块。数组每项必须是对象:",
-    '{"scene":"第X镜·场景地点与时间","desc":"画面+动作描述:景别、人物、动作、情绪,60~120字,按时间顺序一句接一句",'
+    '{"scene":"第X镜·场景地点与时间","shotType":"镜头类型,五选一:static/push/pan/handheld/closeup",'
+    '"desc":"画面+动作描述:景别、人物、动作、情绪,60~120字,按时间顺序一句接一句",'
     '"firstPrompt":"文生图提示词:该镜首帧画面,交代场景环境与人物外观位置,60~150字",'
-    '"motionPrompt":"图生视频提示词:只描述主体连续动作与镜头要求,30~80字",'
+    '"motionPrompt":"图生视频提示词:只描述主体动作,30~80字(运镜由 shotType 决定,不要在这里重复写运镜)",'
     '"duration":5}',
     "叙事节奏(必须遵守,这是短剧能不能留住人的关键):",
     "1) 第 1 镜必须是钩子:开场 3 秒给出反常画面、悬念台词或强冲突,禁止从铺垫慢慢开始;",
@@ -1823,7 +1833,12 @@ _DRAMA_STORY_SYSTEM = "\n".join([
     "3) 结尾必须收束:反转揭示/情绪落点/悬念收口三选一,不要停在平淡叙述;",
     "4) 角色名字、外观与角色设定严格一致,不同镜头里同一角色的外观描述保持一致;",
     "5) 提示词里不出现任何文字、字幕、水印、logo;",
-    "6) 每镜只讲一个动作,动作幅度小而柔和,镜头固定不切换;",
+    "6) 每镜只讲一个动作,动作幅度小而柔和;",
+    "6a) shotType 标注该镜的镜头类型,决定运镜方式:static=固定机位(默认,人物小动作);"
+    "push=镜头缓慢向前推近;pan=镜头缓慢横向平移跟随主体;handheld=手持跟拍(轻微晃动的纪实感);"
+    "closeup=面部特写(以微表情与眼神为主)。全镜只一种运镜、单镜内完成,不得中途切换;"
+    "至少一半镜头用 static 保证稳定衔接,closeup 只给反转/揭示等关键情绪点;"
+    "desc 开头的机位前缀必须与 shotType 一致(如 shotType=push 时机位写「缓慢推近」);",
     "7) duration 是该镜时长秒数(2~30 整数):普通镜头 5 秒,一句话对白或情绪铺陈 8~10 秒,高潮/结尾 10~15 秒;长短交替,不要全部一样。",
     "8) 如果要求写对白:每个镜头加 \"lines\" 字段,格式「角色名:台词」一行一句"
     "(无对话的镜头留空字符串;台词口语化、短句、有钩子,符合角色身份;合计念白时长不超过该镜 duration-1 秒)。"
@@ -1867,6 +1882,13 @@ def _drama_storyboard(pid, eid, params):
         if (data.get("logline") or "").strip():
             user += "全剧梗概:" + data["logline"].strip() + "\n"
         user += f"本集梗概:{logline}\n"
+        # P0-4 前情提要滚动摘要:最近 3 集详细 recap + 更早各 1 句,让第 N 集知道第 1 集的伏笔
+        recaps = [(i, e.get("recap") or "") for i, e in enumerate(eps)
+                  if e.get("recap") and i != pos - 1]
+        if recaps:
+            recent = [f"第 {i + 1} 集前情:{t}" for i, t in recaps[-3:]]
+            older = [f"第 {i + 1} 集:" + t[:60] for i, t in recaps[:-3]]
+            user += "前情提要(已播剧情摘要,新剧情不得与其冲突,可回收其中的伏笔):\n" + "\n".join(older + recent) + "\n"
         # 跨集衔接:上一集最后两镜收在哪,本集从哪接着演
         if pos >= 2:
             prev_shots = eps[pos - 2].get("shots") or []
@@ -1942,6 +1964,7 @@ def _drama_storyboard(pid, eid, params):
             scene = _chapter(idx, len(items)) + "·" + re.sub(r"^第\s*\d+\s*镜[·:、\s]*", "", scene)
         added.append({"id": _drama_new_id(), "scene": scene,
                       "desc": str(item.get("desc") or "")[:300],
+                      "shotType": item.get("shotType") if item.get("shotType") in DRAMA_SHOT_TYPES else "static",
                       "firstPrompt": str(item.get("firstPrompt") or "")[:1200],
                       "motionPrompt": str(item.get("motionPrompt") or "")[:1200],
                       "lines": str(item.get("lines") or "")[:2000] if with_lines else "",
@@ -2059,13 +2082,125 @@ def _drama_lines_ideas(pid, params):
 
 
 _DRAMA_REPROMPT_SYSTEM = "\n".join([
-    "你是短剧提示词工程师。给定一镜的「画面描述」,把它扩写成可直接使用的两个提示词。",
+    "你是短剧提示词工程师。给定一镜的「画面描述」与「镜头类型」,把它扩写成可直接使用的两个提示词。",
     "只输出一个 JSON 对象,不要解释、不要 markdown 代码块:",
     '{"firstPrompt":"文生图提示词:该镜首帧画面,交代场景环境与人物外观位置(与角色卡一致),60~150字",'
-    '"motionPrompt":"图生视频提示词:只描述主体连续动作与镜头要求,30~80字"}',
+    '"motionPrompt":"图生视频提示词:只描述主体动作,30~80字(运镜由镜头类型决定,不要写运镜)"}',
     "要求:1) 画面描述必须完整落地进 firstPrompt(不遗漏人物与关键动作);",
     "2) 角色外观严格按角色卡;与全剧风格一致;不出现任何文字、字幕、水印、logo;",
-    "3) motionPrompt 只写动作与镜头,幅度小而柔和,镜头固定不切换。"])
+    "3) motionPrompt 只写主体动作,幅度小而柔和;不要描述运镜(系统按镜头类型自动加运镜指令)。"])
+
+
+_DRAMA_OUTLINE_SYSTEM = "\n".join([
+    "你是短剧编剧。按给定的全剧梗概、风格与角色设定,一次性产出全剧 N 集的连续剧情大纲。",
+    "只输出一个 JSON 数组,不要解释、不要 markdown 代码块。数组每一项必须是对象:",
+    '{"title":"本集标题(4~10字)","synopsis":"本集梗概(1~2句,说明本集发生了什么、以及本集结尾的钩子/悬念)"}',
+    "要求:",
+    "1) 各集剧情必须严格递进、连续,下一集开头承接上一集结尾;",
+    "2) 剧情围绕全剧梗概展开,有起承转合,合理分配节奏(如前几集埋设冲突,中段升级,结局收束);",
+    "3) 使用给定的角色名,不要新造主要角色(次要配角可以);",
+    "4) 严格输出 N 集,集数不足或过多都会导致系统解析失败;",
+    "5) 输出语言与全剧梗概保持一致(默认中文)。"])
+
+
+def _drama_outline(pid, params):
+    """按全剧梗概 LLM 一次性产出全剧 N 集大纲(title + synopsis);走 ip+":opt" 宽松额度。
+    逐集展开:前端把返回的大纲列表填入分集,每集可手改后再分镜。"""
+    if not GEN_STUDIO["upstream_key"]:
+        raise GenError("upstream_unavailable")
+    data = _drama_read(pid)
+    try:
+        n = int(params.get("nEps") or 6)
+    except (TypeError, ValueError):
+        raise GenError("invalid_prompt")
+    n = max(2, min(20, n))
+    logline = (data.get("logline") or "").strip()[:400]
+    if not logline:
+        raise RuntimeError("全剧梗概为空:先在项目里填一句话故事,才能生成分集大纲")
+    style = (data.get("style") or "").strip()
+    chars = [c for c in data.get("chars", []) if (c.get("name") or c.get("desc"))]
+    user_lines = [
+        f"全剧梗概:{logline}",
+        f"画面风格:{style or '未指定'}",
+        f"需要生成的集数 N:{n}",
+    ]
+    if chars:
+        user_lines.append("角色设定:" + "\n".join(
+            f"- {c.get('name', '?')}:{c.get('desc', '')}" for c in chars))
+    else:
+        user_lines.append("角色设定:未指定(自由设定配角)")
+    payload, _ = _gen_upstream("/chat/completions", {
+        "model": DRAMA_STORY_MODEL,
+        "messages": [{"role": "system", "content": _DRAMA_OUTLINE_SYSTEM},
+                     {"role": "user", "content": "\n".join(user_lines)}],
+        "max_tokens": 3000}, timeout_s=180)
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise GenError("upstream_invalid_response")
+    fence = re.search(r"\[.*\]", content, re.S)
+    if not fence:
+        raise GenError("upstream_invalid_response")
+    try:
+        arr = json.loads(fence.group(0))
+    except Exception:
+        raise GenError("upstream_invalid_response")
+    eps = []
+    for item in arr if isinstance(arr, list) else []:
+        if isinstance(item, dict) and (item.get("title") or item.get("synopsis")):
+            eps.append({"title": str(item.get("title") or "")[:30],
+                        "synopsis": str(item.get("synopsis") or "")[:400]})
+    if not eps:
+        raise GenError("upstream_invalid_response")
+    return eps
+
+
+_DRAMA_RECAP_SYSTEM = "\n".join([
+    "你是短剧剧情摘要员。把本集已生成的分镜(镜头场景+画面+台词)压缩成一条剧情摘要(recap)。",
+    "只输出摘要纯文本本身,不要解释、不要引号、不要分点、不要 markdown。",
+    "要求:",
+    "1) 100 字以内,第三人称叙述;",
+    "2) 必须保留:关键事件因果、角色关系变化、结尾的钩子/悬念/未解伏笔;",
+    "3) 不要罗列镜头编号,也不要复述画面细节(如「镜头切换」);只写剧情本身。"])
+
+
+def _drama_recap(pid, eid, params=None):
+    """把本集分镜压缩成前情提要摘要,存 ep.recap;下一集分镜时自动注入(P0-4)。
+    params 带字符串 text 时手写/清空摘要(空串=清除),不调 LLM。"""
+    params = params or {}
+    data = _drama_read(pid)
+    ep = _drama_ep_by_id(data, eid)
+    if isinstance(params.get("text"), str):
+        recap = params["text"].strip()[:200]
+    else:
+        shots = ep.get("shots") or []
+        if not shots:
+            raise RuntimeError("本集还没有分镜,无法生成前情提要")
+        lines = []
+        for i, s in enumerate(shots, 1):
+            seg = f"{i}. {s.get('scene') or '(未命名)'}:{(s.get('desc') or '')[:70]}"
+            if s.get("lines"):
+                seg += " 台词:" + s["lines"][:60]
+            lines.append(seg)
+        user = "\n".join([
+            f"剧名:《{(data.get('title') or '').strip() or '未命名'}》",
+            f"本集梗概:{(ep.get('synopsis') or '').strip() or (data.get('logline') or '').strip() or '未填写'}",
+            "本集分镜:", "\n".join(lines)])
+        if not GEN_STUDIO["upstream_key"]:
+            raise GenError("upstream_unavailable")
+        payload, _ = _gen_upstream("/chat/completions", {
+            "model": DRAMA_STORY_MODEL,
+            "messages": [{"role": "system", "content": _DRAMA_RECAP_SYSTEM},
+                         {"role": "user", "content": user}],
+            "max_tokens": 500}, timeout_s=120)
+        try:
+            content = payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            raise GenError("upstream_invalid_response")
+        if not isinstance(content, str) or not content.strip():
+            raise GenError("upstream_invalid_response")
+        recap = content.strip().splitlines()[0][:200]
+    return _drama_mutate(pid, lambda d: _drama_ep_by_id(d, eid).update({"recap": recap}))
 
 
 def _drama_shot_reprompt(pid, eid, sid, params):
@@ -2085,7 +2220,8 @@ def _drama_shot_reprompt(pid, eid, sid, params):
     char_lines = "\n".join(f"- {c.get('name', '?')}:{c.get('desc', '')}"
                            for c in data.get("chars", []) if (c.get("name") or c.get("desc")))
     user = (f"画面风格:{(data.get('style') or '').strip() or '电影感写实'}\n"
-            f"本镜画面描述:{desc}\n本镜台词:{(shot.get('lines') or '').strip()[:200] or '(无)'}")
+            f"本镜画面描述:{desc}\n本镜镜头类型:{DRAMA_SHOT_TYPES.get(shot.get('shotType'), 'static=固定机位(默认)')}"
+            f"\n本镜台词:{(shot.get('lines') or '').strip()[:200] or '(无)'}")
     if char_lines:
         user += "\n角色设定(外观必须一致):\n" + char_lines
     payload, _ = _gen_upstream("/chat/completions", {
@@ -2588,6 +2724,7 @@ def _drama_shot_add(pid, eid, params):
             dur = 5
         return {"id": _drama_new_id(), "scene": str(p.get("scene") or "")[:60],
                 "desc": str(p.get("desc") or "")[:300],
+                "shotType": p.get("shotType") if p.get("shotType") in DRAMA_SHOT_TYPES else "static",
                 "firstPrompt": str(p.get("firstPrompt") or "")[:1200],
                 "motionPrompt": str(p.get("motionPrompt") or "")[:1200],
                 "lines": str(p.get("lines") or "")[:2000],
@@ -2614,6 +2751,9 @@ def _drama_shot_update(pid, eid, sid, params):
         for k in ("scene", "desc", "firstPrompt", "motionPrompt", "lines", "voice"):
             if isinstance(params.get(k), str):
                 it[k] = params[k].strip()[:2000 if k == "lines" else (1200 if k.endswith("Prompt") else (60 if k == "voice" else 300))]
+        if "shotType" in params:
+            v = params.get("shotType")
+            it["shotType"] = v if v in DRAMA_SHOT_TYPES else "static"
         try:
             dur = int(params.get("duration"))
         except (TypeError, ValueError):
@@ -2705,7 +2845,9 @@ def _drama_shots_clear(pid, eid):
 
 def _drama_url_guard(url):
     """素材代取的 SSRF 防护:仅 http/https,且主机不得解析到回环/私网/链路本地/保留地址
-    (防 file:// 读本地文件、防借服务器探测内网)。"""
+    (防 file:// 读本地文件、防借服务器探测内网)。
+    放行 198.18.0.0/15(代理软件 fake-IP DNS 会把所有域名解析到该段,连接经代理转发到
+    真实公网主机,不可能路由到内网;IP 字面量不经过 DNS,私网写法仍被拒)。"""
     p = urllib.parse.urlparse(url)
     if p.scheme not in ("http", "https"):
         raise RuntimeError("素材 URL 仅支持 http/https")
@@ -2720,9 +2862,10 @@ def _drama_url_guard(url):
         ip = ipaddress.ip_address(info[4][0])
         if getattr(ip, "ipv4_mapped", None) and ip.ipv4_mapped:
             ip = ip.ipv4_mapped
-        if (ip.is_loopback or ip.is_private or ip.is_link_local
-                or ip.is_reserved or ip.is_unspecified or ip.is_multicast):
-            raise RuntimeError("素材 URL 指向内网/保留地址,已拒绝")
+        fakeip = ip in ipaddress.ip_network("198.18.0.0/15")
+        if not fakeip and (ip.is_loopback or ip.is_private or ip.is_link_local
+                           or ip.is_reserved or ip.is_unspecified or ip.is_multicast):
+            raise RuntimeError(f"素材 URL 指向内网/保留地址({ip}),已拒绝")
 
 
 def _drama_asset_bytes(params):
@@ -4271,6 +4414,13 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                     raise GenError("rate_limit")
                 project, added = _drama_storyboard(pid, _need_eid(), params)
                 self._json({"ok": True, "project": project, "added": added})
+            elif sub == "recap":
+                # P0-4 前情提要:手写 text(含空串=清除)直接存不调 LLM;否则 LLM 压缩本集分镜(走 opt 宽松额度)
+                if not isinstance(params.get("text"), str):
+                    ip = self._client_ip()
+                    if not _gen_quota_allow(ip + ":opt", "image", 0):
+                        raise GenError("rate_limit")
+                self._json({"ok": True, "project": _drama_recap(pid, _need_eid(), params)})
             elif sub == "asset":
                 self._json({"ok": True, "project": _drama_asset_store(pid, params)})
             elif sub == "shots/add":
@@ -4693,6 +4843,28 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
             except Exception as e:
                 self._json({"ok": False, "error": _pub_err(e)}, 400)
             return
+        m = re.fullmatch(r"/api/drama/projects/([a-f0-9]{12})/outline", self.path.rstrip("/"))
+        if m:
+            # 分集大纲:同 brainstorm 门禁与额度;LLM 一次性产出全剧 N 集大纲
+            ip = self._client_ip()
+            try:
+                if _gen_locked(ip):
+                    raise GenError("invite_locked")
+                try:
+                    _gen_authorize(self._bearer(), ip)
+                except GenError as e:
+                    if e.code == "unauthorized":
+                        _gen_fail(ip)
+                        raise
+                if not _gen_quota_allow(ip + ":opt", "image", 0):
+                    raise GenError("rate_limit")
+                params = self._read_json()
+                self._json({"ok": True, "eps": _drama_outline(m.group(1), params)})
+            except GenError as e:
+                self._gen_err(e, record_failure=False)
+            except Exception as e:
+                self._json({"ok": False, "error": _pub_err(e)}, 400)
+            return
         if self.path.startswith("/api/ops/"):
             self._ops_route()
             return
@@ -4847,8 +5019,9 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
             return
         m = re.fullmatch(r"/api/drama/projects/([a-f0-9]{12})/asset/(.+)", parsed.path)
         if m:
-            if self._gen_gate():
-                return
+            # 唯一不挂门禁的 drama 端点:<img>/<video>/<audio> 标签带不了 Authorization 头,
+            # 挂码会让公网部署下所有短剧素材破图。URL 由不可枚举的 pid(12位hex)+素材名
+            # (12位hex 序号)组成,语义同 /api/studio/file 的「分享链接即公开」。
             name = urllib.parse.unquote(m.group(2))
             if not DRAMA_REL_RE.fullmatch(name):
                 self._json({"ok": False, "error": "素材路径不合法"}, 400)
@@ -4864,6 +5037,7 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "private, max-age=300")
             self.end_headers()
             self.wfile.write(data)
             return

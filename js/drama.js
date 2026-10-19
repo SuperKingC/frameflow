@@ -316,6 +316,30 @@
     // pWithLines 不由 renderAll 重置:它是「本次起草」选项,勾选态只在页面加载时默认开
     const ep = curEp();
     $('#epSynopsis').value = (ep && ep.synopsis) || '';
+    // P0-4: 前情提要展示(下集分镜自动注入)+ 手改入口(空串=清除,重生成走 LLM)
+    const rc = $('#epRecapLine');
+    if (rc) {
+      rc.textContent = '';
+      if (ep && ep.recap) {
+        rc.hidden = false;
+        rc.appendChild(document.createTextNode('前情提要(下集分镜自动注入):' + ep.recap));
+        const edit = el('button', 'btn', '✎');
+        edit.style.marginLeft = '6px';
+        edit.title = '手改/清空本集前情提要;清空后点此重填会重新用 AI 压缩';
+        edit.addEventListener('click', function () {
+          if (!CUR || !ep) return;
+          const t = prompt('手改本集前情提要(留空则清除;清除后再点「✎」会重新用 AI 生成)', ep.recap || '');
+          if (t === null) return;
+          dPOST('/' + CUR.id + '/recap', { eid: ep.id, text: t }).then(function (res) {
+            if (res.ok && res.p.ok) { CUR = res.p.project; safeRender(); status(t.trim() ? '前情提要已保存' : '前情提要已清除'); }
+            else status('前情提要保存失败:' + (res.p.error || ''), true);
+          });
+        });
+        rc.appendChild(edit);
+      } else {
+        rc.hidden = true;
+      }
+    }
     empty.hidden = !!(ep && ep.shots.length > 0);
     empty.textContent = '本集还没有镜头:填好左侧「一句话故事/本集梗概」后点「✨ 生成分镜」,或「+ 手动加镜」。';
     renderStyleChips();
@@ -372,6 +396,74 @@
       });
     });
     box.appendChild(add);
+    // P0-3: 生成分集大纲——按全剧梗概一次产出 N 集,批量建集+填梗概(逐集可再手改)
+    const ol = el('button', 'ep-tab ops', '⚡ 生成分集大纲');
+    ol.type = 'button';
+    ol.title = '按全剧梗概一次性生成 N 集大纲(每集标题+梗概),批量建集;每集可再手改后分镜';
+    ol.addEventListener('click', function () {
+      if (!CUR || BUSY) return;
+      if (!$('#pLogline').value.trim() && !(CUR.logline || '').trim()) {
+        status('先填一句话故事(全剧梗概),才能生成分集大纲', true); return;
+      }
+      const nStr = prompt('要生成几集的大纲?(2~20)', '6');
+      if (nStr === null) return;
+      const n = Math.max(2, Math.min(20, parseInt(nStr, 10) || 6));
+      saveProj({ silent: true }).then(function (cur) {
+        if (!cur) return;
+        ol.disabled = true;
+        status('AI 生成分集大纲中…(N=' + n + ',约 10~30 秒)');
+        return fetch('/api/drama/projects/' + CUR.id + '/outline', {
+          method: 'POST', headers: AUTH(), body: JSON.stringify({ nEps: n }),
+        }).then(function (r) {
+          return r.json().catch(function () { return {}; }).then(function (p) { return { ok: r.ok, p: p }; });
+        });
+      }).then(function (res) {
+        ol.disabled = false;
+        if (!res) return;
+        if (!res.ok || !res.p.ok) { status('分集大纲失败:' + (res.p.error || '未知错误'), true); return; }
+        const eps = res.p.eps || [];
+        if (!eps.length) { status('大纲为空:再试一次', true); return; }
+        // 已有多集时询问:追加还是覆盖(保留第 1 集的已生成内容)
+        const have = (CUR.episodes || []).length;
+        let startIdx = 0;
+        if (have > 1 && !confirm('项目已有 ' + have + ' 集。点「确定」把大纲填进这些集(覆盖标题/梗概,镜头保留);点「取消」改为追加新集。')) {
+          startIdx = have;
+        }
+        // 串行建集/更新(每集一次请求;失败继续后面的)
+        let done = 0; let fail = 0;
+        const apply = function (i) {
+          if (i >= eps.length) {
+            safeRender();
+            status('分集大纲完成:共 ' + done + ' 集填好标题/梗概' + (fail ? '(' + fail + ' 集失败,可手改补)' : '')
+              + ';逐集检查后点「✨ 生成分镜」展开');
+            return;
+          }
+          const e = eps[i];
+          const pid = CUR.id;
+          const then = function (res) {
+            if (res && res.ok && res.p && res.p.ok) { CUR = res.p.project; done++; }
+            else fail++;
+            apply(i + 1);
+          };
+          if (startIdx + i < have) {
+            const epId = (CUR.episodes || [])[startIdx + i].id;
+            dPOST('/' + pid + '/eps/' + epId + '/update', { title: e.title, synopsis: e.synopsis }).then(then);
+          } else {
+            dPOST('/' + pid + '/eps/add', {}).then(function (res) {
+              if (!res.ok || !res.p.ok) { fail++; apply(i + 1); return; }
+              CUR = res.p.project;
+              const newEp = (CUR.episodes || [])[startIdx + i] || CUR.episodes[CUR.episodes.length - 1];
+              dPOST('/' + pid + '/eps/' + newEp.id + '/update', { title: e.title, synopsis: e.synopsis }).then(then);
+            });
+          }
+        };
+        apply(0);
+      }).catch(function () {
+        ol.disabled = false;
+        status('分集大纲请求失败:网络错误', true);
+      });
+    });
+    box.appendChild(ol);
     if (ep) {
       const rename = el('button', 'ep-tab ops', '✎');
       rename.type = 'button';
@@ -722,8 +814,21 @@
     card.appendChild(lTxt);
 
     const ops = el('div', 'shot-ops');
+    const stSel = el('select');
+    stSel.title = '镜型(P1-1):固定=稳定防崩;推近/横移/手持=运镜镜(自动派海螺3Max);特写=关键情绪点。分镜 AI 自动标注,可手改';
+    [['static', '固定机位'], ['push', '缓慢推近'], ['pan', '横向平移'],
+     ['handheld', '手持跟拍'], ['closeup', '面部特写']].forEach(function (pair) {
+      const o = document.createElement('option');
+      o.value = pair[0];
+      o.textContent = pair[1];
+      if ((s.shotType || 'static') === pair[0]) o.selected = true;
+      stSel.appendChild(o);
+    });
+    stSel.addEventListener('change', function () {
+      patchShot(s.id, { shotType: stSel.value });
+    });
     const vModel = el('select');
-    vModel.title = '本镜视频模型;留空用自动分派(开口→Veo / ⭐关键镜→可灵Pro / 过场→可灵Std)';
+    vModel.title = '本镜视频模型;留空用自动分派(开口→Veo / 运镜镜→海螺3Max / ⭐关键镜→可灵Pro / 过场→可灵Std)';
     [[null, '自动(按镜分派)'], ['kwaivgi/kling-v3.0-pro', '可灵 3.0 Pro(强制)'],
      ['kwaivgi/kling-v3.0-std', '可灵 3.0 标准(强制)'],
      ['google/veo-3.1-fast', 'Veo 3.1 Fast(强制)']].forEach(function (pair) {
@@ -806,7 +911,7 @@
       if (!confirm('删除第' + (i + 1) + '镜及其素材?')) return;
       dPOST('/' + CUR.id + '/shots/' + s.id + '/delete').then(function (res) { applyP(res, '镜头已删除'); });
     });
-    ops.appendChild(vModel); ops.appendChild(keyLabel); ops.appendChild(chLabel); ops.appendChild(ndLabel);
+    ops.appendChild(stSel); ops.appendChild(vModel); ops.appendChild(keyLabel); ops.appendChild(chLabel); ops.appendChild(ndLabel);
     ops.appendChild(dur);
     // 开口镜头人声由模型生成,配音/对口型不参与——不渲染(取消「开口」即回到配音路线)
     if (!s.nativeDialog) { ops.appendChild(bTts); ops.appendChild(bLip); }
@@ -1076,8 +1181,15 @@
       + ',全剧画面风格与角色形象保持一致;画面中不出现任何文字、字幕、水印、logo。';
   }
 
-  function motionSuffix() {
-    return '。动作幅度小而柔和,镜头固定,不要切换镜头,不要新增元素,与全剧其他镜头风格保持一致。';
+  // P1-1 运镜指令:按 shotType 注入不同运镜(固定镜保留防崩词;运镜镜换「单镜内完成,无剪辑」)
+  function motionSuffix(shot) {
+    const t = (shot && shot.shotType) || 'static';
+    const tail = '不要新增元素,与全剧其他镜头风格保持一致。';
+    if (t === 'push') return '。动作幅度小而柔和,镜头缓慢向前推近,单镜内完成,无剪辑,' + tail;
+    if (t === 'pan') return '。动作幅度小而柔和,镜头缓慢横向平移跟随主体,单镜内完成,无剪辑,' + tail;
+    if (t === 'handheld') return '。动作幅度小而柔和,手持跟拍视角带轻微自然晃动,单镜内完成,无剪辑,' + tail;
+    if (t === 'closeup') return '。动作幅度小而柔和,固定特写机位聚焦微表情与眼神,不要切换镜头,' + tail;
+    return '。动作幅度小而柔和,镜头固定,不要切换镜头,' + tail;
   }
 
   // 角色定妆照 → 压缩成 studio 允许的参考图 dataURL(≤2MB 由 canvas 重采样保证)
@@ -1299,10 +1411,14 @@
   }
 
   // 模型自动分派(P1.3):开口→Veo 原生对白;⭐关键镜→可灵 pro;过场→可灵 std。
+  // P1-1: 运镜镜(push/pan/handheld)→ 海螺 3 Max(电影感运镜,目录标注氛围/情绪镜头)。
   // 用户手动选了本镜模型(videoModel)则尊重手选。
   function autoModelFor(shot, native) {
     if (native) return 'google/veo-3.1-fast';
     if (shot.videoModel) return shot.videoModel;
+    if (shot.shotType === 'push' || shot.shotType === 'pan' || shot.shotType === 'handheld') {
+      return 'minimax/hailuo-3-max';
+    }
     return shot.key ? 'kwaivgi/kling-v3.0-pro' : 'kwaivgi/kling-v3.0-std';
   }
 
@@ -1310,6 +1426,7 @@
     'kwaivgi/kling-v3.0-pro': (function () { const a = []; for (let i = 3; i <= 15; i++) a.push(i); return a; })(),
     'kwaivgi/kling-v3.0-std': (function () { const a = []; for (let i = 3; i <= 15; i++) a.push(i); return a; })(),
     'google/veo-3.1-fast': [4, 6, 8],
+    'minimax/hailuo-3-max': [5, 10],
   };
 
   function genClip(shot) {
@@ -1334,10 +1451,13 @@
     if (durs && durs.indexOf(dur) < 0) {
       dur = durs.reduce(function (a, b) { return Math.abs(b - dur) < Math.abs(a - dur) ? b : a; }, durs[0]);
     }
-    // P1.1 首尾帧硬衔接:下一镜已有首帧且本镜非开口时,把本镜结尾"焊"到下一镜开头
+    // P1.1 首尾帧硬衔接:下一镜已有首帧且本镜非开口时,把本镜结尾"焊"到下一镜开头。
+    // 链接仅对 Kling 模型启用(2026-10-18 直连实测 shape 只验证过可灵/veo 系;
+    // 海螺 3 Max 未实测 first_last,若上游不认会静默 failed——运镜镜统一只吃首帧)。
     const idx = ep.shots.indexOf(shot);
     const next = idx + 1 < ep.shots.length ? ep.shots[idx + 1] : null;
-    const chain = !native && next && next.firstFrame && shot.chain !== false;
+    const chainableModel = model === 'kwaivgi/kling-v3.0-pro' || model === 'kwaivgi/kling-v3.0-std';
+    const chain = chainableModel && !native && next && next.firstFrame && shot.chain !== false;
     status(chain ? '正在提交视频生成…(🔗 已链下一镜首帧作尾帧,模型 ' + model + ')'
                  : '正在提交视频生成…(模型 ' + model + ')');
     const frameLoads = [fileToDataURL(shot.firstFrame, 1280)];
@@ -1346,7 +1466,7 @@
       return Promise.all(frameLoads);
     }).then(function (imgs) {
       const body = { model: model,
-                     prompt: native ? nativePrompt(shot) : shot.motionPrompt.trim() + motionSuffix(),
+                     prompt: native ? nativePrompt(shot) : shot.motionPrompt.trim() + motionSuffix(shot),
                      frameMode: chain ? 'first_last' : 'first', duration: dur,
                      referenceImages: imgs.filter(Boolean) };
       if (native) { body.audio = true; body.resolution = '720p'; }
@@ -1673,11 +1793,25 @@ if (entry.kind === 'portrait' || entry.kind === 'trait') {
       }
       if (fails.length) status('一键成片完成,但有失败(其余 ' + pass + ' 个任务正常):' + fails.join(';'), true);
       else status('一键成片完成:' + pass + ' 个任务已执行,合成在后台跑;完成后在「成片」区终审,可到候片墙换候选');
+      // P0-4: 一键成片成功后自动刷新本集前情提要(不阻塞收尾,静默失败)
+      if (!fails.length) genRecap(epRun.id);
     } catch (e) {
       status('一键成片中断:' + (e && e.message ? e.message : '网络错误') + '。已生成的部分保留,再点一次会从缺的地方继续', true);
     } finally {
       setBusy(false);
     }
+  }
+
+  // P0-4: 前情提要——把本集分镜压缩成摘要存 ep.recap;下一集分镜时自动注入
+  function genRecap(epId) {
+    if (!CUR || !epId) return;
+    dPOST('/' + CUR.id + '/recap', { eid: epId }).then(function (res) {
+      if (res.ok && res.p.ok) {
+        CUR = res.p.project;
+        safeRender();
+        status('前情提要已更新(本集摘要已存,下集分镜会自动注入)');
+      }
+    }).catch(function () { /* 静默失败:不影响主流程 */ });
   }
 
   function genFirstFrameAwait(shot) {
@@ -1938,6 +2072,52 @@ if (entry.kind === 'portrait' || entry.kind === 'trait') {
     loadProjects();
     refreshQuota();
   }
+  // ---------- P0-1: 一句话开拍全自动入口 ----------
+  // 串接:角色定妆 → 等待全部完成 → 分镜 → 一键成片。
+  // 用法:浏览器控制台执行 startAutoFilming();或绑定到 UI 按钮。
+  async function startAutoFilming() {
+    if (!CUR) { status('请先选择或创建一个项目', true); return; }
+    if (BUSY) { status('当前有任务正在执行,请稍后再试', true); return; }
+    status('🚀 一句话开拍:流程启动…');
+    const chars = (CUR.chars || []);
+    if (!chars.length) { status('请先添加角色', true); return; }
+    // 1. 触发所有缺定妆照的角色生成
+    let triggered = 0;
+    chars.forEach(function (ch) {
+      if (!ch.portraitTaskId) { genPortrait(ch); triggered++; }
+    });
+    if (!triggered) status('角色定妆照已就绪,跳过定妆阶段');
+    else status('已提交 ' + triggered + ' 个角色定妆任务,等待完成…');
+    // 2. 轮询等待所有定妆照完成(3s 一查,最长等 10 分钟)
+    const MAX_WAIT = 10 * 60 * 1000;
+    const startT = Date.now();
+    const waitForPortraits = new Promise(function (resolve) {
+      const timer = setInterval(function () {
+        const active = Object.keys(poll).filter(function (tid) { return poll[tid].kind === 'portrait'; });
+        if (active.length === 0 || Date.now() - startT > MAX_WAIT) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 3000);
+    });
+    await waitForPortraits;
+    status('✅ 角色定妆阶段结束,开始生成分镜…');
+    // 3. 生成分镜(模拟点击 btnStoryboard 触发其内部逻辑:保存项目信息并 POST)
+    $('#btnStoryboard').click();
+    // 4. 轮询等待分镜完成(BUSY 状态解除即代表分镜动作结束)
+    const waitForStoryboard = new Promise(function (resolve) {
+      const timer = setInterval(function () {
+        if (!BUSY) { clearInterval(timer); resolve(); }
+      }, 5000);
+    });
+    await waitForStoryboard;
+    status('✅ 分镜完成,开始一键成片(自动配音/首帧/成片/合成)…');
+    // 5. 一键成片(直接调用 runAll 绕过 confirm 弹窗)
+    try { await runAll(); } catch (e) { status('一键成片执行异常:' + (e && e.message ? e.message : ''), true); }
+    status('🎉 一句话开拍流程全部完成!');
+  }
+  window.startAutoFilming = startAutoFilming;
+
   const boot = setInterval(function () {
     if (window.FFGate && FFGate.ok) { clearInterval(boot); init(); }
   }, 200);
