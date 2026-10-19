@@ -3,7 +3,8 @@
 前置:API 已给演示项目(86f1f5ae60c2)挂了 bgm.wav(p2_smoke 同款数据流)。
 覆盖:BGM 行渲染(bgmName=当前:bgm.wav,btnBgmClear 可见)→ pBgm 勾选往返
 (localStorage 持久化)→ 封面候选墙(cover-wall + cover-thumb ≥1)+ 点图放大 lightbox
-→ 全页截图。只做只读与可逆操作,不触发任何计费任务。
+→ 空闲 7s 轮询不整树重渲染(镜头卡节点标记仍在)→ 全页截图。只做只读与可逆操作,
+不触发任何计费任务。
 用法: python tools/p2_ui_smoke.py [BASE](缺省 http://127.0.0.1:8437)"""
 import json
 import subprocess
@@ -42,9 +43,9 @@ if not proj.get("bgm"):
         subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                         "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
                         "-ar", "44100", "-ac", "2", str(wav)], check=True)
-    api("POST", f"/api/drama/projects/{pid}/bgm",
+    api("POST", f"/api/drama/projects/{PID}/bgm",
         {"dataUrl": "data:audio/wav;base64," + base64.b64encode(wav.read_bytes()).decode()})
-    proj = api("GET", f"/api/drama/projects/{pid}")["project"]
+    proj = api("GET", f"/api/drama/projects/{PID}")["project"]
 check("api: project has bgm", bool(proj.get("bgm")), proj.get("bgm"))
 ep = next((e for e in proj["episodes"] if e.get("composed")), None)
 check("api: ep composed", bool(ep and ep.get("composed")), ep and ep.get("composed"))
@@ -113,6 +114,33 @@ with sync_playwright() as pw:
             page.wait_for_timeout(400)
     except Exception as e:
         check("封面候选墙渲染", False, repr(e)[:180])
+
+    # ---------- 5) 空闲轮询不整树重渲染(轮询防抖回归) ----------
+    # 旧实现每 2s 无条件 safeRender → 镜头卡节点被反复重建(img 闪烁、输入框丢焦点)。
+    # 给首张镜头卡挂私有属性并留引用,空闲等 7s 后节点必须还是同一个且仍挂在文档上。
+    has_card = page.evaluate(
+        """() => {
+            const c = document.querySelector('#shotList .shot');
+            if (!c) return false;
+            c.__smokeMark = 'keep';
+            window.__smokeCard = c;
+            return true;
+        }""")
+    check("镜头卡存在(可做重渲染标记)", has_card)
+    page.wait_for_timeout(7000)
+    r = page.evaluate(
+        """() => {
+            const c = document.querySelector('#shotList .shot');
+            return {
+                same: !!c && c === window.__smokeCard,
+                mark: c ? (c.__smokeMark || '') : '',
+                connected: !!(window.__smokeCard && window.__smokeCard.isConnected),
+                shots: document.querySelectorAll('#shotList .shot').length,
+            };
+        }""")
+    check("空闲 7s 轮询不重建镜头卡(标记仍在)", r["same"] and r["mark"] == "keep" and r["connected"],
+          r)
+    check("镜头列表仍完整(7s 后卡数 ≥1)", r["shots"] >= 1, r["shots"])
 
     page.screenshot(path=str(OUT / "drama_p2_ui.png"), full_page=True)
     print("screenshot:", OUT / "drama_p2_ui.png", flush=True)
