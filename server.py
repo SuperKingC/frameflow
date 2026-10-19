@@ -86,7 +86,7 @@ GEN_STUDIO = {
     "video_daily": 30,
     "invite_max_failures": 3,
     "max_prompt": 4000,
-    "prompt_model": "openai/gpt-5.4-mini",
+    "prompt_model": "openai/gpt-6.1-sol",
     # 2026-10-13 全量实测(OpenRouter 目录逐个真跑,工具 tools/probe_models.py):
     # chat+modalities 生图与 /videos 生视频均按实测通过与否收录;fit 是用途描述
     # (适合什么场景,人工按质量口碑+实测定位);durations 为各视频模型支持时长。
@@ -833,13 +833,25 @@ def _gen_video_once(prompt, model_id, duration=None, audio=None, frame_mode=None
         body["audio"] = True  # 老 kling 语义兼容
     refs = refs or []
     if refs:
-        frames = [{"type": "image_url", "image_url": {"url": refs[0]}, "frame_type": "first_frame"}]
+        # 首尾帧 payload 形状按模型分派(2026-10-18 直连实测):
+        # kling-v3.0-std 只吃顶层 frames 简单数组;pro 吃 first/last_frame_image 字段与
+        # frame_images 均可;veo 系吃 frame_images(frame_type 标注)。std+frame_images 会
+        # 被上游静默判 failed,必须按模型挑形状。
         if frame_mode == "first_last":
             if len(refs) < 2:
                 raise GenError("invalid_frame_mode")
-            # 首尾帧模式(实测上游支持):第 2 张参考图作尾帧
-            frames.append({"type": "image_url", "image_url": {"url": refs[1]}, "frame_type": "last_frame"})
-        body["frame_images"] = frames
+            if "kling" in model_id and model_id.endswith("-std"):
+                body["frames"] = [refs[0], refs[1]]
+            elif "kling" in model_id:
+                body["first_frame_image"] = refs[0]
+                body["last_frame_image"] = refs[1]
+            else:
+                body["frame_images"] = [
+                    {"type": "image_url", "image_url": {"url": refs[0]}, "frame_type": "first_frame"},
+                    {"type": "image_url", "image_url": {"url": refs[1]}, "frame_type": "last_frame"}]
+        else:
+            body["frame_images"] = [
+                {"type": "image_url", "image_url": {"url": refs[0]}, "frame_type": "first_frame"}]
     elif frame_mode == "first_last":
         raise GenError("invalid_frame_mode")
     for attempt in (1, 2):
@@ -1526,7 +1538,11 @@ DRAMA_STORY_MODEL = GEN_STUDIO["prompt_model"]
 DRAMA_ASPECTS = ("9:16", "16:9", "1:1", "4:3")
 DRAMA_ASSET_MAX_BYTES = 80 * 1024 * 1024
 DRAMA_PID_RE = re.compile(r"^[a-f0-9]{12}$")
-DRAMA_REL_RE = re.compile(r"^(?:composed\.mp4|(?:chars|shots)/[A-Za-z0-9_-]+\.(?:png|jpg|jpeg|webp|mp4|wav))$")
+# 集 id 形如 "e"+11 位 hex(共 12 位);合成片按集命名 composed_<eid>.mp4,顶层 composed.mp4 保留兼容旧项目
+DRAMA_EID_RE = re.compile(r"^e[a-f0-9]{11}$")
+DRAMA_REL_RE = re.compile(
+    r"^(?:composed(?:_[A-Za-z0-9]+)?\.mp4|mixed_[A-Za-z0-9]+\.mp4|series\.mp4|"
+    r"(?:chars|shots)/[A-Za-z0-9_-]+\.(?:png|jpg|jpeg|webp|mp4|wav))$")
 DRAMA_DATAURL_RE = re.compile(r"^data:(image/(?:png|jpeg|webp)|video/mp4);base64,([A-Za-z0-9+/=]+)$")
 DRAMA_MIME_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "video/mp4": "mp4"}
 _DRAMA_LOCK = threading.Lock()  # project.json 读改写全程持锁,避免并发丢更新(项目量小,文件 IO 快)
@@ -1578,22 +1594,81 @@ def _drama_new_id():
     return uuid.uuid4().hex[:12]
 
 
+def _drama_new_eid():
+    return "e" + uuid.uuid4().hex[:11]
+
+
 def _drama_read(pid):
-    """读取项目(仅读);项目不存在抛 RuntimeError。"""
-    with _DRAMA_LOCK:
-        path = DRAMA_DIR / pid / "project.json"
-        if not path.exists():
-            raise RuntimeError("项目不存在")
-        return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _drama_mutate(pid, fn):
-    """读改写全程持锁;fn(data) 内可抛异常终止保存。返回快照副本。"""
+    """读取项目(仅读);项目不存在抛 RuntimeError。旧项目(顶层 shots)懒迁移到第 1 集。"""
     with _DRAMA_LOCK:
         path = DRAMA_DIR / pid / "project.json"
         if not path.exists():
             raise RuntimeError("项目不存在")
         data = json.loads(path.read_text(encoding="utf-8"))
+    return _drama_migrate(data)
+
+
+def _drama_migrate(data):
+    """v2 结构迁移:project.json 顶层 shots → episodes[0].shots;旧 composed.mp4 挂到第 1 集;
+    空项目补第 1 集。调用方必须已持 _DRAMA_LOCK(此处直接写盘)。幂等:已迁移则跳过写盘。
+    角色/风格/梗概天然是剧级,不动。"""
+    dirty = False
+    if not isinstance(data.get("episodes"), list):
+        data["episodes"] = []
+        dirty = True
+    if not data["episodes"]:
+        shots = data.pop("shots", []) or []
+        if shots or data.get("composed"):
+            data["episodes"].append({
+                "id": _drama_new_eid(), "title": "第 1 集", "synopsis": "",
+                "createdAt": data.get("createdAt") or _drama_now(),
+                "shots": shots, "composed": data.pop("composed", None)})
+        dirty = True
+    data.setdefault("composed", None)
+    before = data.get("currentEpisode")
+    _drama_cur_ep(data)
+    if data.get("currentEpisode") != before:
+        dirty = True
+    if dirty:
+        path = DRAMA_DIR / data["id"] / "project.json"
+        try:
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass  # 迁移写盘失败不影响本次服务(下次读再试)
+    return data
+
+
+def _drama_cur_ep(data):
+    """当前集:currentEpisode 指向有效集;无效时取第 1 集;一集都没有则建空集。"""
+    eps = data.setdefault("episodes", [])
+    if not eps:
+        eps.append({"id": _drama_new_eid(), "title": "第 1 集", "synopsis": "",
+                    "createdAt": _drama_now(), "shots": [], "composed": None})
+    cur = data.get("currentEpisode")
+    ep = next((e for e in eps if e["id"] == cur), None)
+    if not ep:
+        ep = eps[0]
+        data["currentEpisode"] = ep["id"]
+    return ep
+
+
+def _drama_ep_by_id(data, eid):
+    if not DRAMA_EID_RE.fullmatch(eid or ""):
+        raise RuntimeError("集 id 不合法")
+    ep = next((e for e in data.get("episodes", []) if e["id"] == eid), None)
+    if not ep:
+        raise RuntimeError("集不存在")
+    return ep
+
+
+def _drama_mutate(pid, fn):
+    """读改写全程持锁;fn(data) 内可抛异常终止保存。返回快照副本。写入前确保 v2 结构。"""
+    with _DRAMA_LOCK:
+        path = DRAMA_DIR / pid / "project.json"
+        if not path.exists():
+            raise RuntimeError("项目不存在")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data = _drama_migrate(data)
         fn(data)
         data["updatedAt"] = _drama_now()
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1611,27 +1686,30 @@ def _drama_list():
             data = _drama_read(d.name)
         except Exception:
             continue
+        eps = data.get("episodes", [])
         out.append({"id": data["id"], "title": data.get("title", ""),
                     "updatedAt": data.get("updatedAt", ""),
-                    "shotCount": len(data.get("shots", [])),
-                    "clipCount": sum(1 for s in data.get("shots", []) if s.get("clip"))})
+                    "episodeCount": len(eps),
+                    "shotCount": sum(len(e.get("shots", [])) for e in eps),
+                    "clipCount": sum(1 for e in eps for s in e.get("shots", []) if s.get("clip"))})
     return out
 
 
 def _drama_create(params):
     title = (params.get("title") or "").strip() or "未命名短剧"
     aspect = params.get("aspect") if params.get("aspect") in DRAMA_ASPECTS else "9:16"
+    eid = _drama_new_eid()
     data = {"id": _drama_new_id(), "title": title[:60],
             "logline": (params.get("logline") or "").strip()[:600],
             "style": (params.get("style") or "").strip()[:120],
             "aspect": aspect, "createdAt": _drama_now(), "updatedAt": _drama_now(),
-            "chars": [], "shots": [], "composed": None}
+            "chars": [], "episodes": [], "composed": None}
     with _DRAMA_LOCK:
         d = DRAMA_DIR / data["id"]
         d.mkdir(parents=True, exist_ok=True)
         (d / "project.json").write_text(json.dumps(data, ensure_ascii=False, indent=2),
                                         encoding="utf-8")
-    return data
+    return _drama_read(data["id"])  # 走 _drama_cur_ep 建第 1 集并回写
 
 
 def _drama_delete(pid):
@@ -1654,6 +1732,72 @@ def _drama_project_update(pid, params):
             d["aspect"] = params["aspect"]
         if isinstance(params.get("beat"), str):
             d["beat"] = params["beat"].strip()[:20] if params["beat"].strip() in DRAMA_BEATS else ""
+    return _drama_mutate(pid, apply)
+
+
+def _drama_episode_add(pid, params):
+    """加一集:标题自动「第 N 集」;素材目录共用 shots/(镜头 id 全局唯一,按集只存引用)。"""
+    data = _drama_read(pid)
+    n = len(data.get("episodes", [])) + 1
+    eid = _drama_new_eid()
+    title = (params.get("title") if isinstance(params.get("title"), str) else "").strip()[:40]
+    synopsis = (params.get("synopsis") if isinstance(params.get("synopsis"), str) else "").strip()[:400]
+    log = synopsis or (params.get("logline") if isinstance(params.get("logline"), str) else "").strip()[:400]
+
+    def apply(d):
+        d["episodes"].append({"id": eid, "title": title or f"第 {n} 集",
+                              "synopsis": log, "createdAt": _drama_now(),
+                              "shots": [], "composed": None})
+        d["currentEpisode"] = eid
+    _drama_mutate(pid, apply)
+    return _drama_read(pid), eid
+
+
+def _drama_episode_update(pid, eid, params):
+    def apply(d):
+        ep = _drama_ep_by_id(d, eid)
+        if isinstance(params.get("title"), str):
+            ep["title"] = params["title"].strip()[:40] or ep["title"]
+        if isinstance(params.get("synopsis"), str):
+            ep["synopsis"] = params["synopsis"].strip()[:400]
+    return _drama_mutate(pid, apply)
+
+
+def _drama_episode_delete(pid, eid):
+    """删集:该集镜头的素材文件一并清理;角色库不动。至少保留一集(删到剩一集时清空其镜头)。"""
+    data = _drama_read(pid)
+    eps = data.get("episodes", [])
+    ep = _drama_ep_by_id(data, eid)
+    rels = []
+    for s in ep.get("shots", []):
+        for f in (s.get("firstFrame"), s.get("clip"), s.get("tts")):
+            if f:
+                rels.append(f)
+    if ep.get("composed"):
+        rels.append(ep["composed"])
+    if len(eps) <= 1:
+        def apply(d):
+            e = _drama_ep_by_id(d, eid)
+            e["shots"] = []
+            e["composed"] = None
+        data = _drama_mutate(pid, apply)
+    else:
+        def apply(d):
+            d["episodes"] = [e for e in d["episodes"] if e["id"] != eid]
+            if d.get("currentEpisode") == eid:
+                d["currentEpisode"] = d["episodes"][0]["id"]
+        data = _drama_mutate(pid, apply)
+    for rel in rels:
+        try:
+            (DRAMA_DIR / pid / rel).unlink()
+        except OSError:
+            pass
+    return data
+
+
+def _drama_episode_select(pid, eid):
+    def apply(d):
+        d["currentEpisode"] = _drama_ep_by_id(d, eid)["id"]
     return _drama_mutate(pid, apply)
 
 
@@ -1683,12 +1827,21 @@ _DRAMA_STORY_SYSTEM = "\n".join([
     "7) duration 是该镜时长秒数(2~30 整数):普通镜头 5 秒,一句话对白或情绪铺陈 8~10 秒,高潮/结尾 10~15 秒;长短交替,不要全部一样。",
     "8) 如果要求写对白:每个镜头加 \"lines\" 字段,格式「角色名:台词」一行一句"
     "(无对话的镜头留空字符串;台词口语化、短句、有钩子,符合角色身份;合计念白时长不超过该镜 duration-1 秒)。"
-    "对白必须推动剧情或给出反转,严禁台词复述画面。"])
+    "对白必须推动剧情或给出反转,严禁台词复述画面。",
+    "电影化分镜规则(专业感的关键,必须遵守):",
+    "9) desc 开头必须注明景别与机位,格式「景别·机位:」(景别从 远景/全景/中景/近景/特写 中选;"
+    "机位从 固定机位/缓慢推近/缓慢拉远/过肩视角 中选,推拉只限小幅缓慢);",
+    "10) 相邻镜头的景别必须有变化,禁止连续两镜同景别(如特写接特写);关键情绪点(反转/揭示)用特写或近景;",
+    "11) 对话场景遵守 180° 轴线:两人对话时保持左右空间关系一致,连续镜头不要跳轴;"
+    "正反打交替(一人镜头接另一人反应镜头)时,desc 里写明「过肩视角,面向右/左」;"
+    "12) firstPrompt 要体现该镜景别构图(如特写镜写面部细节、远景镜写全貌环境),"
+    "同一场景的相邻镜头保持光线方向与色调一致。"])
 
 
-def _drama_storyboard(pid, params):
-    """LLM 起草分镜:输入项目里的梗概/风格/角色,追加 N 个镜头;分镜表可再手改。
-    withLines=true 时按章节(起/承/转/合)分组起草,并给每镜写对白(lines 字段)。"""
+def _drama_storyboard(pid, eid, params):
+    """LLM 起草分镜:输入剧级梗概/风格/角色与本集梗概,追加 N 个镜头到该集;分镜表可再手改。
+    withLines=true 时按章节(起/承/转/合)分组起草,并给每镜写对白(lines 字段)。
+    多集项目自动注入剧上下文:剧名/全剧梗概/集位置/上一集结尾(跨集衔接)。"""
     try:
         n = int(params.get("nShots") or 6)
     except (TypeError, ValueError):
@@ -1696,16 +1849,37 @@ def _drama_storyboard(pid, params):
     n = max(1, min(24, n))
     with_lines = params.get("withLines") is True
     data = _drama_read(pid)
-    logline = (params.get("logline") if isinstance(params.get("logline"), str) else data.get("logline")) or ""
-    style = (params.get("style") if isinstance(params.get("style"), str) else data.get("style")) or ""
-    if not logline.strip():
-        raise RuntimeError("故事梗概为空:先在项目里填一句话故事")
+    ep = _drama_ep_by_id(data, eid)
+    eps = data.get("episodes", [])
+    pos = next((i + 1 for i, e in enumerate(eps) if e["id"] == eid), 1)
+    # 本集梗概优先,回退全剧梗概(单集项目两者常同)
+    logline = (ep.get("synopsis") or "").strip() or (data.get("logline") or "").strip()
+    style = (data.get("style") or "").strip()
+    if not logline:
+        raise RuntimeError("故事梗概为空:先在项目里填一句话故事(或本集梗概)")
     if not GEN_STUDIO["upstream_key"]:
         raise GenError("upstream_unavailable")
     char_lines = "\n".join(f"- {c.get('name', '?')}:{c.get('desc', '')}"
                            for c in data.get("chars", []) if (c.get("name") or c.get("desc")))
-    user = (f"故事梗概:{logline.strip()}\n画面风格:{style.strip() or '电影感写实'}\n"
-            f"画幅:{data.get('aspect', '9:16')}\n镜头数:{n}")
+    user = ""
+    if len(eps) > 1:
+        user += (f"剧名:《{(data.get('title') or '').strip()}》;这是第 {pos} 集(全剧共 {len(eps)} 集,本集只讲该集的故事)。\n")
+        if (data.get("logline") or "").strip():
+            user += "全剧梗概:" + data["logline"].strip() + "\n"
+        user += f"本集梗概:{logline}\n"
+        # 跨集衔接:上一集最后两镜收在哪,本集从哪接着演
+        if pos >= 2:
+            prev_shots = eps[pos - 2].get("shots") or []
+            if prev_shots:
+                brief = ";\n".join(
+                    (s.get("scene") or "(未命名)") + ":" + (s.get("desc") or "")[:60]
+                    + ((" 台词:" + s["lines"][:50]) if s.get("lines") else "")
+                    for s in prev_shots[-2:])
+                user += (f"上一集(第 {pos - 1} 集)结尾是:\n{brief}\n"
+                         "本集开头必须自然承接上一集结尾的时间/地点/情绪,不要重演或跳回开头;\n")
+    else:
+        user += f"故事梗概:{logline}\n"
+    user += f"画面风格:{style or '电影感写实'}\n画幅:{data.get('aspect', '9:16')}\n镜头数:{n}"
     beat = data.get("beat") if data.get("beat") in DRAMA_BEATS else ""
     if beat:
         user += "\n叙事模板:" + DRAMA_BEATS[beat] + "(叙事节奏在模板与下面通用规则冲突时以模板为准)"
@@ -1714,14 +1888,14 @@ def _drama_storyboard(pid, params):
                  "各章任务:起=3秒钩子+人物登场,承=矛盾升级,转=反转/危机,合=收束余响。必须给大部分镜头写 lines 对白。")
     if char_lines:
         user += "\n角色设定:\n" + char_lines
-    # 追加式分镜的剧情衔接:让 LLM 看到已有镜头收在哪,新镜头从那里继续演
-    existing = data.get("shots") or []
+    # 追加式分镜的剧情衔接:让 LLM 看到本集已有镜头收在哪,新镜头从那里继续演
+    existing = ep.get("shots") or []
     if existing:
         brief = "\n".join(
             f"{i+1}. {s.get('scene') or '(未命名)'}:{(s.get('desc') or '')[:50]}"
             + (("台词:" + s["lines"][:40]) if s.get("lines") else "")
             for i, s in enumerate(existing[-4:]))
-        user += (f"\n已有 {len(existing)} 个镜头,最后几镜是:\n{brief}\n"
+        user += (f"\n本集已有 {len(existing)} 个镜头,最后几镜是:\n{brief}\n"
                  "新镜头必须无缝衔接:从最后一镜的时间/地点/情绪接着往下演,不要重复、改写或跳回开头。")
     sys_prompt = _DRAMA_STORY_SYSTEM
     if with_lines:
@@ -1773,13 +1947,15 @@ def _drama_storyboard(pid, params):
                       "lines": str(item.get("lines") or "")[:2000] if with_lines else "",
                       "voice": "default", "audio": False, "tts": None,
                       "duration": max(2, min(30, dur)),
+                      # ⭐ 首镜(3秒钩子)与末镜(结尾收口)自动标关键镜:抽卡+贵模型分派的第一优先级
+                      "key": idx == 0 or idx == len(items) - 1,
                       "firstFrame": None, "clip": None,
                       "firstTaskId": None, "clipTaskId": None})
     if not added:
         raise GenError("upstream_invalid_response")
 
     def apply(d):
-        d["shots"].extend(added)
+        _drama_ep_by_id(d, eid)["shots"].extend(added)
     return _drama_mutate(pid, apply), added
 
 
@@ -1892,7 +2068,7 @@ _DRAMA_REPROMPT_SYSTEM = "\n".join([
     "3) motionPrompt 只写动作与镜头,幅度小而柔和,镜头固定不切换。"])
 
 
-def _drama_shot_reprompt(pid, sid, params):
+def _drama_shot_reprompt(pid, eid, sid, params):
     """按本镜画面描述重写 firstPrompt/motionPrompt(LLM;前端 desc 变更防抖自动调用,
     高级模式开着时不触发)。与 storyboard 同一条宽松额度,不占生图额度。"""
     if not GEN_STUDIO["upstream_key"]:
@@ -1902,7 +2078,8 @@ def _drama_shot_reprompt(pid, sid, params):
     if not desc:
         raise RuntimeError("画面描述为空,先写这一镜发生了什么")
     data = _drama_read(pid)
-    shot = next((s for s in data["shots"] if s["id"] == sid), None)
+    ep = _drama_ep_by_id(data, eid)
+    shot = next((s for s in ep.get("shots", []) if s["id"] == sid), None)
     if not shot:
         raise RuntimeError("镜头不存在")
     char_lines = "\n".join(f"- {c.get('name', '?')}:{c.get('desc', '')}"
@@ -1933,7 +2110,7 @@ def _drama_shot_reprompt(pid, sid, params):
         raise GenError("upstream_invalid_response")
 
     def apply(d):
-        it = next((s for s in d["shots"] if s["id"] == sid), None)
+        it = next((s for s in _drama_ep_by_id(d, eid).get("shots", []) if s["id"] == sid), None)
         if not it:
             raise RuntimeError("镜头已被删除")
         it["firstPrompt"] = first
@@ -2168,11 +2345,12 @@ def _kling_upload_video(video_path):
         "或把成片上传到对象存储后给 KLING_VID_URL。可灵 identify-face 只接受公网 video_url / 官方 video_id。")
 
 
-def _drama_shot_lipsync(pid, sid, params=None):
+def _drama_shot_lipsync(pid, eid, sid, params=None):
     """镜头对口型:成片 + 本镜 TTS wav → 可灵官方两步链路 → 换回带口型成片。
     阻塞式(可灵对口型一般 1~3 分钟);ffmpeg 压缩成片 <100MB 后按公网直链提交。"""
     data = _drama_read(pid)
-    shot = next((s for s in data["shots"] if s["id"] == sid), None)
+    ep = _drama_ep_by_id(data, eid)
+    shot = next((s for s in ep.get("shots", []) if s["id"] == sid), None)
     if not shot:
         raise RuntimeError("镜头不存在")
     if not shot.get("clip") or not (DRAMA_DIR / pid / shot["clip"]).exists():
@@ -2259,7 +2437,7 @@ def _drama_shot_lipsync(pid, sid, params=None):
                 pass
 
             def apply(d):
-                it = next((x for x in d["shots"] if x["id"] == sid), None)
+                it = next((x for x in _drama_ep_by_id(d, eid).get("shots", []) if x["id"] == sid), None)
                 if not it:
                     raise RuntimeError("镜头已被删除")
                 it["clip"] = rel  # 换回带口型的成片(原片覆盖式替换,合成自动用新片)
@@ -2270,11 +2448,12 @@ def _drama_shot_lipsync(pid, sid, params=None):
     raise RuntimeError("可灵对口型超时")
 
 
-def _drama_shot_tts(pid, sid, params=None):
+def _drama_shot_tts(pid, eid, sid, params=None):
     """为镜头生成配音:lines 按「角色名:台词」解析,逐句 TTS 后用 ffmpeg concat 成一条,
     存 shots/<sid>_tts.wav;失败/空台词清理旧文件。返回项目快照。"""
     data = _drama_read(pid)
-    shot = next((s for s in data["shots"] if s["id"] == sid), None)
+    ep = _drama_ep_by_id(data, eid)
+    shot = next((s for s in ep.get("shots", []) if s["id"] == sid), None)
     if not shot:
         raise RuntimeError("镜头不存在")
     lines = [l.strip() for l in (shot.get("lines") or "").splitlines() if l.strip()]
@@ -2318,7 +2497,7 @@ def _drama_shot_tts(pid, sid, params=None):
     tts_dur = _ffprobe_duration(proj_dir / rel)
 
     def apply(d):
-        it = next((s for s in d["shots"] if s["id"] == sid), None)
+        it = next((s for s in _drama_ep_by_id(d, eid).get("shots", []) if s["id"] == sid), None)
         if not it:
             raise RuntimeError("镜头已被删除")
         it["tts"] = rel
@@ -2336,7 +2515,8 @@ def _drama_char_add(pid, params):
     def apply(d):
         d["chars"].append({"id": _drama_new_id(), "name": name[:30],
                            "desc": (params.get("desc") or "").strip()[:400],
-                           "voice": "default", "refs": [], "asset": None, "portraitTaskId": None})
+                           "voice": "default", "refs": [], "asset": None, "traits": [],
+                           "portraitTaskId": None, "traitTaskId": None})
     return _drama_mutate(pid, apply)
 
 
@@ -2351,9 +2531,10 @@ def _drama_char_update(pid, cid, params):
             it["desc"] = params["desc"].strip()[:400]
         if isinstance(params.get("voice"), str):
             it["voice"] = params["voice"].strip()[:30] or "default"
-        if "portraitTaskId" in params:
-            v = params["portraitTaskId"]
-            it["portraitTaskId"] = v.strip()[:64] if isinstance(v, str) and v.strip() else None
+        for k in ("portraitTaskId", "traitTaskId"):
+            if k in params:
+                v = params[k]
+                it[k] = v.strip()[:64] if isinstance(v, str) and v.strip() else None
     return _drama_mutate(pid, apply)
 
 
@@ -2363,15 +2544,43 @@ def _drama_char_delete(pid, cid):
     if not it:
         raise RuntimeError("角色不存在")
     data = _drama_mutate(pid, lambda d: d["chars"].remove(next(c for c in d["chars"] if c["id"] == cid)))
-    if it.get("asset"):
-        try:
-            (DRAMA_DIR / pid / it["asset"]).unlink()
-        except OSError:
-            pass
+    for rel in [it.get("asset")] + list(it.get("traits") or []):
+        if rel:
+            try:
+                (DRAMA_DIR / pid / rel).unlink()
+            except OSError:
+                pass
     return data
 
 
-def _drama_shot_add(pid, params):
+def _drama_char_trait_delete(pid, cid, params):
+    """删除第 index 张三视图(1 起);文件一并清理。"""
+    try:
+        index = int(params.get("index"))
+    except (TypeError, ValueError):
+        raise RuntimeError("index 必须是数字")
+    data = _drama_read(pid)
+    it = next((c for c in data["chars"] if c["id"] == cid), None)
+    if not it:
+        raise RuntimeError("角色不存在")
+    traits = [r for r in (it.get("traits") or []) if r]
+    if index < 1 or index > len(traits):
+        raise RuntimeError("三视图序号不存在")
+    rel = traits[index - 1]
+    try:
+        (DRAMA_DIR / pid / rel).unlink()
+    except OSError:
+        pass
+
+    def apply(d):
+        it2 = next((c for c in d["chars"] if c["id"] == cid), None)
+        if not it2:
+            raise RuntimeError("角色不存在")
+        it2["traits"] = [r for r in (it2.get("traits") or []) if r and r != rel]
+    return _drama_mutate(pid, apply)
+
+
+def _drama_shot_add(pid, eid, params):
     def norm(p):
         try:
             dur = int(p.get("duration") or 5)
@@ -2393,13 +2602,13 @@ def _drama_shot_add(pid, params):
     incoming = [p for p in incoming if isinstance(p, dict)][:20]
 
     def apply(d):
-        d["shots"].extend(norm(p) for p in incoming)
+        _drama_ep_by_id(d, eid)["shots"].extend(norm(p) for p in incoming)
     return _drama_mutate(pid, apply)
 
 
-def _drama_shot_update(pid, sid, params):
+def _drama_shot_update(pid, eid, sid, params):
     def apply(d):
-        it = next((s for s in d["shots"] if s["id"] == sid), None)
+        it = next((s for s in _drama_ep_by_id(d, eid).get("shots", []) if s["id"] == sid), None)
         if not it:
             raise RuntimeError("镜头不存在")
         for k in ("scene", "desc", "firstPrompt", "motionPrompt", "lines", "voice"):
@@ -2418,19 +2627,38 @@ def _drama_shot_update(pid, sid, params):
             it["videoModel"] = v.strip()[:80] if isinstance(v, str) and v.strip() else None
         if "nativeDialog" in params:
             it["nativeDialog"] = params.get("nativeDialog") is True
+        if "key" in params:
+            it["key"] = params.get("key") is True   # ⭐ 关键镜(抽卡+贵模型分派的依据)
+        if "chain" in params:
+            it["chain"] = params.get("chain") is True  # 🔗 首尾帧衔接开关(缺省开)
         for k in ("firstTaskId", "clipTaskId"):
             if k in params:
                 v = params[k]
                 it[k] = v.strip()[:64] if isinstance(v, str) and v.strip() else None
+        # 抽卡择优:把 takes 中某候选设为该镜当前使用的 first/clip 素材
+        for field, sel_key in (("firstFrame", "firstTakeSel"), ("clip", "clipTakeSel")):
+            if sel_key in params:
+                sel = params[sel_key]
+                kind = "first" if sel_key == "firstTakeSel" else "clip"
+                if not isinstance(sel, str) or not sel.strip():
+                    continue
+                take = next((t for t in (it.get("takes") or [])
+                             if t.get("id") == sel.strip() and t.get("kind") == kind), None)
+                if not take:
+                    raise RuntimeError("候选不存在")
+                it[sel_key] = sel.strip()
+                it[field] = take["rel"]
     return _drama_mutate(pid, apply)
 
 
-def _drama_shot_delete(pid, sid):
+def _drama_shot_delete(pid, eid, sid):
     data = _drama_read(pid)
-    it = next((s for s in data["shots"] if s["id"] == sid), None)
+    ep = _drama_ep_by_id(data, eid)
+    it = next((s for s in ep.get("shots", []) if s["id"] == sid), None)
     if not it:
         raise RuntimeError("镜头不存在")
-    data = _drama_mutate(pid, lambda d: d["shots"].remove(next(s for s in d["shots"] if s["id"] == sid)))
+    data = _drama_mutate(pid, lambda d: _drama_ep_by_id(d, eid)["shots"].remove(
+        next(s for s in _drama_ep_by_id(d, eid)["shots"] if s["id"] == sid)))
     for rel in (it.get("firstFrame"), it.get("clip")):
         if rel:
             try:
@@ -2440,30 +2668,32 @@ def _drama_shot_delete(pid, sid):
     return data
 
 
-def _drama_shot_reorder(pid, params):
+def _drama_shot_reorder(pid, eid, params):
     order = params.get("order")
     if not isinstance(order, list) or not all(isinstance(x, str) for x in order):
         raise RuntimeError("order 必须是镜头 id 数组")
 
     def apply(d):
-        idx = {s["id"]: s for s in d["shots"]}
+        ep = _drama_ep_by_id(d, eid)
+        idx = {s["id"]: s for s in ep.get("shots", [])}
         arranged = [idx[i] for i in order if i in idx]
-        tail = [s for s in d["shots"] if s["id"] not in set(order)]
-        d["shots"] = arranged + tail
+        tail = [s for s in ep.get("shots", []) if s["id"] not in set(order)]
+        ep["shots"] = arranged + tail
     return _drama_mutate(pid, apply)
 
 
-def _drama_shots_clear(pid):
-    """一键清空全部分镜(首帧/成片/配音素材文件一并删);角色与定妆照不动。"""
+def _drama_shots_clear(pid, eid):
+    """一键清空本集全部分镜(首帧/成片/配音素材文件一并删);角色与定妆照不动。"""
     data = _drama_read(pid)
+    ep = _drama_ep_by_id(data, eid)
     rels = []
-    for s in data["shots"]:
+    for s in ep.get("shots", []):
         for f in (s.get("firstFrame"), s.get("clip"), s.get("tts")):
             if f:
                 rels.append(f)
 
     def apply(d):
-        d["shots"] = []
+        _drama_ep_by_id(d, eid)["shots"] = []
     data = _drama_mutate(pid, apply)
     for rel in rels:
         try:
@@ -2554,40 +2784,100 @@ def _drama_asset_bytes(params):
         str(k) for k in (params.keys() if isinstance(params, dict) else [])) + "])")
 
 
+def _drama_find_shot(data, item_id):
+    """跨集找镜头;返回 (ep, shot)。三层数据里镜头 id 全局唯一,asset/reorder 等接口可能只带 id。"""
+    for ep in data.get("episodes", []):
+        for s in ep.get("shots", []):
+            if s["id"] == item_id:
+                return ep, s
+    return None, None
+
+
 def _drama_asset_store(pid, params):
-    """把成品素材挂到镜头(kind=first/clip)或角色(kind=portrait)上并落盘;旧素材文件清理。"""
+    """把成品素材挂到镜头(kind=first/clip)或角色(kind=portrait/trait)上并落盘;旧素材文件清理。
+    镜头素材跨集查找(前端只传镜头 id);三视图 kind=trait 追加到 chars[].traits[]。"""
     target, kind = params.get("target"), params.get("kind")
-    if target not in ("char", "shot") or (target == "char" and kind != "portrait") \
+    if target not in ("char", "shot") or (target == "char" and kind not in ("portrait", "trait")) \
             or (target == "shot" and kind not in ("first", "clip")):
         raise RuntimeError("target/kind 不合法")
     item_id = str(params.get("id") or "")
+    data = _drama_read(pid)
+    if target == "char":
+        item = next((x for x in data["chars"] if x["id"] == item_id), None)
+        if not item:
+            raise RuntimeError("角色不存在")
+    else:
+        ep, item = _drama_find_shot(data, item_id)
+        if not item:
+            raise RuntimeError("镜头不存在")
+    if target == "char" and kind == "trait":
+        raw, ext = _drama_asset_bytes(params)
+        rel = f"chars/{item_id}_trait{len([r for r in item.get('traits') or [] if r]) + 1}.{ext}"
+        (DRAMA_DIR / pid / rel).parent.mkdir(parents=True, exist_ok=True)
+        (DRAMA_DIR / pid / rel).write_bytes(raw)
+
+        def apply(d):
+            it = next((x for x in d["chars"] if x["id"] == item_id), None)
+            if not it:
+                raise RuntimeError("角色已被删除")
+            it["traits"] = [r for r in (it.get("traits") or []) if r] + [rel]
+            it["traitTaskId"] = None
+        return _drama_mutate(pid, apply)
     field = "asset" if target == "char" else {"first": "firstFrame", "clip": "clip"}[kind]
     raw, ext = _drama_asset_bytes(params)
-    rel = (f"chars/{item_id}.{ext}" if target == "char" else f"shots/{item_id}_{kind}.{ext}")
-    data = _drama_read(pid)
-    items = data["chars"] if target == "char" else data["shots"]
-    item = next((x for x in items if x["id"] == item_id), None)
-    if not item:
-        raise RuntimeError("角色不存在" if target == "char" else "镜头不存在")
-    old = item.get(field)
-    path = DRAMA_DIR / pid / rel
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(raw)
-    if old and old != rel:
-        try:
-            (DRAMA_DIR / pid / old).unlink()
-        except OSError:
-            pass
+    if target == "char":
+        rel = f"chars/{item_id}.{ext}"
+        old = item.get(field)
+        path = DRAMA_DIR / pid / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        if old and old != rel:
+            try:
+                (DRAMA_DIR / pid / old).unlink()
+            except OSError:
+                pass
 
+        def apply(d):
+            it = next((x for x in d["chars"] if x["id"] == item_id), None)
+            if not it:
+                raise RuntimeError("目标已被删除")
+            it[field] = rel
+            it["portraitTaskId"] = None
+        return _drama_mutate(pid, apply)
+
+    # 关键镜抽卡(P1.2):镜头成品不覆盖,追加到 takes 候选墙;新成品自动成为当前使用项。
+    # 追加/淘汰/落盘全部在 apply(_drama_mutate 锁内最新状态)里做——外层快照上的改动会被丢弃。
     def apply(d):
-        it = next((x for x in (d["chars"] if target == "char" else d["shots"]) if x["id"] == item_id), None)
+        ep2, it = _drama_find_shot(d, item_id)
         if not it:
             raise RuntimeError("目标已被删除")
+        takes = [t for t in (it.get("takes") or []) if t.get("kind") == kind]
+        # 候选墙容量 4:超过时淘汰最旧(文件+条目)
+        while len(takes) >= 4:
+            old_take = takes.pop(0)
+            try:
+                (DRAMA_DIR / pid / old_take["rel"]).unlink()
+            except OSError:
+                pass
+            it["takes"] = [t for t in it["takes"] if t is not old_take]
+        idx = len(takes) + 1
+        take_id = f"t{idx}_{uuid.uuid4().hex[:4]}"
+        rel = f"shots/{item_id}_{kind}_{idx}_{uuid.uuid4().hex[:6]}.{ext}"
+        path = DRAMA_DIR / pid / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        it.setdefault("takes", []).append({"id": take_id, "kind": kind, "rel": rel,
+                                           "ts": datetime.datetime.now().isoformat()})
+        it[f"{kind}TakeSel"] = take_id
         it[field] = rel
-        if target == "shot":
-            it["firstTaskId" if kind == "first" else "clipTaskId"] = None
-        else:
-            it["portraitTaskId"] = None
+        it["firstTaskId" if kind == "first" else "clipTaskId"] = None
+        # 成本透明化(P1.3):把本次生成花费累加到镜头上(前端从 studio 任务 usage 捎带)
+        try:
+            cost = float(params.get("cost") or 0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        if cost > 0:
+            it["cost"] = round(float(it.get("cost") or 0) + cost, 4)
     return _drama_mutate(pid, apply)
 
 
@@ -2688,8 +2978,8 @@ def _ffprobe_has_audio(path):
         return False
 
 
-def _drama_compose(pid, burn_subs=False):
-    """拼接全部已生成镜头成片。
+def _drama_compose(pid, eid, burn_subs=False):
+    """拼接本集全部已生成镜头成片(输出 composed_<eid>.mp4,按集归档)。
     1) 无配音需求时:流复制(-c copy)秒拼零转码——但 concat demuxer 拼部分 H.264 流
        (实测可灵成片,B 帧/访问单元边界问题)会把视频流拼坏:包数缺失、pts 拉长
        (5×5s 拼出 37s 视频+25s 音频),故拼完必须校验总时长;
@@ -2698,20 +2988,20 @@ def _drama_compose(pid, burn_subs=False):
        (adelay 起始 0.5s)混入原音轨(视频够长就截断配音、不够则音频延到片尾淡出),
        再 concat;burn_subs 同时把该镜 lines 烧成底部字幕。"""
     data = _drama_read(pid)
-    shots = [s for s in data["shots"] if s.get("clip")]
+    shots = [s for s in _drama_ep_by_id(data, eid).get("shots", []) if s.get("clip")]
     clips = [DRAMA_DIR / pid / s["clip"] for s in shots]
     clips = [p for p in clips if p.exists()]
     if not clips:
         raise RuntimeError("还没有任何镜头成片,先生成视频")
     proj_dir = DRAMA_DIR / pid
-    out = proj_dir / "composed.mp4"
+    out = proj_dir / f"composed_{eid}.mp4"
     tts_list = [DRAMA_DIR / pid / s["tts"] for s in shots if s.get("tts")]
     tts_list = [p for p in tts_list if p.exists()]
     need_mix = bool(tts_list) or burn_subs
     expect = sum(_ffprobe_duration(p) for p in clips)
     ok = False
     if not need_mix and len(clips) > 1:
-        lst = proj_dir / "concat.txt"
+        lst = proj_dir / f"concat_{eid}.txt"
         lst.write_text("".join(f"file '{p.as_posix()}'\n" for p in clips), encoding="utf-8")
         base = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                 "-f", "concat", "-safe", "0", "-i", lst.as_posix()]
@@ -2802,7 +3092,7 @@ def _drama_compose(pid, burn_subs=False):
                                 (who.strip() + ":" + say).strip()))
                     t0 += _ffprobe_duration(clips[i2]) or 5
                 if srt_lines:
-                    srt = proj_dir / "subs.srt"
+                    srt = proj_dir / f"subs_{eid}.srt"
                     srt.write_text("\n".join(srt_lines), encoding="utf-8")
                     # ffmpeg 的 cwd = 项目根(server 启动目录),用相对路径免去 Windows 盘符转义
                     srt_rel = srt.relative_to(ROOT).as_posix()
@@ -2828,7 +3118,220 @@ def _drama_compose(pid, burn_subs=False):
                 raise RuntimeError("ffmpeg 重编码合成失败" + (f":{err}" if err else ""))
         if expect > 0 and abs(_ffprobe_duration(out) - expect) >= 0.8:
             raise RuntimeError("合成结果时长异常,请检查各镜成片是否可播")
-    return _drama_mutate(pid, lambda d: d.__setitem__("composed", "composed.mp4"))
+    rel = f"composed_{eid}.mp4"
+
+    def apply(d):
+        _drama_ep_by_id(d, eid)["composed"] = rel
+    return _drama_mutate(pid, apply)
+
+
+def _drama_remix(pid):
+    """全剧统一重混(P2.6):把所有集的成片按集序拼成 series.mp4——
+    1) 每集先检查 composed_<eid>.mp4 存在;不存在则报错提示先合成该集;
+    2) 每段先响度统一(loudnorm 双遍标准 I=-16 LRA=11 TP=-1.5,竖屏短剧主流响度),
+       画幅统一到第一段(缩放+黑边),重编码保证拼接兼容(逐段 temp 文件);
+    3) 片头字卡(剧名,黑底白字 2s)与片尾字卡(剧名·完,2s)可开关(默认开);
+    4) 拼接后校验总时长;输出 series.mp4。"""
+    data = _drama_read(pid)
+    eps = data.get("episodes", [])
+    proj_dir = DRAMA_DIR / pid
+    segs = []
+    for ep in eps:
+        p = proj_dir / f"composed_{ep['id']}.mp4"
+        if not p.exists():
+            raise RuntimeError(f"第 {ep.get('index', '?')} 集还没有成片,先逐集合成")
+        segs.append(p)
+    if not segs:
+        raise RuntimeError("还没有任何集成片")
+    # 画幅基准:第一段
+    w, h = _ffprobe_size(segs[0])
+    if not w or not h:
+        raise RuntimeError("无法读取首段画幅")
+    tmp_dir = proj_dir / "_remix"
+    tmp_dir.mkdir(exist_ok=True)
+    normed = []
+    for i, seg in enumerate(segs):
+        out = tmp_dir / f"seg{i}.mp4"
+        # 响度归一:单遍动态 loudnorm(双遍在极短/极静音频上会算出越界 measured 值报
+        # "Result too large",单遍已足够日常统一);loudnorm 本身失败再退纯重编码兜底。
+        base_args = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", seg.as_posix(),
+                     "-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2",
+                     "-ar", "48000", "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                     "-c:a", "aac", "-b:a", "192k"]
+        # 两条 attempt 都以输出文件收尾:base_args 本身就是完整命令(尾元素=输出)。
+        attempts = [base_args[:-1] + ["-af", "loudnorm=I=-16:LRA=11:TP=-1.5", out.as_posix()],
+                    base_args + [out.as_posix()]]
+        r2 = None
+        for args2 in attempts:
+            r2 = subprocess.run(args2, timeout=600, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if r2.returncode == 0 and out.exists() and out.stat().st_size > 1000:
+                break
+        if r2 is None or r2.returncode != 0 or not out.exists() or out.stat().st_size < 1000:
+            raise RuntimeError("响度统一重编码失败:" + ((r2.stderr if r2 else b"") or b"").decode("utf-8", "replace")[-200:])
+        normed.append(out)
+    # 片头/片尾字卡
+    title = (data.get("title") or "").strip() or "短剧"
+    def card(text, out):
+        f = tmp_dir / "card.txt"
+        f.write_text(text, encoding="utf-8")
+        r = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                            "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:d=2:r=25",
+                            "-vf", f"drawtext=textfile={f.as_posix()}:fontcolor=white:fontsize={h//14}:x=(w-text_w)/2:y=(h-text_h)/2",
+                            "-t", "2", "-c:v", "libx264", "-preset", "fast", "-crf", "20", out.as_posix()],
+                           timeout=120, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return r.returncode == 0 and out.exists()
+    head = tmp_dir / "head.mp4"
+    tail = tmp_dir / "tail.mp4"
+    has_head = card(title, head)
+    has_tail = card(f"{title}·完", tail)
+    final = [p for p in ([head] if has_head else []) + normed + ([tail] if has_tail else [])]
+    out_path = proj_dir / "series.mp4"
+    lst = tmp_dir / "series.txt"
+    lst.write_text("".join(f"file '{p.as_posix()}'\n" for p in final), encoding="utf-8")
+    expect = sum(_ffprobe_duration(p) for p in final)
+    r = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                        "-f", "concat", "-safe", "0", "-i", lst.as_posix(),
+                        "-c", "copy", out_path.as_posix()],
+                       timeout=900, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    ok = (r.returncode == 0 and out_path.exists() and out_path.stat().st_size > 1000
+          and expect > 0 and abs(_ffprobe_duration(out_path) - expect) < 1.0)
+    if not ok:
+        # copy 拼不动(帧率/参数差异)退重编码 concat filter
+        inputs = []
+        for p in final:
+            inputs += ["-i", p.as_posix()]
+        n = len(final)
+        vs = "".join(f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}];" for i in range(n))
+        all_a = all(_ffprobe_has_audio(p) for p in final)
+        if all_a:
+            filt = vs + "".join(f"[{i}:a]aresample=48000[a{i}];" for i in range(n)) + "".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[v][a]"
+            maps = ["-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-c:a", "aac", "-b:a", "192k"]
+        else:
+            filt = vs + "".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v]"
+            maps = ["-map", "[v]", "-c:v", "libx264", "-preset", "fast", "-crf", "20"]
+        r2 = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"] + inputs +
+                            ["-filter_complex", filt] + maps + [out_path.as_posix()],
+                            timeout=1800, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if r2.returncode != 0:
+            raise RuntimeError("series 拼接失败:" + (r2.stderr or b"").decode("utf-8", "replace")[-200:])
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return out_path
+
+def _drama_remix_start(pid):
+    """全剧重混异步任务:状态写进 project.remixJob,前端轮询 GET 项目。"""
+    data = _drama_read(pid)
+    cur = data.get("remixJob") or {}
+    if cur.get("state") == "running":
+        raise RuntimeError("全剧重混已在进行中")
+    token = _drama_new_id()
+    job = {"state": "running", "error": None, "startedAt": _drama_now(), "finishedAt": None, "token": token}
+
+    def apply(d):
+        d["remixJob"] = dict(job)
+    _drama_mutate(pid, apply)
+
+    def run():
+        try:
+            _drama_remix(pid)
+            ok, err = True, None
+        except Exception as e:
+            ok, err = False, _pub_err(e)
+
+        def done(d):
+            cur = d.get("remixJob") or {}
+            if cur.get("token") != token or cur.get("state") != "running":
+                return
+            cur.update({"state": "done" if ok else "error", "error": err, "finishedAt": _drama_now()})
+        try:
+            _drama_mutate(pid, done)
+        except Exception:
+            pass
+
+    threading.Thread(target=run, daemon=True, name=f"drama-remix-{pid}").start()
+    return _drama_read(pid)
+
+def _drama_compose_warnings(pid, eid):
+    """合成前/后的「配音比成片长」截断预警清单(只读,不落盘)。"""
+    data = _drama_read(pid)
+    out = []
+    for s in _drama_ep_by_id(data, eid).get("shots", []):
+        cd = _ffprobe_duration(DRAMA_DIR / pid / s["clip"]) if s.get("clip") else 0
+        if s.get("ttsDur") and cd > 0 and s["ttsDur"] > cd + 0.3 and not s.get("nativeDialog"):
+            out.append({"id": s["id"], "scene": s.get("scene") or "",
+                        "ttsDur": s["ttsDur"], "clipDur": round(cd, 2)})
+    return out
+
+
+# ---------- 短剧后台任务(compose/tts 阻塞重,挪进线程;状态挂 project.json,前端轮询) ----------
+# 同一个 job 在跑时重复点开始:直接拒(防两个 ffmpeg 同文件互踩)。
+_DRAMA_JOB_LOCK = threading.Lock()
+_DRAMA_JOB_KINDS = ("compose", "tts")
+
+
+def _drama_job_start(pid, kind, eid=None, sid=None, burn_subs=True):
+    if kind not in _DRAMA_JOB_KINDS:
+        raise RuntimeError("任务类型不合法")
+    # 先做前置校验(同步返回错误,不等轮询):缺成片/缺台词立刻反馈
+    data = _drama_read(pid)
+    ep = _drama_ep_by_id(data, eid) if eid else None
+    shot = None
+    if kind == "tts":
+        shot = next((s for s in ep.get("shots", []) if s["id"] == sid), None) if ep else None
+        if not shot:
+            raise RuntimeError("镜头不存在")
+        if not [l for l in (shot.get("lines") or "").splitlines() if l.strip()]:
+            raise RuntimeError("这一镜没有对白:先在台词区写几句(格式「角色名:台词」)")
+        cur = shot.get("ttsJob") or {}
+        if cur.get("state") == "running":
+            raise RuntimeError("该镜配音已在进行中")
+    else:
+        if not any(s.get("clip") and (DRAMA_DIR / pid / s["clip"]).exists()
+                   for s in ep.get("shots", [])):
+            raise RuntimeError("还没有任何镜头成片,先生成视频")
+        cur = ep.get("composeJob") or {}
+        if cur.get("state") == "running":
+            raise RuntimeError("本集已在合成中")
+    token = _drama_new_id()
+    job = {"state": "running", "error": None, "startedAt": _drama_now(),
+           "finishedAt": None, "token": token}
+    if kind == "tts":
+        def apply(d):
+            it = next((s for s in _drama_ep_by_id(d, eid).get("shots", []) if s["id"] == sid), None)
+            if it:
+                it["ttsJob"] = dict(job)
+    else:
+        def apply(d):
+            _drama_ep_by_id(d, eid)["composeJob"] = dict(job)
+    _drama_mutate(pid, apply)
+    if kind == "tts":
+        target, fn = ("shot", lambda: _drama_shot_tts(pid, eid, sid))
+    else:
+        target, fn = ("episode", lambda: _drama_compose(pid, eid, burn_subs))
+
+    def run():
+        try:
+            fn()
+            ok, err = True, None
+        except Exception as e:
+            ok, err = False, _pub_err(e)
+        try:
+            def done(d):
+                it = (_drama_ep_by_id(d, eid) if kind == "compose"
+                      else next((s for s in _drama_ep_by_id(d, eid).get("shots", [])
+                                 if s["id"] == sid), None))
+                if not it:
+                    return
+                cur = it.get(kind + "Job") or {}
+                if cur.get("token") != token or cur.get("state") != "running":
+                    return  # 已被新一轮启动覆盖/已清除
+                cur.update({"state": "done" if ok else "error", "error": err,
+                            "finishedAt": _drama_now()})
+            _drama_mutate(pid, done)
+        except Exception:
+            pass  # 项目/集被删:状态无处可写,静默结束
+
+    threading.Thread(target=run, daemon=True, name=f"drama-{kind}-{eid or pid}").start()
+    return _drama_read(pid)
 
 
 def _srt_ts(sec):
@@ -3212,6 +3715,91 @@ def _ops_analyze(params):
             "structure": _ops_parse_strlist(obj.get("structure"), 4),
             "topicIdeas": _ops_parse_strlist(obj.get("topicIdeas"), 5)}
 
+
+# ---------- 通用「✨优化」:五类对象(人设/标题/正文/标签/配图提示词)给建议清单+改进文本 ----------
+# 采纳制:LLM 只给 {problem, suggestion, revised},revised 由用户在弹窗里手动采纳,绝不直接改内容。
+_OPS_OPTIMIZE_LIMITS = {
+    "persona": {"label": "人设卡", "n": 1500},
+    "title": {"label": "标题", "n": 800},
+    "body": {"label": "正文", "n": 8000},
+    "tags": {"label": "话题标签", "n": 600},
+    "prompt": {"label": "配图提示词", "n": 3000},
+}
+_OPS_OPTIMIZE_SYSTEM = "\n".join([
+    "你是小红书/抖音的资深内容运营顾问。用户会给出某一部分的当前内容(可能还带账号人设与选题背景)。",
+    "只输出一个 JSON 数组,不要解释、不要 markdown 代码块。数组 3~5 项,每项:",
+    '{"problem":"这条内容当前的问题/可提升点,一句话","suggestion":"怎么改的思路,一句话(≤60字)",'
+    '"revised":"按该思路改进后的完整文本,可直接替换使用"}',
+    "要求:每条建议针对一个不同的问题;revised 必须是完整可用的成品(不是片段、不是 diff);"
+    "保持账号人设口吻与平台格式;不敷衍(不要出现「可以更生动」这类没有改进文本的空话)。",
+])
+
+
+def _ops_optimize(params):
+    """通用优化建议(不落盘):{target, text, personaId?, topic?, platform?} → [{problem,suggestion,revised}]。
+    target ∈ persona|title|body|tags|prompt。配额在路由层走 ip+":opt" 宽松池。"""
+    if not GEN_STUDIO["upstream_key"]:
+        raise GenError("upstream_unavailable")
+    target = params.get("target")
+    if target not in _OPS_OPTIMIZE_LIMITS:
+        raise GenError("invalid_target")
+    text = (params.get("text") if isinstance(params.get("text"), str) else "").strip()
+    if len(text) < 2:
+        raise GenError("invalid_prompt")
+    text = text[:_OPS_OPTIMIZE_LIMITS[target]["n"]]
+    platform = params.get("platform") if params.get("platform") in _OPS_PLATFORMS else None
+    persona = None
+    pid = str(params.get("personaId") or "")
+    if pid:
+        try:
+            persona = _ops_load("personas", pid)
+        except Exception:
+            persona = None
+    user = ["优化对象:" + _OPS_OPTIMIZE_LIMITS[target]["label"],
+            "当前内容:\n" + text]
+    if persona:
+        p = persona["persona"]
+        user.append("账号人设:" + persona["name"] + "——" + (p["positioning"] or "") +
+                    (";口吻:" + p["tone"] if p["tone"] else "") +
+                    (";口头禅:「" + p["catchphrase"] + "」" if p["catchphrase"] else ""))
+    if platform:
+        user.append("目标平台:" + _OPS_PLATFORM_META[platform]["rules"])
+    topic = (params.get("topic") if isinstance(params.get("topic"), str) else "").strip()[:400]
+    if topic:
+        user.append("所属选题:" + topic)
+    fmt = {"persona": "输出要求:revised 必须是多行「字段: 内容」格式,字段名固定为:定位、目标人群、语气、口头禅、视觉风格、禁忌;每行一个字段,半角冒号,不要用【】、序号或加粗,不要输出这 6 个字段之外的任何内容。","tags": "输出要求:revised 是一行标签组合,标签之间用空格分隔,不带 # 号。"}.get(target)
+    if fmt:
+        user.append(fmt)
+    payload, _ = _gen_upstream("/chat/completions", {
+        "model": DRAMA_STORY_MODEL,
+        "messages": [{"role": "system", "content": _OPS_OPTIMIZE_SYSTEM},
+                     {"role": "user", "content": "\n".join(user)}],
+        "max_tokens": 3000}, timeout_s=120)
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise GenError("upstream_invalid_response")
+    out = []
+    try:
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", (content or "").strip(), flags=re.S).strip()
+        m = re.search(r"\[.*\]", cleaned, re.S)
+        arr = json.loads(m.group(0) if m else cleaned)
+    except Exception:
+        arr = None
+    for it in arr if isinstance(arr, list) else []:
+        if not isinstance(it, dict):
+            continue
+        problem = str(it.get("problem") or "").strip()[:120]
+        suggestion = str(it.get("suggestion") or "").strip()[:200]
+        revised = str(it.get("revised") or "").strip()
+        if not problem or not revised:
+            continue
+        out.append({"problem": problem, "suggestion": suggestion, "revised": revised})
+    if not out:
+        print(json.dumps({"event": "ops_optimize_parse_fail", "target": target,
+                          "head": (content or "")[:160]}, ensure_ascii=False))
+        raise GenError("upstream_invalid_response")
+    return out[:5]
 
 # 素材库:现成小多利资产的只读白名单(按目录扫描,新文件自动出现);P2 起开放视频
 # (mp4/webp 动画)并把短剧工作台的成片/镜头成片挂进来(name = drama-<pid>-composed|shot-<sid>.mp4)
@@ -3641,23 +4229,39 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 _drama_delete(pid)
                 self._json({"ok": True})
                 return
+            # 统一读一次 body(空体容错);eid 缺省=当前集(兼容旧前端/旧测试)
+            try:
+                params = self._read_json()
+            except Exception:
+                params = {}
+            eid = params.get("eid") if isinstance(params.get("eid"), str) else ""
+
+            def _need_eid():
+                return eid if eid and DRAMA_EID_RE.fullmatch(eid) else _drama_read(pid)["currentEpisode"]
+
+            def _shot_eid(sid):
+                """镜头级操作定位集:body eid 若真指向该镜就用;否则跨集找(兼容旧前端)。"""
+                data = _drama_read(pid)
+                if eid and DRAMA_EID_RE.fullmatch(eid):
+                    ep = next((e for e in data["episodes"] if e["id"] == eid), None)
+                    if ep and any(s["id"] == sid for s in ep.get("shots", [])):
+                        return eid
+                found = _drama_find_shot(data, sid)
+                if not found[1]:
+                    raise RuntimeError("镜头不存在")
+                return found[0]["id"]
+
             if sub == "compose":
-                # burnSubs=false 时不烧字幕(前端勾选);缺省仍烧(兼容不带 body 的旧调用)。
-                # TTS 配音有就自动混
-                try:
-                    body = self._read_json()
-                except Exception:
-                    body = {}
-                project = _drama_compose(pid, burn_subs=(body.get("burnSubs") is not False))
-                warnings = []
-                for s in project.get("shots", []):
-                    cd = _ffprobe_duration(DRAMA_DIR / pid / s["clip"]) if s.get("clip") else 0
-                    if s.get("ttsDur") and cd > 0 and s["ttsDur"] > cd + 0.3 and not s.get("nativeDialog"):
-                        warnings.append({"id": s["id"], "scene": s.get("scene") or "",
-                                         "ttsDur": s["ttsDur"], "clipDur": round(cd, 2)})
-                self._json({"ok": True, "project": project, "warnings": warnings})
+                # 异步合成:立即返回任务状态,前端轮询 GET 项目(composeJob);burnSubs=false 时不烧字幕
+                project = _drama_job_start(pid, "compose", _need_eid(),
+                                           burn_subs=(params.get("burnSubs") is not False))
+                self._json({"ok": True, "project": project})
                 return
-            params = self._read_json()
+            if sub == "remix":
+                # 全剧统一重混:loudnorm 归一 + 跨集拼接 series.mp4(片头片尾字卡可配)
+                project = _drama_remix_start(pid)
+                self._json({"ok": True, "project": project})
+                return
             if sub == "update":
                 self._json({"ok": True, "project": _drama_project_update(pid, params)})
             elif sub == "storyboard":
@@ -3665,42 +4269,63 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 ip = self._client_ip()
                 if not _gen_quota_allow(ip + ":opt", "image", 0):
                     raise GenError("rate_limit")
-                project, added = _drama_storyboard(pid, params)
+                project, added = _drama_storyboard(pid, _need_eid(), params)
                 self._json({"ok": True, "project": project, "added": added})
             elif sub == "asset":
                 self._json({"ok": True, "project": _drama_asset_store(pid, params)})
             elif sub == "shots/add":
-                self._json({"ok": True, "project": _drama_shot_add(pid, params)})
+                self._json({"ok": True, "project": _drama_shot_add(pid, _need_eid(), params)})
             elif sub == "shots/reorder":
-                self._json({"ok": True, "project": _drama_shot_reorder(pid, params)})
+                self._json({"ok": True, "project": _drama_shot_reorder(pid, _need_eid(), params)})
             elif sub == "shots/clear":
-                self._json({"ok": True, "project": _drama_shots_clear(pid)})
+                self._json({"ok": True, "project": _drama_shots_clear(pid, _need_eid())})
+            elif sub == "eps/add":
+                project, new_eid = _drama_episode_add(pid, params)
+                self._json({"ok": True, "project": project, "episodeId": new_eid})
             elif sub == "chars/add":
                 self._json({"ok": True, "project": _drama_char_add(pid, params)})
+            elif sub.startswith("eps/"):
+                m3 = re.fullmatch(r"eps/(e[a-f0-9]{11})/(update|delete|select|compose)", sub)
+                if not m3:
+                    self._json({"ok": False, "error": "unknown endpoint"}, 404)
+                    return
+                if m3.group(2) == "compose":
+                    project = _drama_job_start(pid, "compose", m3.group(1),
+                                               burn_subs=(params.get("burnSubs") is not False))
+                elif m3.group(2) == "update":
+                    project = _drama_episode_update(pid, m3.group(1), params)
+                elif m3.group(2) == "delete":
+                    project = _drama_episode_delete(pid, m3.group(1))
+                else:
+                    project = _drama_episode_select(pid, m3.group(1))
+                self._json({"ok": True, "project": project})
             elif sub.startswith("shots/") or sub.startswith("chars/"):
-                m2 = re.fullmatch(r"(shots|chars)/([a-f0-9]{12})/(update|delete|refs/add|refs/delete|tts|lipsync|reprompt)", sub)
+                m2 = re.fullmatch(r"(shots|chars)/([a-f0-9]{12})/(update|delete|refs/add|refs/delete|traits/delete|tts|lipsync|reprompt)", sub)
                 if not m2:
                     self._json({"ok": False, "error": "unknown endpoint"}, 404)
                     return
                 kind, item_id, action = m2.group(1), m2.group(2), m2.group(3)
                 if kind == "shots":
+                    e_id = _shot_eid(item_id)
                     if action == "tts":
-                        project = _drama_shot_tts(pid, item_id)
+                        project = _drama_job_start(pid, "tts", e_id, item_id)
                     elif action == "lipsync":
-                        project = _drama_shot_lipsync(pid, item_id)
+                        project = _drama_shot_lipsync(pid, e_id, item_id)
                     elif action == "reprompt":
                         # desc→提示词派生走 storyboard 同一条宽松额度(ip+":opt"),不占生图额度
                         ip = self._client_ip()
                         if not _gen_quota_allow(ip + ":opt", "image", 0):
                             raise GenError("rate_limit")
-                        project = _drama_shot_reprompt(pid, item_id, params)
+                        project = _drama_shot_reprompt(pid, e_id, item_id, params)
                     else:
-                        project = (_drama_shot_update(pid, item_id, params) if action == "update"
-                                   else _drama_shot_delete(pid, item_id))
+                        project = (_drama_shot_update(pid, e_id, item_id, params) if action == "update"
+                                   else _drama_shot_delete(pid, e_id, item_id))
                 elif action == "refs/add":
                     project = _drama_char_refs_add(pid, item_id, params)
                 elif action == "refs/delete":
                     project = _drama_char_refs_delete(pid, item_id, params)
+                elif action == "traits/delete":
+                    project = _drama_char_trait_delete(pid, item_id, params)
                 else:
                     project = (_drama_char_update(pid, item_id, params) if action == "update"
                                else _drama_char_delete(pid, item_id))
@@ -3723,8 +4348,8 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
             if path == "/api/ops/personas":
                 self._json({"ok": True, "persona": _ops_persona_create(self._read_json())})
                 return
-            if path in ("/api/ops/copy", "/api/ops/analyze"):
-                # 文案生成/对标拆解:LLM 调用走 ip+":opt" 宽松额度(不占生图额度),同 brainstorm 门禁
+            if path in ("/api/ops/copy", "/api/ops/analyze", "/api/ops/optimize"):
+                # 文案/拆解/优化建议:LLM 调用走 ip+":opt" 宽松额度(不占生图额度),同 brainstorm 门禁
                 ip = self._client_ip()
                 if _gen_locked(ip):
                     raise GenError("invite_locked")
@@ -3733,8 +4358,10 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 params = self._read_json()
                 if path == "/api/ops/copy":
                     self._json({"ok": True, "copies": _ops_copy(params)})
-                else:
+                elif path == "/api/ops/analyze":
                     self._json({"ok": True, **_ops_analyze(params)})
+                else:
+                    self._json({"ok": True, "items": _ops_optimize(params)})
                 return
             if path == "/api/ops/posts":
                 self._json({"ok": True, "post": _ops_post_create(self._read_json())})
@@ -4248,6 +4875,20 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 self._json({"ok": True, "project": _drama_read(m.group(1))})
             except Exception:
                 self._json({"ok": False, "error": "项目不存在"}, 404)
+            return
+        m = re.fullmatch(r"/api/drama/projects/([a-f0-9]{12})/warnings", parsed.path)
+        if m:
+            # 配音比成片长的截断预警(前端合成 done 后拉取);eid 缺省=当前集
+            if self._gen_gate():
+                return
+            q = self._q()
+            eid = (q.get("eid") or [""])[0]
+            try:
+                if not (eid and DRAMA_EID_RE.fullmatch(eid)):
+                    eid = _drama_read(m.group(1))["currentEpisode"]
+                self._json({"ok": True, "warnings": _drama_compose_warnings(m.group(1), eid)})
+            except Exception as e:
+                self._json({"ok": False, "error": _pub_err(e)}, 400)
             return
         if parsed.path == "/api/ops/meta":
             if self._gen_gate():

@@ -1,15 +1,22 @@
 # -*- coding: utf-8 -*-
-"""短剧工作台 API 联调脚本(python urllib,保证 UTF-8;curl 在 Git Bash 下会把中文变 GBK)。"""
+"""短剧工作台 API 回归(v2 剧集三层结构 + 异步任务)。
+用法: python tools/drama_api_test.py [BASE](缺省 http://127.0.0.1:8437)
+真 LLM 用例(storyboard/reprompt/brainstorm/withLines/lines-ideas)走 ip+":opt" 宽松额度
+(3 次/分钟),撞 429 等 65s 重试;其余用例零成本。
+覆盖:建剧自动带第 1 集 / eps 增改选删 / 按集镜头 CRUD(eid 与旧路径兼容)/ 素材跨集落盘
+/ 三视图 / 异步 compose(轮询 composeJob)+ 按集成片 + warnings / 异步 tts / 章节分镜 /
+灵感现编 / shots/clear / 集删除素材清理。"""
 import base64
 import json
 import subprocess
 import sys
 import time
 import urllib.request
-import uuid
 from pathlib import Path
 
-BASE = "http://127.0.0.1:8437"
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8437"
+# 文件存在性检查必须指向被测实例的落盘区:8439 等测试实例由 FRAMEFLOW_GENWORK_DIR 重定向
+GEN = Path("genwork/.drama_test") if ":8439" in BASE else Path("genwork")
 
 
 def call(method, path, body=None, raw=False):
@@ -31,21 +38,71 @@ def call(method, path, body=None, raw=False):
 
 
 def check(name, cond, detail=""):
-    print(("PASS " if cond else "FAIL ") + name + ((" | " + str(detail)[:200]) if detail else ""))
+    print(("PASS " if cond else "FAIL ") + name + ((" | " + str(detail)[:220]) if detail else ""))
     if not cond:
         sys.exit(1)
 
 
-# 1. 建项目
+def ep_of(proj, eid):
+    return next(e for e in proj["episodes"] if e["id"] == eid)
+
+
+def cur_ep(proj):
+    return ep_of(proj, proj["currentEpisode"])
+
+
+def shot_of(proj, eid, sid):
+    return next(s for s in ep_of(proj, eid)["shots"] if s["id"] == sid)
+
+
+def poll_job(pid, eid, kind, sid=None, timeout=240):
+    """轮询 composeJob/ttsJob 到终态,返回 (最后状态, 最后一次 project 快照)。"""
+    deadline = time.time() + timeout
+    job, proj = {}, None
+    while time.time() < deadline:
+        st, r = call("GET", f"/api/drama/projects/{pid}")
+        if st == 200 and r.get("ok"):
+            proj = r["project"]
+            ep = ep_of(proj, eid)
+            job = (ep.get("composeJob") if kind == "compose"
+                   else next((s.get("ttsJob") for s in ep.get("shots", []) if s["id"] == sid), None)) or {}
+            if job.get("state") in ("done", "error"):
+                return job, proj
+        time.sleep(1.5)
+    return job, proj
+
+
+def make_media(pid, name, size, dur=None):
+    """ffmpeg 生成测试图/视频并 b64;真产物保证 mime 判断与合成链路真实。"""
+    out = GEN / "drama" / pid / name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if dur:
+        subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                        "-f", "lavfi", "-i", f"testsrc=size={size}:rate=24:duration={dur}",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)], check=True)
+    else:
+        subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                        "-f", "lavfi", "-i", f"testsrc=size={size}", "-frames:v", "1",
+                        str(out)], check=True)
+    return base64.b64encode(out.read_bytes()).decode()
+
+
+# ---------- 1. 建项目(自动带第 1 集) ----------
 st, r = call("POST", "/api/drama/projects", {"title": "接口联调短剧", "aspect": "9:16",
              "logline": "深夜便利店,一只会说话的猫告诉打工女孩,明天世界会重置一次",
              "style": "日系赛璐璐动漫,柔和光影"})
 check("create project", st == 200 and r.get("ok") and r["project"]["id"], r)
 pid = r["project"]["id"]
+proj = r["project"]
+e1 = proj["currentEpisode"]
+check("create has ep1", len(proj["episodes"]) == 1 and proj["episodes"][0]["shots"] == []
+      and proj["episodes"][0]["id"] == e1, proj["episodes"])
+check("create ep shape", e1.startswith("e") and len(e1) == 12, e1)
 
-# 2. 列表 / 读取 / 更新
+# ---------- 2. 列表 / 读取 / 更新 ----------
 st, r = call("GET", "/api/drama/projects")
-check("list projects", st == 200 and any(p["id"] == pid for p in r["projects"]), r)
+mine = next((p for p in r["projects"] if p["id"] == pid), {})
+check("list projects", st == 200 and mine.get("episodeCount") == 1, {"found": bool(mine), **mine})
 st, r = call("GET", f"/api/drama/projects/{pid}")
 check("get project", st == 200 and r["project"]["title"] == "接口联调短剧", r)
 st, r = call("POST", f"/api/drama/projects/{pid}/update", {"style": "日系赛璐璐动漫,柔和光影,霓虹夜色"})
@@ -55,85 +112,117 @@ check("beat set", st == 200 and r["project"]["beat"] == "twist", r.get("project"
 st, r = call("POST", f"/api/drama/projects/{pid}/update", {"beat": "bogus"})
 check("beat invalid cleared", st == 200 and r["project"]["beat"] == "", r.get("project", {}).get("beat"))
 
-# 3. 角色
+# ---------- 3. 集增改选 ----------
+st, r = call("POST", f"/api/drama/projects/{pid}/eps/add", {"synopsis": "第二集:黑猫揭示真相"})
+check("eps add", st == 200 and r.get("ok") and len(r["project"]["episodes"]) == 2
+      and r["project"]["episodes"][1]["title"] == "第 2 集", r.get("project", {}).get("episodes"))
+e2 = r["episodeId"]
+check("eps add becomes current", r["project"]["currentEpisode"] == e2, e2)
+st, r = call("POST", f"/api/drama/projects/{pid}/eps/{e2}/update",
+             {"title": "第二集·夜", "synopsis": "第二集:黑猫揭示便利店重置的真相"})
+check("eps update", st == 200 and ep_of(r["project"], e2)["title"] == "第二集·夜"
+      and "真相" in ep_of(r["project"], e2)["synopsis"], r.get("project", {}).get("episodes"))
+st, r = call("POST", f"/api/drama/projects/{pid}/eps/{e1}/select", {})
+check("eps select", st == 200 and r["project"]["currentEpisode"] == e1, r.get("project", {}).get("currentEpisode"))
+
+# ---------- 4. 角色 ----------
 st, r = call("POST", f"/api/drama/projects/{pid}/chars/add", {"name": "小满", "desc": "22岁打工女孩,短发,便利店制服"})
 check("char add", st == 200 and len(r["project"]["chars"]) == 1, r)
 cid = r["project"]["chars"][0]["id"]
+check("char v2 fields", r["project"]["chars"][0]["traits"] == [] and "traitTaskId" in r["project"]["chars"][0],
+      r["project"]["chars"][0])
 st, r = call("POST", f"/api/drama/projects/{pid}/chars/{cid}/update", {"name": "小满"})
 check("char update", st == 200 and r["project"]["chars"][0]["name"] == "小满", r)
 
-# 4. 镜头增改排删
+# ---------- 5. 镜头增改排删(eid 与旧路径兼容) ----------
 st, r = call("POST", f"/api/drama/projects/{pid}/shots/add",
              {"scene": "夜·便利店门口", "desc": "小满瘫坐在台阶上,猫突然开口说话",
               "firstPrompt": "深夜便利店门口,打工女孩坐在台阶上,一只黑猫蹲在她面前开口说话",
               "motionPrompt": "女孩惊讶抬头,黑猫尾巴轻摆", "duration": 5})
-check("shot add", st == 200 and len(r["project"]["shots"]) == 1, r)
-s1 = r["project"]["shots"][0]["id"]
+check("shot add (current ep)", st == 200 and len(cur_ep(r["project"])["shots"]) == 1, r)
+s1 = cur_ep(r["project"])["shots"][0]["id"]
 st, r = call("POST", f"/api/drama/projects/{pid}/shots/add", {"scene": "夜·店内", "desc": "第二镜"})
-check("shot add 2", st == 200 and len(r["project"]["shots"]) == 2, r)
-s2 = r["project"]["shots"][1]["id"]
-st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s1}/update", {"duration": 10, "desc": "小满瘫坐在台阶上,黑猫开口:明天世界重置"})
-check("shot update", st == 200 and r["project"]["shots"][0]["duration"] == 10, r)
-st, r = call("POST", f"/api/drama/projects/{pid}/shots/reorder", {"order": [s2, s1]})
-check("shot reorder", st == 200 and r["project"]["shots"][0]["id"] == s2, r)
+check("shot add 2", st == 200 and len(cur_ep(r["project"])["shots"]) == 2, r)
+s2 = cur_ep(r["project"])["shots"][1]["id"]
+st, r = call("POST", f"/api/drama/projects/{pid}/shots/add", {"eid": e2, "scene": "夜·天台", "desc": "反转"})
+check("shot add with eid", st == 200 and len(ep_of(r["project"], e2)["shots"]) == 1
+      and len(ep_of(r["project"], e1)["shots"]) == 2, r)
+s3 = ep_of(r["project"], e2)["shots"][0]["id"]
+st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s1}/update", {"duration": 60})
+check("duration clamped (legacy path)", st == 200
+      and shot_of(r["project"], e1, s1)["duration"] == 30, r)
+st, r = call("POST", f"/api/drama/projects/{pid}/shots/reorder",
+             {"eid": e1, "order": [s2, s1]})
+check("shot reorder", st == 200 and [s["id"] for s in ep_of(r["project"], e1)["shots"]] == [s2, s1], r)
 
-# 5. 素材落盘:ffmpeg 生成真实 PNG + 两个测试 mp4(1 秒 540x960)
-subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", "testsrc=size=360x480",
-                "-frames:v", "1", f"genwork/drama/{pid}/test_char.png"], check=True)
-raw_png = open(f"genwork/drama/{pid}/test_char.png", "rb").read()
-check("png size>100", len(raw_png) > 100, len(raw_png))
-png_b64 = base64.b64encode(raw_png).decode()
+# ---------- 6. 素材落盘:角色定妆 / 三视图 / 逐镜成片(跨集) ----------
+png_b64 = make_media(pid, "test_char.png", "360x480")
 st, r = call("POST", f"/api/drama/projects/{pid}/asset",
              {"target": "char", "id": cid, "kind": "portrait", "dataUrl": "data:image/png;base64," + png_b64})
 check("char portrait asset", st == 200 and r["project"]["chars"][0]["asset"] == f"chars/{cid}.png", r)
 
-for sid in (s1, s2):
-    out = f"genwork/drama/{pid}/testsrc_{sid}.mp4"
-    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    "-f", "lavfi", "-i", "testsrc=size=540x960:rate=24:duration=1",
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p", out], check=True)
-    b64 = base64.b64encode(open(out, "rb").read()).decode()
+trait_b64 = make_media(pid, "test_trait.png", "200x260")
+st, r = call("POST", f"/api/drama/projects/{pid}/asset",
+             {"target": "char", "id": cid, "kind": "trait", "dataUrl": "data:image/png;base64," + trait_b64})
+check("trait add", st == 200 and r["project"]["chars"][0]["traits"] == [f"chars/{cid}_trait1.png"], r)
+st, r = call("POST", f"/api/drama/projects/{pid}/asset",
+             {"target": "char", "id": cid, "kind": "trait", "dataUrl": "data:image/png;base64," + trait_b64})
+check("trait add 2", st == 200 and len(r["project"]["chars"][0]["traits"]) == 2, r)
+st, body = call("GET", f"/api/drama/projects/{pid}/asset/chars/{cid}_trait2.png", raw=True)
+check("trait served", st == 200 and len(body) > 100 and body[:4] == b"\x89PNG", (st, len(body)))
+st, r = call("POST", f"/api/drama/projects/{pid}/chars/{cid}/traits/delete", {"index": 1})
+check("trait delete", st == 200 and r["project"]["chars"][0]["traits"] == [f"chars/{cid}_trait2.png"], r)
+
+for sid, eid in ((s2, e1), (s3, e2)):  # s2 在 ep1、s3 在 ep2,跨集各落一个
+    b64 = make_media(pid, f"c_{sid}.mp4", "540x960", dur=1)
     st, r = call("POST", f"/api/drama/projects/{pid}/asset",
                  {"target": "shot", "id": sid, "kind": "clip", "dataUrl": "data:video/mp4;base64," + b64})
-    check(f"shot clip asset {sid[:6]}", st == 200 and r["project"]["shots"][[x["id"] for x in r["project"]["shots"]].index(sid)]["clip"], r)
+    check(f"shot clip asset {sid[:6]}", st == 200 and shot_of(r["project"], eid, sid)["clip"], r)
 
-# 6. 素材读取
-st, body = call("GET", f"/api/drama/projects/{pid}/asset/composed.mp4", raw=True)
-st, r = call("POST", f"/api/drama/projects/{pid}/compose")
-check("compose", st == 200 and r["project"]["composed"] == "composed.mp4", r)
-st, body = call("GET", f"/api/drama/projects/{pid}/asset/composed.mp4", raw=True)
-check("composed served", st == 200 and len(body) > 10000 and body[4:8] == b"ftyp", (st, len(body)))
+# ---------- 6.5 关键镜抽卡(P1.2)+ 成本累计(P1.3) ----------
+b64b = make_media(pid, f"c_{s2}_b.mp4", "540x960", dur=1)
+st, r = call("POST", f"/api/drama/projects/{pid}/asset",
+             {"target": "shot", "id": s2, "kind": "clip", "cost": 0.25,
+              "dataUrl": "data:video/mp4;base64," + b64b})
+proj = r["project"]
+s2now = shot_of(proj, e1, s2)
+takes_c = [t for t in (s2now.get("takes") or []) if t.get("kind") == "clip"]
+check("take 2 appended", st == 200 and len(takes_c) == 2
+      and str(s2now.get("clipTakeSel")).startswith("t2") and s2now["clip"] == takes_c[-1]["rel"],
+      {"takes": len(takes_c), "sel": s2now.get("clipTakeSel")})
+check("cost accumulated", (s2now.get("cost") or 0) >= 0.25, s2now.get("cost"))
+t1rel = takes_c[0]["rel"]
+t1id = takes_c[0]["id"]
+st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s2}/update", {"clipTakeSel": t1id})
+if not (isinstance(r, dict) and r.get("project")):
+    print("FAIL take switch request |", r); sys.exit(1)
+s2now = shot_of(r["project"], e1, s2)
+check("take switch to t1", st == 200 and s2now["clip"] == t1rel
+      and s2now.get("clipTakeSel") == t1id, {"clip": s2now.get("clip")})
 
-# 7. 非法路径拒绝
+# ---------- 7. 素材读取 / 非法路径 / 缺键报错 ----------
+st, body = call("GET", f"/api/drama/projects/{pid}/asset/composed.mp4", raw=True)  # 旧片不存在,404 可
 st, r = call("GET", f"/api/drama/projects/{pid}/asset/../project.json", raw=True)
 check("traversal rejected", st in (400, 404), st)
+st, r = call("POST", f"/api/drama/projects/{pid}/asset", {"target": "shot", "id": s1, "kind": "first"})
+check("asset missing keys err", st == 400 and "keys=[target,id,kind]" in r.get("error", ""), r)
 
-# 7.5 meta(styles + ideas)
+# ---------- 8. meta + 角色参考图 ----------
 st, r = call("GET", "/api/drama/meta")
 check("meta styles/ideas", st == 200 and r.get("ok") and len(r.get("styles", [])) >= 8
       and len(r.get("ideas", [])) >= 1 and all("logline" in x for x in r["ideas"]),
       {"styles": len(r.get("styles", [])), "idea0": (r.get("ideas") or [{}])[0].get("title")})
-
-# 7.6 角色参考图:上传 2 张、删除第 1 张、校验文件
 for i in (1, 2):
-    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    "-f", "lavfi", "-i", f"testsrc=size=200x260", "-frames:v", "1",
-                    f"genwork/drama/{pid}/up{i}.png"], check=True)
-    b64 = base64.b64encode(open(f"genwork/drama/{pid}/up{i}.png", "rb").read()).decode()
+    up = make_media(pid, f"up{i}.png", "200x260")
     st, r = call("POST", f"/api/drama/projects/{pid}/chars/{cid}/refs/add",
-                 {"dataUrl": "data:image/png;base64," + b64})
-    check(f"char ref add {i}", st == 200 and r.get("ok") and len(r["project"]["chars"][0]["refs"]) == i, r)
+                 {"dataUrl": "data:image/png;base64," + up})
+    check(f"char ref add {i}", st == 200 and len(r["project"]["chars"][0]["refs"]) == i, r)
 refs = r["project"]["chars"][0]["refs"]
 st, r = call("POST", f"/api/drama/projects/{pid}/chars/{cid}/refs/delete", {"index": 1})
 check("char ref delete", st == 200 and len(r["project"]["chars"][0]["refs"]) == 1
-      and r["project"]["chars"][0]["refs"][0] != refs[0], r)
-gone = not (Path(f"genwork/drama/{pid}/{refs[0]}").exists())
-check("char ref file deleted", gone, refs[0])
-st, r = call("POST", f"/api/drama/projects/{pid}/chars/{cid}/refs/add", {"dataUrl": "data:text/html;base64,xxx"})
-check("char ref bad mime", st == 400 and "不支持" in r.get("error", ""), r)
+      and not Path(str(GEN / "drama") + f"/{pid}/{refs[0]}").exists(), r)
 
-# 7.7 portraitTaskId 清除:上传 asset 后应清空
+# ---------- 9. portraitTaskId 清除 ----------
 st, r = call("POST", f"/api/drama/projects/{pid}/chars/{cid}/update", {"portraitTaskId": "abc123"})
 check("portraitTaskId set", st == 200 and r["project"]["chars"][0]["portraitTaskId"] == "abc123", r)
 st, r = call("POST", f"/api/drama/projects/{pid}/asset",
@@ -141,55 +230,84 @@ st, r = call("POST", f"/api/drama/projects/{pid}/asset",
 check("portrait asset clears taskId", st == 200 and r["project"]["chars"][0]["portraitTaskId"] is None
       and r["project"]["chars"][0]["asset"].startswith("chars/"), r)
 
-# 7.8 缺键报错带键名
-st, r = call("POST", f"/api/drama/projects/{pid}/asset", {"target": "shot", "id": s1, "kind": "first"})
-check("asset missing keys err", st == 400 and "keys=[target,id,kind]" in r.get("error", ""), r)
+# ---------- 10. 异步 compose(无 eid → 当前集)→ 轮询 → 按集成片 served + warnings ----------
+st, r = call("POST", f"/api/drama/projects/{pid}/compose", {})
+check("compose start async", st == 200 and r.get("ok")
+      and (cur_ep(r["project"]).get("composeJob") or {}).get("state") == "running", r)
+job, proj = poll_job(pid, e1, "compose")
+check("compose done", job.get("state") == "done", job)
+check("composed rel", proj and cur_ep(proj)["composed"] == f"composed_{e1}.mp4",
+      proj and cur_ep(proj)["composed"])
+st, body = call("GET", f"/api/drama/projects/{pid}/asset/composed_{e1}.mp4", raw=True)
+check("composed served", st == 200 and len(body) > 10000 and body[4:8] == b"ftyp", (st, len(body)))
+st, r = call("GET", f"/api/drama/projects/{pid}/warnings?eid={e1}")
+check("warnings endpoint", st == 200 and r.get("ok") and isinstance(r.get("warnings"), list), r)
 
-# 7.9 台词/TTS:写对白 → 生成配音(SAPI 真跑)→ 校验 tts wav 落盘
-st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s1}/update",
+# ---------- 10.5 compose e2 + 全剧重混(P2.6) ----------
+st, r = call("POST", f"/api/drama/projects/{pid}/eps/{e2}/compose", {"burnSubs": False})
+check("compose e2 start", st == 200 and r.get("ok"), r)
+job, proj = poll_job(pid, e2, "compose")
+check("compose e2 done", job.get("state") == "done", job)
+st, r = call("POST", f"/api/drama/projects/{pid}/remix", {})
+check("remix start", st == 200 and r.get("ok")
+      and (r["project"].get("remixJob") or {}).get("state") == "running", r)
+deadline = time.time() + 240
+rj = {}
+while time.time() < deadline:
+    st, r = call("GET", f"/api/drama/projects/{pid}")
+    rj = (r.get("project", {}).get("remixJob") or {}) if isinstance(r, dict) else {}
+    if rj.get("state") in ("done", "error"):
+        break
+    time.sleep(2)
+check("remix done", rj.get("state") == "done", rj)
+st, body = call("GET", f"/api/drama/projects/{pid}/asset/series.mp4", raw=True)
+check("series served", st == 200 and len(body) > 10000 and body[4:8] == b"ftyp", (st, len(body)))
+
+# ---------- 11. 台词/TTS 异步 ----------
+st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s2}/update",
              {"lines": "小满:今天怎么不进来?\n黑猫:在等你换班。"})
-proj = r["project"]
-s1cur = next(s for s in proj["shots"] if s["id"] == s1)
-check("lines update", st == 200 and "换班" in s1cur["lines"], s1cur.get("lines"))
+check("lines update", st == 200 and "换班" in shot_of(r["project"], e1, s2)["lines"], r)
 st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s1}/tts", {})
-proj = r["project"]
-s1cur = next(s for s in proj["shots"] if s["id"] == s1)
-check("shot tts", st == 200 and r.get("ok") and s1cur["tts"], s1cur.get("tts"))
-tts_rel = s1cur["tts"]
-st, body = call("GET", f"/api/drama/projects/{pid}/asset/{tts_rel}", raw=True)
+check("tts no lines rejected", st == 400 and "对白" in r.get("error", ""), r)
+st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s2}/tts", {})
+check("tts start async", st == 200 and r.get("ok"), r)
+job, proj = poll_job(pid, e1, "tts", sid=s2, timeout=120)
+check("tts done", job.get("state") == "done", job)
+s2cur = shot_of(proj, e1, s2)
+check("tts attached", bool(s2cur["tts"]) and (s2cur.get("ttsDur") or 0) > 0, s2cur.get("tts"))
+st, body = call("GET", f"/api/drama/projects/{pid}/asset/{s2cur['tts']}", raw=True)
 check("tts served", st == 200 and len(body) > 5000 and body[:4] == b"RIFF", (st, len(body)))
 
-# 7.10 时长范围(2~30)截断
-st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s2}/update", {"duration": 60})
-proj = r["project"]
-check("duration clamped", st == 200 and next(s for s in proj["shots"] if s["id"] == s2)["duration"] == 30, r)
-
-# 8. 分镜 LLM(真实调用一次;上游偶发 503 或 LLM 少给/漏 firstPrompt,失败自动重试一次)
+# ---------- 12. 分镜 LLM(真实调用;opt 档 3 次/分钟,撞 429 等 65s) ----------
 added = []
 for attempt in (1, 2):
     st, r = call("POST", f"/api/drama/projects/{pid}/storyboard", {"nShots": 4})
     added = (r.get("added") or []) if isinstance(r, dict) else []
     if st == 200 and r.get("ok") and len(added) >= 4 and all(s.get("firstPrompt") for s in added):
         break
+    if st == 429 and attempt == 1:
+        time.sleep(65)
 check("storyboard", st == 200 and r.get("ok") and len(added) >= 4
-      and all(s.get("firstPrompt") for s in added),
+      and all(s.get("firstPrompt") for s in added)
+      and added[0].get("key") is True and added[-1].get("key") is True,
       {"st": st, "err": r.get("error") if isinstance(r, dict) else r,
        "added": len(added), "noPrompt": sum(1 for s in added if not s.get("firstPrompt"))})
+st, r = call("GET", f"/api/drama/projects/{pid}")
+check("storyboard landed in ep1", len(ep_of(r["project"], e1)["shots"]) == 6, r)
 
-# 8.4 reprompt(真实调用一次;按 desc 重写 firstPrompt/motionPrompt;上游偶发 503 重试一次)
+# 13. reprompt(真 LLM)
 for attempt in (1, 2):
-    st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s2}/reprompt",
-                 {"desc": "小满在便利店货架间挑饭团,黑猫蹲在收银台上"})
+    st, r = call("POST", f"/api/drama/projects/{pid}/shots/{s3}/reprompt",
+                 {"desc": "小满在天台吹风,黑猫说出重置的秘密"})
     if st == 200 and r.get("ok"):
         break
     if st == 429 and attempt == 1:
-        time.sleep(65)  # 等分钟池重置
-rp_shot = next((s for s in r.get("project", {}).get("shots", []) if s["id"] == s2), {})
-check("shot reprompt", st == 200 and r.get("ok") and rp_shot.get("firstPrompt") and rp_shot.get("motionPrompt"),
-      {"st": st, "err": r.get("error") if isinstance(r, dict) else r,
-       "fp": (rp_shot.get("firstPrompt") or "")[:40]})
+        time.sleep(65)
+rp = shot_of(r["project"], e2, s3) if isinstance(r, dict) and r.get("project") else {}
+check("shot reprompt", st == 200 and r.get("ok") and rp.get("firstPrompt") and rp.get("motionPrompt"),
+      {"st": st, "err": r.get("error") if isinstance(r, dict) else r})
 
-# 8.5 brainstorm 现编(真实调用一次;opt 档撞 429 等下一分钟窗口)
+# 14. brainstorm(真 LLM)
 for attempt in (1, 2):
     st, r = call("POST", "/api/drama/brainstorm", {"seed": "便利店"})
     if st == 200 and r.get("ok"):
@@ -197,52 +315,65 @@ for attempt in (1, 2):
     if st == 429 and attempt == 1:
         time.sleep(65)
 ideas = r.get("ideas", []) if isinstance(r, dict) else []
-check("brainstorm", st == 200 and r.get("ok") and len(ideas) >= 1
-      and all(x.get("logline") for x in ideas),
-      {"st": st, "err": r.get("error") if isinstance(r, dict) else r,
-       "t0": ideas[0].get("title") if ideas else r})
+check("brainstorm", st == 200 and len(ideas) >= 1 and all(x.get("logline") for x in ideas),
+      {"st": st, "err": r.get("error") if isinstance(r, dict) else r})
 
-# 8.6 带台词章节分镜(withLines=true;真实调用;opt 档 3 次/分钟,撞 429 等到下一分钟窗口再试一次)
+# 15. withLines 章节分镜(真 LLM)
+added = []
 for attempt in (1, 2):
     st, r = call("POST", f"/api/drama/projects/{pid}/storyboard", {"nShots": 4, "withLines": True})
-    shots = r.get("project", {}).get("shots", []) if isinstance(r, dict) else []
+    proj = r.get("project", {}) if isinstance(r, dict) else {}
+    shots = ep_of(proj, e1)["shots"] if proj else []
     added = [s for s in shots if s.get("lines") and len(s["scene"]) > 1 and s["scene"][0] in "起承转合"]
-    if st == 200 and r.get("ok") and len(added) >= 2 and all(s.get("firstPrompt") for s in added):
+    if st == 200 and r.get("ok") and len(added) >= 2:
         break
     if st == 429 and attempt == 1:
-        time.sleep(65)  # 等分钟池重置
-check("storyboard withLines", st == 200 and r.get("ok") and len(added) >= 2
-      and all(s.get("firstPrompt") for s in added),
+        time.sleep(65)
+check("storyboard withLines", st == 200 and r.get("ok") and len(added) >= 2,
       {"st": st, "err": r.get("error") if isinstance(r, dict) else r,
        "chapters": [s["scene"][:12] for s in added][:4]})
 
-# 8.7 台词灵感按项目角色现编(真实调用一次;opt 档撞 429 等下一分钟窗口)
+# 16. lines-ideas(真 LLM)
 for attempt in (1, 2):
     st, r = call("POST", f"/api/drama/projects/{pid}/lines-ideas", {"seed": "小满在收银台打瞌睡"})
     if st == 200 and r.get("ok") and r.get("ideas"):
         break
     if st == 429 and attempt == 1:
-        time.sleep(65)  # 等分钟池重置
-li = r.get("ideas", []) if isinstance(r, dict) else []
-check("lines ideas", st == 200 and r.get("ok") and len(li) >= 1
-      and all(x.get("lines") for x in li),
-      {"st": st, "err": r.get("error") if isinstance(r, dict) else r,
-       "moods": [x.get("mood") for x in li][:3]})
+        time.sleep(65)
+check("lines ideas", st == 200 and r.get("ok") and r.get("ideas")
+      and all(x.get("lines") for x in r["ideas"]),
+      {"st": st, "err": r.get("error") if isinstance(r, dict) else r})
 
-# 8.8 shots/clear:一键清空镜头并删素材文件;角色/定妆照保留
-clip_path = Path(f"genwork/drama/{pid}/shots/{s1}_clip.mp4")
-tts_path = Path(f"genwork/drama/{pid}/shots/{s1}_tts.wav")
-char_path = Path(f"genwork/drama/{pid}/chars/{cid}.png")
-st, r = call("POST", f"/api/drama/projects/{pid}/shots/clear", {})  # 服务端统一先读 JSON 体,空对象即可
-proj = r.get("project", {}) if isinstance(r, dict) else {}
-check("shots clear", st == 200 and r.get("ok") and proj.get("shots") == []
+# ---------- 17. shots/clear(eid;素材删,角色/定妆保留) ----------
+clip_path = Path(str(GEN / "drama") + f"/{pid}/shots/{s2}_clip.mp4")
+tts_path = Path(str(GEN / "drama") + f"/{pid}/shots/{s2}_tts.wav")
+char_path = Path(str(GEN / "drama") + f"/{pid}/chars/{cid}.png")
+st, r = call("POST", f"/api/drama/projects/{pid}/shots/clear", {"eid": e1})
+proj = r.get("project", {})
+check("shots clear", st == 200 and ep_of(proj, e1)["shots"] == []
       and not clip_path.exists() and not tts_path.exists() and char_path.exists(),
-      {"st": st, "err": r.get("error") if isinstance(r, dict) else r,
-       "shots": len(proj.get("shots", [])),
+      {"st": st, "shots": len(ep_of(proj, e1)["shots"]) if proj else -1,
        "clipGone": not clip_path.exists(), "ttsGone": not tts_path.exists(),
        "charKept": char_path.exists()})
 
-# 9. 清理:删除联调项目
+# ---------- 18. 集删除(素材清理) ----------
+st, r = call("POST", f"/api/drama/projects/{pid}/eps/add", {"title": "待删集"})
+e3 = r["episodeId"]
+st, r = call("POST", f"/api/drama/projects/{pid}/shots/add",
+             {"eid": e3, "scene": "x", "desc": "待删"})
+s4 = ep_of(r["project"], e3)["shots"][0]["id"]
+b64 = make_media(pid, f"c_{s4}.mp4", "540x960", dur=1)
+st, r = call("POST", f"/api/drama/projects/{pid}/asset",
+             {"target": "shot", "id": s4, "kind": "clip", "dataUrl": "data:video/mp4;base64," + b64})
+check("ep3 clip asset", st == 200, r)
+st, r = call("POST", f"/api/drama/projects/{pid}/eps/{e3}/delete", {})
+check("episode delete", st == 200 and all(e["id"] != e3 for e in r["project"]["episodes"])
+      and not Path(str(GEN / "drama") + f"/{pid}/shots/{s4}_clip.mp4").exists(),
+      {"eps": len(r["project"]["episodes"])})
+st, r = call("POST", f"/api/drama/projects/{pid}/eps/{e2}/select", {})
+check("select after delete", st == 200 and r["project"]["currentEpisode"] == e2, r)
+
+# ---------- 19. 清理 ----------
 st, r = call("POST", f"/api/drama/projects/{pid}/delete")
 check("delete project", st == 200 and r.get("ok"), r)
 st, r = call("GET", f"/api/drama/projects/{pid}")

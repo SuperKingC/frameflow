@@ -10,7 +10,7 @@
 <body>
 <header class="topbar">
   <a class="backlink" href="index.html">← 工作台</a>
-  <div class="brand"><span class="logo">K</span> KK工作台 <span class="ver">v0.4</span></div>
+  <div class="brand"><span class="logo">K</span> KK工作台 <span class="ver">v0.5</span></div>
   <span class="pagetitle">短剧工作台</span>
 </header>
 
@@ -80,10 +80,13 @@
       <button class="btn primary wide" id="btnCompose" hidden>合成成片(有配音的镜自动混音)</button>
       <label class="row" style="margin-top:8px"><input type="checkbox" id="pBurnSubs" checked> 烧录台词字幕(底部;勾选才加)</label>
       <button class="btn wide" id="btnPlayAll" hidden style="margin-top:8px">▶ 连播预览</button>
-      <button class="btn wide" id="btnRunAll" hidden style="margin-top:8px">⚡ 一键串跑(自动补齐缺的首帧/成片)</button>
+      <button class="btn wide" id="btnRunAll" hidden style="margin-top:8px">🚀 一键成片(配音→首帧→视频→自动合成,⭐镜自动抽卡)</button>
+      <button class="btn wide" id="btnRemix" hidden style="margin-top:8px">🎬 全剧重混(统一响度+跨集拼成 series.mp4)</button>
       <div id="composedBox"></div>
+      <div id="remixBox"></div>
       <p class="hint" id="quotaLine" style="margin-top:10px">剩余额度:—</p>
-      <p class="hint">流程:填故事 → ✨生成分镜(可手改,可带台词)→ 角色定妆 → 逐镜生首帧 → 逐镜生视频 → 合成。长剧用「一键串跑」按限额排队;镜头时长按可灵 3.0 支持 3~15 秒(1 分钟剧约 5~8 镜)。台词区写好对白的镜头,「🎙 生成配音」秒出;合成时自动混音+烧字幕。再次生成分镜会追加并自动衔接已有剧情;想推倒重来用「🗑 清空分镜」。素材落盘 genwork/drama/,重启不丢。</p>
+      <p class="hint" id="costLine" style="margin:2px 0 0"></p>
+      <p class="hint">流程(按集制作):填剧名/一句话故事/风格 → 角色区定妆+追加三视图(一次生成,全剧集复用)→ 选集 → 生成分镜(可带台词,多集自动衔接上一集结尾)→ 逐镜生首帧/视频 → 「合成成片」出本集成片。长剧用「⚡ 一键串跑」按限额排队;「开口」镜头用 Veo 3.1 原生对白。再次生成分镜会追加并自动衔接本集已有剧情;想推倒重来用「🗑 清空分镜」。素材落盘 genwork/drama/,重启不丢。</p>
     </div>
 
     <div class="gen-stage">
@@ -96,10 +99,17 @@
         <div class="log-latest" id="logLatest">就绪</div>
         <div class="log-list" id="logList"></div>
       </div>
+      <div id="epTabs" class="ep-tabs" hidden></div>
+      <div class="ep-syn" id="epSynRow" hidden>
+        <label class="f-label">本集梗概(生成分镜时注入,跨集自动衔接)
+          <textarea id="epSynopsis" rows="2" style="width:100%"
+            placeholder="本集要发生什么(一句话;多集剧会自动衔接上一集结尾)"></textarea>
+        </label>
+      </div>
       <div class="label-row">
         <label style="margin:0;font-size:11.5px;letter-spacing:1.2px;color:var(--accent)">分镜</label>
         <div style="display:flex;gap:8px">
-          <button class="btn" id="btnClearShots" hidden title="删除全部镜头及其素材,角色保留">🗑 清空分镜</button>
+          <button class="btn" id="btnClearShots" hidden title="删除本集全部镜头及其素材,角色保留">🗑 清空分镜</button>
           <button class="btn" id="btnAddShot" hidden>+ 手动加镜</button>
           <button class="btn primary" id="btnStoryboard" hidden>✨ 生成分镜</button>
         </div>

@@ -44,6 +44,15 @@ def rename(k):
 
 
 cfg = Florence2Config.from_pretrained(SRC)
+# 字段名差异:仓库 vision_config 用 dim_embed,builtin Florence2VisionConfig 叫 embed_dim
+# (builtin 默认 (128,256,512,1024) 恰好等于 base 的 dim_embed,base 转换是撞对的;large 不映射就建错尺寸)
+_repo = json.load(open(os.path.join(SRC, "config.json"), encoding="utf-8"))
+_v = _repo.get("vision_config") or {}
+if "dim_embed" in _v:
+    cfg.vision_config.embed_dim = _v["dim_embed"]
+for _f in ("projection_dim", "num_heads", "num_groups", "depths", "window_size"):
+    if _f in _v:
+        setattr(cfg.vision_config, _f, _v[_f])
 with torch.device("meta"):
     model = Florence2ForConditionalGeneration._from_config(cfg)
 tkeys = {k: tuple(v.shape) for k, v in model.state_dict().items()}
@@ -87,6 +96,9 @@ print("saved model.safetensors", os.path.getsize(os.path.join(DST, "model.safete
 
 cfg_json = json.load(open(os.path.join(SRC, "config.json"), encoding="utf-8"))
 cfg_json["image_token_id"] = 1  # <pad> 作图像占位符(位置被图像特征替换,行值不参与)
+# builtin Florence2VisionConfig 读 embed_dim(仓库字段叫 dim_embed);不写回去 from_pretrained 又会按 base 默认建模型
+if "dim_embed" in (cfg_json.get("vision_config") or {}):
+    cfg_json["vision_config"]["embed_dim"] = cfg_json["vision_config"]["dim_embed"]
 json.dump(cfg_json, open(os.path.join(DST, "config.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 for f in ("preprocessor_config.json", "tokenizer.json", "tokenizer_config.json", "vocab.json"):
     shutil.copy(os.path.join(SRC, f), os.path.join(DST, f))

@@ -20,6 +20,67 @@
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .log-latest.err { color: var(--danger); }
+
+/* 剧集 tabs:剧→集→镜的中间层;当前集高亮,已合成集带小圆点 */
+.ep-tabs {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; align-items: center;
+}
+.ep-tab {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 12px; border: 1px solid var(--line); border-radius: 999px;
+  background: var(--bg); color: var(--fg2); font-size: 12px; cursor: pointer;
+  transition: all .15s;
+}
+.ep-tab b { font-weight: 600; color: var(--fg); font-size: 12.5px; }
+.ep-tab span.n { font-size: 10.5px; color: var(--fg3); }
+.ep-tab:hover { border-color: var(--accent); color: var(--fg); }
+.ep-tab.on {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.ep-tab.on b { color: #fff; }
+.ep-tab.on span.n { color: rgba(255,255,255,.75); }
+.ep-tab.add { border-style: dashed; color: var(--fg3); }
+.ep-tab.add:hover { color: var(--accent); border-color: var(--accent); }
+.ep-tab.ops { padding: 5px 9px; font-size: 12px; }
+
+/* 本集梗概行 */
+.ep-syn { margin-bottom: 8px; }
+.ep-syn textarea {
+  background: var(--bg2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 6px 10px; font-size: 12.5px; resize: vertical; min-height: 36px;
+}
+
+/* ---------- 候片墙(抽卡择优)与成本角标(P1.2/P1.3) ---------- */
+.take-strips { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.take-strip { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.take-strip .take-label { font-size: 12px; color: var(--text-3); flex: none; width: 64px; }
+.take-thumb {
+  position: relative; width: 64px; height: 44px; padding: 0; margin: 0;
+  border: 2px solid var(--line); border-radius: 6px; overflow: hidden;
+  background: #000; cursor: pointer; flex: none;
+}
+.take-thumb img, .take-thumb video {
+  width: 100%; height: 100%; object-fit: cover; display: block;
+}
+.take-thumb.on { border-color: var(--accent); }
+.take-thumb.on::after {
+  content: '✓'; position: absolute; right: 2px; bottom: 2px;
+  font-size: 10px; color: #fff; background: var(--accent);
+  border-radius: 50%; width: 14px; height: 14px; line-height: 14px; text-align: center;
+}
+.shot-cost {
+  display: inline-block; margin-top: 6px; font-size: 11.5px; color: var(--text-3);
+}
+#costLine { color: var(--text-2); }
+#remixBox video { width: 100%; border-radius: 8px; border: 1px solid var(--line); margin-top: 8px; background: #000; }
+#remixBox .download {
+  display: block; text-align: center; text-decoration: none;
+  font-size: 13px; color: var(--accent);
+  background: rgba(52, 211, 153, .1);
+  border-radius: 6px; padding: 5px 6px; margin-top: 6px;
+}
+#remixBox .download:hover { background: rgba(52, 211, 153, .2); }
+#remixBox .hint.err { color: var(--danger); }
 .log-list {
   display: none; max-height: 260px; overflow-y: auto;
   border-top: 1px solid var(--line); padding: 4px 12px 8px;

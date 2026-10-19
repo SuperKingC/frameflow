@@ -134,9 +134,16 @@ def show(task, prompt, text, parsed, secs):
 
 def main():
     img_path = sys.argv[1] if len(sys.argv) > 1 else r"D:\Mine\frameflow\testdata\duoli_ref\duoli_2.jpg"
+    task = sys.argv[2] if len(sys.argv) > 2 else None   # 指定任务则单跑(配合 argv[3] 短语)
+    phrase = sys.argv[3] if len(sys.argv) > 3 else ""
     image = Image.open(img_path).convert("RGB")
     print(f"[image] {img_path} {image.width}x{image.height}")
     tok, imgp, model, pp = load()
+
+    if task:
+        show(task, *run(model, tok, imgp, pp, image, task, phrase=phrase, max_new=256))
+        print("\nPROBE DONE")
+        return
 
     # 冒烟:OD 小输出先验证链路
     try:

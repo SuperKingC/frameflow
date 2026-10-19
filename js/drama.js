@@ -25,14 +25,17 @@
   const VID_MODEL = 'kwaivgi/kling-v3.0-pro';
 
   let PROJECTS = [];
-  let CUR = null;        // 当前项目(服务端全量快照)
+  let CUR = null;        // 当前项目(服务端全量快照;剧→集→镜三层,shots 挂在 episodes[].shots)
+  let CUR_EP = null;     // 当前集 id(localStorage 按项目记忆)
   let META = { styles: [], ideas: [], linesIdeas: [], voices: [] };
   let VID_DURATIONS = [5, 10];   // 当前视频模型的 supported_durations(动态更新)
-  const poll = {};       // studio taskId -> { kind:'first'|'clip'|'portrait', id, startedAt }
+  const poll = {};       // studio taskId -> { kind:'first'|'clip'|'portrait'|'trait', id, startedAt }
   const COLLAPSED = new Set();   // 收起状态的镜头 id(会话级:刷新恢复展开)
   const LOGS = [];               // 任务进度日志(所有 status 同步进这里,面板可展开看全部)
   let LOG_OPEN = false;          // 展开态(localStorage 记忆)
   let pendingRender = false;
+  let jobTimer = null;           // 服务端后台任务(compose/tts)轮询定时器
+  const SUB_TIMES = [];          // 提交时间戳(串跑滑窗限流:opt 池 3 次/分钟)
   let charRefTarget = null;   // 文件选择器当前服务的角色 id
   let charRefInput = null;    // 由 init 创建(drama.html 中声明)
 
@@ -111,6 +114,37 @@
     return '/api/drama/projects/' + CUR.id + '/asset/' + rel;
   }
 
+  // 当前集:CUR_EP 指向有效集,失效回退第 1 集;切换时记 localStorage(按项目隔离)
+  function curEp() {
+    if (!CUR) return null;
+    const eps = CUR.episodes || [];
+    let ep = eps.find(function (e) { return e.id === CUR_EP; });
+    if (!ep) {
+      ep = eps[0] || null;
+      CUR_EP = ep ? ep.id : null;
+    }
+    return ep;
+  }
+
+  function rememberEp() {
+    if (CUR && CUR_EP) {
+      try { localStorage.setItem('ffDramaEp:' + CUR.id, CUR_EP); } catch (e) { /* 隐私模式 */ }
+    }
+  }
+
+  function totalShots() {
+    return (CUR && CUR.episodes || []).reduce(function (n, e) { return n + (e.shots || []).length; }, 0);
+  }
+
+  // 跨集找镜头(单镜接口服务端也跨集定位;前端查找用于状态/索引)
+  function findShotEverywhere(sid) {
+    for (const e of (CUR && CUR.episodes || [])) {
+      const s = (e.shots || []).find(function (x) { return x.id === sid; });
+      if (s) return { ep: e, shot: s };
+    }
+    return { ep: null, shot: null };
+  }
+
   function dGET(path) {
     return fetch('/api/drama/projects' + path, { headers: AUTH() })
       .then(function (r) {
@@ -177,8 +211,8 @@
   function syncSelTitle() {
     if (!CUR) return;
     const o = $('#projSel').querySelector('option[value="' + CUR.id + '"]');
-    if (o) o.textContent = CUR.title + '(' + CUR.shots.length + '镜'
-      + (CUR.composed ? ' · 已合成' : '') + ')';
+    if (o) o.textContent = CUR.title + '(' + (CUR.episodes || []).length + '集'
+      + totalShots() + '镜)';
   }
 
   // ---------- 项目 ----------
@@ -191,7 +225,7 @@
       PROJECTS.forEach(function (p) {
         const o = document.createElement('option');
         o.value = p.id;
-        o.textContent = p.title + '(' + p.shotCount + '镜' + (p.clipCount ? ' · ' + p.clipCount + '片' : '') + ')';
+        o.textContent = p.title + '(' + (p.episodeCount || 1) + '集/' + p.shotCount + '镜)';
         sel.appendChild(o);
       });
       // 记住最后打开的项目:刷新后回到刚才在编辑的那部剧,而不是列表第一个
@@ -216,18 +250,32 @@
     dGET('/' + pid).then(function (res) {
       if (!res.ok || !res.p.ok) { status('项目加载失败:' + (res.p.error || ''), true); return; }
       CUR = res.p.project;
+      // 恢复上次编辑的集(按项目记忆;失效由 curEp() 回退第 1 集)
+      try { CUR_EP = localStorage.getItem('ffDramaEp:' + pid) || null; } catch (e) { CUR_EP = null; }
+      const ep = curEp();
+      if (ep) rememberEp();
       renderAll();
-      status('已加载「' + CUR.title + '」');
+      status('已加载「' + CUR.title + '」' + (ep ? ' · ' + ep.title : ''));
     }).catch(function () { status('项目加载失败:网络错误', true); });
   }
 
   function saveProj(opts) {
     if (!CUR) return Promise.resolve(null);
-    return dPOST('/' + CUR.id + '/update', {
-      title: $('#pTitle').value, logline: $('#pLogline').value,
-      style: $('#pStyle').value, aspect: $('#pAspect').value, beat: $('#pBeat').value,
+    // 本集梗概随项目信息一起保存(当前集存在时);失败不挡剧级保存
+    const ep = curEp();
+    const epSync = (ep && $('#epSynopsis') && $('#epSynopsis').value.trim() !== (ep.synopsis || ''))
+      ? dPOST('/' + CUR.id + '/eps/' + ep.id + '/update', { synopsis: $('#epSynopsis').value })
+      : Promise.resolve(null);
+    return epSync.then(function () {
+      return dPOST('/' + CUR.id + '/update', {
+        title: $('#pTitle').value, logline: $('#pLogline').value,
+        style: $('#pStyle').value, aspect: $('#pAspect').value, beat: $('#pBeat').value,
+      });
     }).then(function (res) {
-      if (!res.ok || !res.p.ok) { status('保存失败:' + (res.p.error || ''), true); return null; }
+      if (!res || !res.ok || !res.p.ok) {
+        if (res) status('保存失败:' + (res.p.error || ''), true);
+        return null;
+      }
       CUR = res.p.project;
       syncSelTitle();
       if (!opts || !opts.silent) { status('项目信息已保存'); }
@@ -243,13 +291,17 @@
   function renderAll() {
     const has = !!CUR;
     $('#projForm').hidden = !has;
-    ['btnAddChar', 'btnCompose', 'btnPlayAll', 'btnAddShot', 'btnStoryboard', 'btnDelProj', 'btnIdea', 'btnRunAll', 'btnClearShots']
+    ['btnAddChar', 'btnCompose', 'btnPlayAll', 'btnAddShot', 'btnStoryboard', 'btnDelProj', 'btnIdea', 'btnRunAll', 'btnClearShots', 'btnRemix']
       .forEach(function (id) { $('#' + id).hidden = !has; });
+    $('#epTabs').hidden = !has;
+    $('#epSynRow').hidden = !has;
     const empty = $('#shotEmpty');
     if (!has) {
       $('#charList').textContent = '';
+      $('#epTabs').textContent = '';
       $('#shotList').textContent = '';
       $('#composedBox').textContent = '';
+      $('#epSynopsis').value = '';
       empty.hidden = false;
       empty.textContent = '还没有项目:点左侧「新建」开始一部短剧。';
       return;
@@ -262,20 +314,95 @@
     $('#pNShots').value = String($('#pNShots').value || '6');
     $('#pAdvanced').checked = ADVANCED;
     // pWithLines 不由 renderAll 重置:它是「本次起草」选项,勾选态只在页面加载时默认开
-    empty.hidden = CUR.shots.length > 0;
-    empty.textContent = '还没有镜头:填好左侧「一句话故事」后点「✨ 生成分镜」,或「+ 手动加镜」。';
+    const ep = curEp();
+    $('#epSynopsis').value = (ep && ep.synopsis) || '';
+    empty.hidden = !!(ep && ep.shots.length > 0);
+    empty.textContent = '本集还没有镜头:填好左侧「一句话故事/本集梗概」后点「✨ 生成分镜」,或「+ 手动加镜」。';
     renderStyleChips();
+    renderEpTabs();
     renderChars();
     renderShots();
     renderComposed();
-    // 恢复进行中的任务(页面刷新后接着轮询)
-    CUR.shots.forEach(function (s) {
-      if (s.firstTaskId && !poll[s.firstTaskId]) poll[s.firstTaskId] = { kind: 'first', id: s.id, startedAt: Date.now() };
-      if (s.clipTaskId && !poll[s.clipTaskId]) poll[s.clipTaskId] = { kind: 'clip', id: s.id, startedAt: Date.now() };
+    renderRemix();
+    renderCostLine();
+    // 恢复进行中的 studio 任务(全剧集扫一遍;素材落盘跨集定位)
+    (CUR.episodes || []).forEach(function (e) {
+      (e.shots || []).forEach(function (s) {
+        if (s.firstTaskId && !poll[s.firstTaskId]) poll[s.firstTaskId] = { kind: 'first', id: s.id, startedAt: Date.now() };
+        if (s.clipTaskId && !poll[s.clipTaskId]) poll[s.clipTaskId] = { kind: 'clip', id: s.id, startedAt: Date.now() };
+      });
     });
     (CUR.chars || []).forEach(function (c) {
       if (c.portraitTaskId && !poll[c.portraitTaskId]) poll[c.portraitTaskId] = { kind: 'portrait', id: c.id, startedAt: Date.now() };
+      if (c.traitTaskId && !poll[c.traitTaskId]) poll[c.traitTaskId] = { kind: 'trait', id: c.id, startedAt: Date.now() };
     });
+    // 恢复服务端后台任务轮询(compose/tts 现在异步,状态在 project.json 里)
+    pollDramaJobs();
+  }
+
+  // ---------- 剧集 tabs(剧→集→镜) ----------
+  function renderEpTabs() {
+    const box = $('#epTabs');
+    box.textContent = '';
+    const ep = curEp();
+    (CUR.episodes || []).forEach(function (e, i) {
+      const t = el('button', 'ep-tab' + (ep && e.id === ep.id ? ' on' : ''));
+      t.type = 'button';
+      t.appendChild(el('b', null, e.title || ('第' + (i + 1) + '集')));
+      t.appendChild(el('span', 'n', (e.shots || []).length + '镜' + (e.composed ? ' · 已合成' : '')));
+      t.addEventListener('click', function () {
+        if (CUR_EP === e.id) return;
+        CUR_EP = e.id;
+        rememberEp();
+        safeRender();
+      });
+      box.appendChild(t);
+    });
+    const add = el('button', 'ep-tab add', '+ 新集');
+    add.type = 'button';
+    add.title = '新建一集(角色库与全剧设定自动复用)';
+    add.addEventListener('click', function () {
+      dPOST('/' + CUR.id + '/eps/add', {}).then(function (res) {
+        if (!res.ok || !res.p.ok) { status('新建集失败:' + (res.p.error || ''), true); return; }
+        CUR = res.p.project;
+        CUR_EP = res.p.episodeId;
+        rememberEp();
+        safeRender();
+        status('已新建 ' + (CUR.episodes.length) + ' 集所在:填本集梗概后直接「✨ 生成分镜」,角色自动沿用');
+      });
+    });
+    box.appendChild(add);
+    if (ep) {
+      const rename = el('button', 'ep-tab ops', '✎');
+      rename.type = 'button';
+      rename.title = '重命名本集 / 编辑本集梗概(梗概会注入分镜)';
+      rename.addEventListener('click', function () {
+        const t = prompt('本集标题', ep.title || '');
+        if (t === null) return;
+        const syn = prompt('本集梗概(可空;分镜起草时会注入,衔接全剧)', ep.synopsis || '');
+        dPOST('/' + CUR.id + '/eps/' + ep.id + '/update', { title: t, synopsis: syn || '' })
+          .then(function (res) { applyP(res, '本集信息已保存'); });
+      });
+      box.appendChild(rename);
+      if ((CUR.episodes || []).length > 1) {
+        const del = el('button', 'ep-tab ops', '🗑');
+        del.type = 'button';
+        del.title = '删除本集(镜头与素材一并删除;角色库保留)';
+        del.addEventListener('click', function () {
+          if (!confirm('删除「' + (ep.title || '本集') + '」及其中全部镜头素材?不可恢复!')) return;
+          dPOST('/' + CUR.id + '/eps/' + ep.id + '/delete', {}).then(function (res) {
+            if (!res.ok || !res.p.ok) { status('删除失败:' + (res.p.error || ''), true); return; }
+            CUR = res.p.project;
+            CUR_EP = null;  // 回退到第 1 集
+            curEp();
+            rememberEp();
+            safeRender();
+            status('集已删除');
+          });
+        });
+        box.appendChild(del);
+      }
+    }
   }
 
   function renderStyleChips() {
@@ -362,6 +489,39 @@
       }
       if (refBar.children.length) main.appendChild(refBar);
 
+      // 三视图缩略条(角色圣经资产,全剧集复用;traitTaskId 轮询)
+      const traits = c.traits || [];
+      if (traits.length || c.asset) {
+        const trBar = el('div', 'char-refs');
+        if (c.asset) {
+          const wrap0 = el('span', 'char-ref main-face');
+          const t0 = el('img');
+          t0.src = assetURL(c.asset);
+          t0.title = '定妆照(长相主参考)';
+          wrap0.appendChild(t0);
+          trBar.appendChild(wrap0);
+        }
+        traits.forEach(function (rel, i) {
+          const wrap = el('span', 'char-ref');
+          const t = el('img');
+          t.src = assetURL(rel);
+          t.title = '三视图 ' + (i + 1) + '(跨集复用)';
+          const x = el('button');
+          x.type = 'button';
+          x.textContent = '×';
+          x.title = '移除这张三视图';
+          x.addEventListener('click', function (e) {
+            e.stopPropagation();
+            dPOST('/' + CUR.id + '/chars/' + c.id + '/traits/delete', { index: i + 1 })
+              .then(function (res) { applyP(res, '已移除三视图'); });
+          });
+          wrap.appendChild(t);
+          wrap.appendChild(x);
+          trBar.appendChild(wrap);
+        });
+        main.appendChild(trBar);
+      }
+
       // 配音音色:角色专属;台词按「角色名」匹配到这个音色
       const voiceRow = el('div', 'char-ops');
       const vLabel = el('span', 'muted', '配音音色');
@@ -383,6 +543,20 @@
       const ops = el('div', 'char-ops');
       const gen = el('button', 'btn', c.asset ? '重roll定妆照' : '生成定妆照');
       gen.addEventListener('click', function () { genPortrait(c); });
+      // 三视图追加:同一角色多角度资产(跨集复用;第二张起带已有定妆保脸)
+      const poseSel = el('select');
+      poseSel.title = '追加角色资产视图(生成后所有集的镜头都能引用)';
+      [['side', '侧面全身'], ['back', '背面全身'], ['full', '正面全身'], ['closeup', '面部特写']]
+        .forEach(function (p) {
+          const o = document.createElement('option');
+          o.value = p[0];
+          o.textContent = '+' + p[1];
+          poseSel.appendChild(o);
+        });
+      poseSel.addEventListener('change', function () {
+        if (poseSel.value) genTrait(c, poseSel.value);
+        poseSel.value = 'side';
+      });
       const del = el('button', 'btn', '删除');
       del.addEventListener('click', function () {
         if (!confirm('删除角色「' + c.name + '」及其定妆照?')) return;
@@ -390,7 +564,8 @@
       });
       const st = el('span', 'char-status');
       if (c.portraitTaskId) st.textContent = '定妆照生成中…';
-      ops.appendChild(gen); ops.appendChild(del); ops.appendChild(st);
+      if (c.traitTaskId) st.textContent = '三视图生成中…';
+      ops.appendChild(gen); ops.appendChild(poseSel); ops.appendChild(del); ops.appendChild(st);
       main.appendChild(name); main.appendChild(desc); main.appendChild(ops);
       row.appendChild(main);
       // 拖拽图片到角色行直接加参考图
@@ -434,9 +609,11 @@
   function renderShots() {
     const list = $('#shotList');
     list.textContent = '';
+    const ep = curEp();
+    if (!ep) return;
     // 章节分组:scene 字段「起·第1章:场景」按「·」前缀聚合(无前缀的进「其他」)
     const groups = [];
-    CUR.shots.forEach(function (s, i) {
+    ep.shots.forEach(function (s, i) {
       const m = /^[起承转合]\s*[·•]/.exec(s.scene || '');
       const g = m ? m[0].slice(0, -1) : '';
       let bucket = groups.find(function (x) { return x.name === g; });
@@ -546,10 +723,10 @@
 
     const ops = el('div', 'shot-ops');
     const vModel = el('select');
-    vModel.title = '本镜视频模型;留默认用全剧设置';
-    [[null, '默认模型'], ['kwaivgi/kling-v3.0-pro', '可灵 3.0 Pro(开口)'],
-     ['kwaivgi/kling-v3.0-std', '可灵 3.0 标准(开口,便宜)'],
-     ['google/veo-3.1-fast', 'Veo 3.1 Fast(开口,英文最佳)']].forEach(function (pair) {
+    vModel.title = '本镜视频模型;留空用自动分派(开口→Veo / ⭐关键镜→可灵Pro / 过场→可灵Std)';
+    [[null, '自动(按镜分派)'], ['kwaivgi/kling-v3.0-pro', '可灵 3.0 Pro(强制)'],
+     ['kwaivgi/kling-v3.0-std', '可灵 3.0 标准(强制)'],
+     ['google/veo-3.1-fast', 'Veo 3.1 Fast(强制)']].forEach(function (pair) {
       const o = document.createElement('option');
       o.value = pair[0] || '';
       o.textContent = pair[1];
@@ -558,6 +735,26 @@
     });
     vModel.addEventListener('change', function () {
       patchShot(s.id, { videoModel: vModel.value || null });
+    });
+    const keyChk = document.createElement('input');
+    keyChk.type = 'checkbox';
+    keyChk.checked = !!s.key;
+    keyChk.title = '⭐ 关键镜:一键成片时自动抽 2 候选择优,并用可灵 Pro(更贵更稳)';
+    const keyLabel = el('label', null, '⭐');
+    keyLabel.insertBefore(keyChk, keyLabel.firstChild);
+    keyLabel.title = keyChk.title;
+    keyChk.addEventListener('change', function () {
+      patchShot(s.id, { key: keyChk.checked });
+    });
+    const chChk = document.createElement('input');
+    chChk.type = 'checkbox';
+    chChk.checked = s.chain !== false;   // 缺省开:首尾帧硬衔接
+    chChk.title = '🔗 首尾帧衔接:下一镜已有首帧时,把本镜结尾焊到下一镜开头(需要下一镜先出首帧)';
+    const chLabel = el('label', null, '🔗');
+    chLabel.insertBefore(chChk, chLabel.firstChild);
+    chLabel.title = chChk.title;
+    chChk.addEventListener('change', function () {
+      patchShot(s.id, { chain: chChk.checked });
     });
     const ndChk = document.createElement('input');
     ndChk.type = 'checkbox';
@@ -609,7 +806,7 @@
       if (!confirm('删除第' + (i + 1) + '镜及其素材?')) return;
       dPOST('/' + CUR.id + '/shots/' + s.id + '/delete').then(function (res) { applyP(res, '镜头已删除'); });
     });
-    ops.appendChild(vModel); ops.appendChild(ndLabel);
+    ops.appendChild(vModel); ops.appendChild(keyLabel); ops.appendChild(chLabel); ops.appendChild(ndLabel);
     ops.appendChild(dur);
     // 开口镜头人声由模型生成,配音/对口型不参与——不渲染(取消「开口」即回到配音路线)
     if (!s.nativeDialog) { ops.appendChild(bTts); ops.appendChild(bLip); }
@@ -647,6 +844,45 @@
     }
     if (media.children.length) card.appendChild(media);
 
+    // 候片墙(P1.2):首帧/成片的多候选缩略条,点选切换(服务端 takes + TakeSel)
+    const takeStrips = el('div', 'take-strips');
+    [['first', '首帧候选'], ['clip', '成片候选']].forEach(function (pair) {
+      const kind = pair[0];
+      const takes = (s.takes || []).filter(function (t) { return t.kind === kind; });
+      if (takes.length < 2) return;
+      const selField = kind === 'first' ? 'firstTakeSel' : 'clipTakeSel';
+      const selId = s[selField];
+      const strip = el('div', 'take-strip');
+      strip.appendChild(el('span', 'take-label', pair[1]));
+      takes.forEach(function (t) {
+        const b = el('button', 'take-thumb' + (selId === t.id ? ' on' : ''));
+        b.type = 'button';
+        b.title = '候选 ' + t.id + (selId === t.id ? '(当前)' : '(点击切换)');
+        if (kind === 'first') {
+          const img = document.createElement('img');
+          img.src = assetURL(t.rel);
+          b.appendChild(img);
+        } else {
+          const v = document.createElement('video');
+          v.src = assetURL(t.rel);
+          v.preload = 'metadata';
+          v.muted = true;
+          b.appendChild(v);
+        }
+        b.addEventListener('click', function () {
+          const field = kind === 'first' ? 'firstTakeSel' : 'clipTakeSel';
+          patchShot(s.id, (function () { const o = {}; o[field] = t.id; return o; })());
+          status('已切换本镜' + pair[1] + '到 ' + t.id + ';重新点「合成成片」用新候选出片');
+        });
+        strip.appendChild(b);
+      });
+      takeStrips.appendChild(strip);
+    });
+    if (takeStrips.children.length) card.appendChild(takeStrips);
+    if (s.cost > 0) {
+      card.appendChild(el('span', 'shot-cost', '累计成本 $' + Number(s.cost).toFixed(2)));
+    }
+
     card.appendChild(el('div', 'shot-status', ''));
     return card;
   }
@@ -677,7 +913,7 @@
     renderIdeas(META.linesIdeas, false);
     $('#ideaModal').style.display = 'flex';
     if (!CUR) return;
-    const shotNow = CUR.shots.find(function (x) { return x.id === shot.id; });
+    const shotNow = findShotEverywhere(shot.id).shot;
     fetch('/api/drama/projects/' + CUR.id + '/lines-ideas', {
       method: 'POST', headers: AUTH(),
       body: JSON.stringify({ seed: (shotNow && shotNow.lines) || '' }),
@@ -692,37 +928,146 @@
     }).catch(function () { /* 现编失败静默:通用灵感仍可用 */ });
   }
 
+  // 服务端后台任务(compose/tts)轮询:project.json 里的 composeJob/ttsJob 有 running 时每 2s 拉一次
+  function pollDramaJobs() {
+    if (jobTimer) return;   // 已有轮询在跑
+    jobTimer = setInterval(function () {
+      if (!CUR) { clearInterval(jobTimer); jobTimer = null; return; }
+      dGET('/' + CUR.id).then(function (res) {
+        if (!res.ok || !res.p.ok) return;
+        const before = CUR;
+        CUR = res.p.project;
+        const running = [];
+        (CUR.episodes || []).forEach(function (e) {
+          const j = e.composeJob || {};
+          if (j.state === 'running' || j.state === 'queued') running.push(e.id);
+          (e.shots || []).forEach(function (s) {
+            const tj = s.ttsJob || {};
+            if (tj.state === 'running') running.push('tts:' + s.id);
+          });
+        });
+        const rj = CUR.remixJob || {};
+        if (rj.state === 'running') running.push('remix');
+        if (!running.length) {
+          clearInterval(jobTimer);
+          jobTimer = null;
+          if (before !== CUR) {
+            // 某个 job 落地:如果是本集 compose,顺带报结果
+            const ep = curEp();
+            const rjNow = CUR.remixJob || {};
+            const j = ep && ep.composeJob;
+            if (rjNow.state === 'done') status('全剧重混完成!series.mp4 已可在「全剧重混」区预览/下载');
+            else if (rjNow.state === 'error') status('全剧重混失败:' + (rjNow.error || ''), true);
+            else if (j && j.state === 'done') status('合成完成!「成片」区已可预览/下载本集成片');
+            else if (j && j.state === 'error') status('合成失败:' + (j.error || ''), true);
+            else status('后台任务已完成');
+            if (ep && ep.composeJob && ep.composeJob.state === 'done') {
+              dGET('/' + CUR.id + '/warnings?eid=' + ep.id).then(function (wres) {
+                if (!wres.ok || !wres.p.ok) return;
+                const w = wres.p.warnings || [];
+                if (w.length) status('合成完成;⚠ ' + w.length + ' 镜台词比画面长被截断:'
+                  + w.map(function (x) { return x.scene; }).join('、'), true);
+              });
+            }
+          }
+        }
+        safeRender();
+      }).catch(function () { /* 网络抖动下一轮再试 */ });
+    }, 2000);
+  }
+
   function renderComposed() {
     const box = $('#composedBox');
     box.textContent = '';
-    if (!CUR.composed) return;
+    const ep = curEp();
+    if (!ep) return;
+    // 异步合成状态:queued/running 显示进度;done 渲染成片;error 报错
+    const job = ep.composeJob || {};
+    if (job.state === 'running' || job.state === 'queued') {
+      const t = Date.now();
+      if (!renderComposed._t0 || renderComposed._ep !== ep.id) renderComposed._t0 = t;
+      renderComposed._ep = ep.id;
+      const sec = Math.round((t - renderComposed._t0) / 1000);
+      box.appendChild(el('p', 'hint', (job.state === 'queued' ? '合成排队中' : 'ffmpeg 合成中…')
+        + '(已 ' + sec + ' 秒;镜头越多越久,可先编辑其他集)'));
+      return;
+    }
+    renderComposed._t0 = 0;
+    if (job.state === 'error') {
+      box.appendChild(el('p', 'hint err', '上次合成失败:' + (job.error || '') + '(点「合成成片」重试)'));
+    }
+    if (!ep.composed) return;
     const v = document.createElement('video');
     v.controls = true;
-    v.src = assetURL(CUR.composed);
+    v.src = assetURL(ep.composed);
     box.appendChild(v);
-    const a = el('a', 'download', '⬇ 下载成片');
-    a.href = assetURL(CUR.composed);
-    a.download = (CUR.title || 'drama') + '.mp4';
+    const a = el('a', 'download', '⬇ 下载本集成片');
+    a.href = assetURL(ep.composed);
+    a.download = ((CUR.title || 'drama') + '-' + (ep.title || 'ep') + '.mp4');
     box.appendChild(a);
+  }
+
+  // 全剧重混(P2.6):remixJob 状态轮询 + series.mp4 播放
+  function renderRemix() {
+    const box = $('#remixBox');
+    if (!box) return;
+    box.textContent = '';
+    if (!CUR) return;
+    const job = CUR.remixJob || {};
+    if (job.state === 'running') {
+      box.appendChild(el('p', 'hint', '全剧重混中…(逐集 loudnorm 响度归一→拼 series,可先做别的事)'));
+      return;
+    }
+    if (job.state === 'error') {
+      box.appendChild(el('p', 'hint err', '上次重混失败:' + (job.error || '') + '(再点一次重试)'));
+    }
+    if (job.state !== 'done') return;
+    const v = document.createElement('video');
+    v.controls = true;
+    v.src = assetURL('series.mp4');
+    box.appendChild(v);
+    const a = el('a', 'download', '⬇ 下载全剧(series.mp4)');
+    a.href = assetURL('series.mp4');
+    a.download = ((CUR.title || 'drama') + '-全剧.mp4');
+    box.appendChild(a);
+  }
+
+  // 成本透明化(P1.3):本集/全剧累计生成花费(镜头 cost 由素材落盘时累计)
+  function renderCostLine() {
+    const line = $('#costLine');
+    if (!line) return;
+    if (!CUR) { line.textContent = ''; return; }
+    const ep = curEp();
+    const sum = function (shots) {
+      return (shots || []).reduce(function (n, s) { return n + (Number(s.cost) || 0); }, 0);
+    };
+    const epCost = ep ? sum(ep.shots) : 0;
+    const all = (CUR.episodes || []).reduce(function (n, e) { return n + sum(e.shots); }, 0);
+    const parts = [];
+    if (epCost > 0) parts.push('本集 $' + epCost.toFixed(2));
+    if (all > 0) parts.push('全剧 $' + all.toFixed(2));
+    line.textContent = parts.length ? '生成成本:' + parts.join(' · ') + '(按镜头累计)' : '';
   }
 
   function patchShot(sid, fields) {
     dPOST('/' + CUR.id + '/shots/' + sid + '/update', fields).then(function (res) {
       if (!res.ok || !res.p.ok) { status('保存失败:' + (res.p.error || ''), true); return; }
       CUR = res.p.project;
-      const s = CUR.shots.find(function (x) { return x.id === sid; });
+      const s = findShotEverywhere(sid).shot;
       const badge = document.querySelector('.shot[data-id="' + sid + '"] .st');
       if (badge && s) badge.textContent = shotBadge(s);
     });
   }
 
   function moveShot(sid, delta) {
-    const ids = CUR.shots.map(function (s) { return s.id; });
+    const ep = curEp();
+    if (!ep) return;
+    const ids = ep.shots.map(function (s) { return s.id; });
     const i = ids.indexOf(sid);
     const j = i + delta;
     if (i < 0 || j < 0 || j >= ids.length) return;
     ids.splice(j, 0, ids.splice(i, 1)[0]);
-    dPOST('/' + CUR.id + '/shots/reorder', { order: ids }).then(function (res) { applyP(res); });
+    dPOST('/' + CUR.id + '/shots/reorder', { eid: ep.id, order: ids }).then(function (res) { applyP(res); });
   }
 
   // ---------- 生成 ----------
@@ -789,10 +1134,50 @@
       });
   }
 
+  // 追加三视图:同一角色的多角度资产(全剧集复用)。pose ∈ side|back|full|closeup。
+  // 参考图优先级:用户 refs > 已有定妆照+三视图(保脸保风格)> 纯文字。
+  const TRAIT_POSES = {
+    side: '同一角色的侧面全身像,完整身形与服装,侧面视角,光线均匀,纯色简洁背景',
+    back: '同一角色的背面全身像,完整身形与服装(发色/服装颜色与参考图一致),纯色简洁背景',
+    full: '同一角色的正面全身像,从头到脚完整身形与服装,站姿自然,纯色简洁背景',
+    closeup: '同一角色的面部特写,五官清晰,表情自然,纯色简洁背景',
+  };
+  function genTrait(ch, pose) {
+    if (!CUR) return;
+    if (ch.traitTaskId) { status('这一角色的三视图正在生成中', true); return; }
+    const look = (ch.desc || '').trim() || ch.name;
+    const prompt = '角色设定图:' + look + '。' + (TRAIT_POSES[pose] || TRAIT_POSES.full)
+      + '。必须与参考图是同一个人物:长相、发型、发色、服装风格严格一致'
+      + styleSuffix();
+    const refs = (ch.refs && ch.refs.length ? ch.refs.slice(0, 3)
+                  : [ch.asset].concat(ch.traits || []).filter(Boolean).slice(0, 3));
+    Promise.all(refs.map(function (rel) { return fileToDataURL(rel, 1024); }))
+      .then(function (imgs) {
+        const body = { model: IMG_MODEL, prompt: prompt, aspectRatio: '3:4', imageSize: '1K' };
+        const frames = imgs.filter(Boolean);
+        if (frames.length) body.referenceImages = frames;
+        return studioSubmit(body);
+      })
+      .then(function (res) {
+        if (!res.ok) { status('三视图提交失败:' + (ERRORS[res.p.error] || res.p.error || '未知错误'), true); return; }
+        poll[res.p.id] = { kind: 'trait', id: ch.id, startedAt: Date.now() };
+        dPOST('/' + CUR.id + '/chars/' + ch.id + '/update', { traitTaskId: res.p.id });
+        const badge = document.querySelector('.char[data-id="' + ch.id + '"] .char-status');
+        if (badge) badge.textContent = '三视图生成中…';
+        status('三视图任务已提交(一般 10~60 秒);完成后全剧集的镜头首帧都会引用它');
+        refreshQuota();
+      })
+      .catch(function (e) {
+        status('三视图提交失败:' + (e && e.message ? e.message : '参考图读取失败'), true);
+      });
+  }
+
   // 首帧参考图构成(E·一致性三板斧):[上一镜首帧=相邻场景衔接] + [第1镜首帧=全剧风格锚]
   // + [定妆照=角色锁脸],去重后 ≤5(上游上限)。返回 [{rel, role}]。
   function firstFrameRefs(shot) {
-    const idx = CUR.shots.indexOf(shot);
+    const ep = curEp();
+    if (!ep) return [];
+    const idx = ep.shots.indexOf(shot);
     const out = [];
     const seen = {};
     const pushRel = function (rel, role) {
@@ -800,21 +1185,46 @@
       seen[rel] = true;
       out.push({ rel: rel, role: role });
     };
-    const prev = idx > 0 ? CUR.shots[idx - 1] : null;
+    const prev = idx > 0 ? ep.shots[idx - 1] : null;
     if (prev && prev.firstFrame) pushRel(prev.firstFrame, 'prev');
-    if (idx > 0 && CUR.shots[0].firstFrame) pushRel(CUR.shots[0].firstFrame, 'anchor');
-    const charSlots = out.length ? 3 : 5;   // 有画面锚时定妆照最多 3 张,留位给衔接
-    (CUR.chars || []).filter(function (c) { return c.asset; })
-      .slice(0, charSlots).forEach(function (c) { pushRel(c.asset, 'char'); });
+    if (idx > 0 && ep.shots[0].firstFrame) pushRel(ep.shots[0].firstFrame, 'anchor');
+    const charSlots = out.length ? 3 : 5;   // 有画面锚时角色资产最多 3 张,留位给衔接
+    (CUR.chars || []).forEach(function (c) {
+      // 定妆照 + 三视图一起进参考池(先主定妆,再三视图;同角色只占一个槽位组)
+      [c.asset].concat(c.traits || []).filter(Boolean)
+        .slice(0, Math.max(1, Math.floor(charSlots / Math.max(1, (CUR.chars || []).filter(function (x) { return x.asset; }).length))))
+        .forEach(function (rel) { pushRel(rel, 'char'); });
+    });
     return out;
   }
 
   // 提交首帧生成。返回 Promise<{ok, error?}> 供串跑判断;手动按钮同样可用。
+  // 滑窗限流(P2.5):分钟池 3 次/分钟,自留 1 次余量给灵感/分镜等 LLM 调用;
+  // 提交间隔 <22s 时等待,保证串跑/一键成片不会瞬间撞 429。
+  function throttleSubmit() {
+    const WINDOW_MS = 60000, LIMIT = 2, SPACING = 22000;
+    const now = Date.now();
+    while (SUB_TIMES.length && now - SUB_TIMES[0] > WINDOW_MS) SUB_TIMES.shift();
+    let wait = 0;
+    if (SUB_TIMES.length >= LIMIT) {
+      wait = Math.max(0, WINDOW_MS - (now - SUB_TIMES[0])) + 500;
+    } else if (SUB_TIMES.length) {
+      const since = now - SUB_TIMES[SUB_TIMES.length - 1];
+      if (since < SPACING) wait = SPACING - since;
+    }
+    if (wait > 0) status('限额排队中,约 ' + Math.ceil(wait / 1000) + ' 秒后提交…');
+    return new Promise(function (resolve) {
+      setTimeout(function () { SUB_TIMES.push(Date.now()); resolve(); }, wait);
+    });
+  }
+
   function genFirstFrame(shot) {
     if (!CUR) return Promise.resolve({ ok: false, error: '项目未加载' });
     if (shot.firstTaskId) { status('这一镜的首帧正在生成中', true); return Promise.resolve({ ok: false, error: '该镜首帧已在生成中' }); }
     if (!shot.firstPrompt.trim()) { status('先填首帧提示词', true); return Promise.resolve({ ok: false, error: '首帧提示词为空' }); }
-    const idx = CUR.shots.indexOf(shot);
+    const ep = curEp();
+    if (!ep) return Promise.resolve({ ok: false, error: '项目未加载' });
+    const idx = ep.shots.indexOf(shot);
     const refs = firstFrameRefs(shot);
     const hasPrev = refs.some(function (r) { return r.role === 'prev'; });
     const hasAnchor = refs.some(function (r) { return r.role === 'anchor'; });
@@ -837,6 +1247,9 @@
     status('正在提交首帧生成…' + (hasPrev ? '(已锚定上一镜画面)' : ''));
     return Promise.all(refs.map(function (r) { return fileToDataURL(r.rel, 1024); }))
       .catch(function () { return []; })   // 参考图取不到就不带,别挡生成
+      .then(function (frames) {
+        return throttleSubmit().then(function () { return frames; });
+      })
       .then(function (frames) {
         const body = { model: IMG_MODEL, prompt: prompt,
                        aspectRatio: CUR.aspect || '9:16', imageSize: '1K' };
@@ -867,15 +1280,16 @@
   }
 
   function nativePrompt(shot) {
-    const lines = (shot.lines || '').split('\n').map(function (l) { return l.trim(); }).filter(Boolean)
+    const fmt = (shot.lines || '').split('\n').map(function (l) { return l.trim(); }).filter(Boolean)
       .map(function (l) {
         const who = l.indexOf(':') > 0 ? l.slice(0, l.indexOf(':')) : '';
         const say = l.indexOf(':') > 0 ? l.slice(l.indexOf(':') + 1) : l;
         return who ? (who + ' 用中文说: "' + say + '"') : ('说: "' + say + '"');
-      }).join(' 然后 ');
+      });
+    const lines = fmt.join(' 然后 ');
     const speakers = [];
-    lines.forEach(function (l) {
-      const who = l.indexOf(':') > 0 ? l.slice(0, l.indexOf(':')).trim() : '';
+    fmt.forEach(function (l) {
+      const who = l.indexOf(' ') > 0 ? l.slice(0, l.indexOf(' ')).trim() : '';
       if (who && speakers.indexOf(who) < 0) speakers.push(who);
     });
     const hints = speakers.map(voiceHintOf).filter(Boolean);
@@ -884,17 +1298,29 @@
       + '。口型与台词精确同步,声画同步,不加字幕,不出现文字。';
   }
 
+  // 模型自动分派(P1.3):开口→Veo 原生对白;⭐关键镜→可灵 pro;过场→可灵 std。
+  // 用户手动选了本镜模型(videoModel)则尊重手选。
+  function autoModelFor(shot, native) {
+    if (native) return 'google/veo-3.1-fast';
+    if (shot.videoModel) return shot.videoModel;
+    return shot.key ? 'kwaivgi/kling-v3.0-pro' : 'kwaivgi/kling-v3.0-std';
+  }
+
+  const MODEL_DURS = {
+    'kwaivgi/kling-v3.0-pro': (function () { const a = []; for (let i = 3; i <= 15; i++) a.push(i); return a; })(),
+    'kwaivgi/kling-v3.0-std': (function () { const a = []; for (let i = 3; i <= 15; i++) a.push(i); return a; })(),
+    'google/veo-3.1-fast': [4, 6, 8],
+  };
+
   function genClip(shot) {
     if (!CUR) return;
+    const ep = curEp();
+    if (!ep) return;
     if (shot.clipTaskId) { status('这一镜的成片正在生成中', true); return; }
     if (!shot.firstFrame) { status('先为这一镜生成首帧', true); return; }
     const native = shot.nativeDialog && shot.lines.trim();
     if (!native && !shot.motionPrompt.trim()) { status('先填运动提示词(或勾选「人物开口说台词」)', true); return; }
-    if (native) {
-      status('正在提交「人物开口」镜头(Veo 3.1 fast 原生对白)…');
-    } else {
-      status('正在提交视频生成…');
-    }
+    const model = autoModelFor(shot, native);
     // 开口镜头:Veo 3.1 fast 原生对白(音画一体,人物真开口);时长落到其支持档 4/6/8
     const NATIVE_DURS = [4, 6, 8];
     let dur = shot.duration || 5;
@@ -903,33 +1329,52 @@
       dur = NATIVE_DURS.find(function (d) { return d >= need; })
         || NATIVE_DURS[NATIVE_DURS.length - 1];
     }
-    fileToDataURL(shot.firstFrame, 1280).then(function (frame) {
-      const body = { model: native ? 'google/veo-3.1-fast' : (shot.videoModel || VID_MODEL),
+    // 时长兜底:模型不吃该时长就取最近支持档(自动分派 std/pro 后常见 16~30s 镜头)
+    const durs = MODEL_DURS[model];
+    if (durs && durs.indexOf(dur) < 0) {
+      dur = durs.reduce(function (a, b) { return Math.abs(b - dur) < Math.abs(a - dur) ? b : a; }, durs[0]);
+    }
+    // P1.1 首尾帧硬衔接:下一镜已有首帧且本镜非开口时,把本镜结尾"焊"到下一镜开头
+    const idx = ep.shots.indexOf(shot);
+    const next = idx + 1 < ep.shots.length ? ep.shots[idx + 1] : null;
+    const chain = !native && next && next.firstFrame && shot.chain !== false;
+    status(chain ? '正在提交视频生成…(🔗 已链下一镜首帧作尾帧,模型 ' + model + ')'
+                 : '正在提交视频生成…(模型 ' + model + ')');
+    const frameLoads = [fileToDataURL(shot.firstFrame, 1280)];
+    if (chain) frameLoads.push(fileToDataURL(next.firstFrame, 1280));
+    return throttleSubmit().then(function () {
+      return Promise.all(frameLoads);
+    }).then(function (imgs) {
+      const body = { model: model,
                      prompt: native ? nativePrompt(shot) : shot.motionPrompt.trim() + motionSuffix(),
-                     frameMode: 'first', duration: dur,
-                     referenceImages: [frame] };
+                     frameMode: chain ? 'first_last' : 'first', duration: dur,
+                     referenceImages: imgs.filter(Boolean) };
       if (native) { body.audio = true; body.resolution = '720p'; }
       return studioSubmit(body);
     }).then(function (res) {
-      if (!res.ok) { status('视频提交失败:' + (ERRORS[res.p.error] || res.p.error || '未知错误'), true); return; }
+      if (!res.ok) { status('视频提交失败:' + (ERRORS[res.p.error] || res.p.error || '未知错误'), true); return { ok: false, error: 'submit' }; }
       poll[res.p.id] = { kind: 'clip', id: shot.id, startedAt: Date.now() };
       patchShot(shot.id, { clipTaskId: res.p.id });
       status('视频任务已提交,后台生成中(可灵一般 1~5 分钟)');
       refreshQuota();
+      return { ok: true };
     }).catch(function (e) {
       status('视频提交失败:' + (e && e.message ? e.message : '首帧读取失败'), true);
+      return { ok: false, error: 'network' };
     });
   }
 
   function entryLabel(kind) {
-    return kind === 'portrait' ? '定妆照' : (kind === 'first' ? '首帧' : '成片');
+    return kind === 'portrait' ? '定妆照' : (kind === 'trait' ? '三视图'
+      : (kind === 'first' ? '首帧' : '成片'));
   }
 
   function clearTaskRef(entry) {
     if (!CUR) return;
-    if (entry.kind === 'portrait') {
+    if (entry.kind === 'portrait' || entry.kind === 'trait') {
       const c = CUR.chars.find(function (x) { return x.id === entry.id; });
-      if (c) dPOST('/' + CUR.id + '/chars/' + entry.id + '/update', { portraitTaskId: '' });
+      if (c) dPOST('/' + CUR.id + '/chars/' + entry.id + '/update',
+                   entry.kind === 'portrait' ? { portraitTaskId: '' } : { traitTaskId: '' });
       return;
     }
     const field = entry.kind === 'first' ? 'firstTaskId' : 'clipTaskId';
@@ -985,10 +1430,10 @@
           if (res.p.status === 'running') {
             const sec = Math.round((Date.now() - entry.startedAt) / 1000);
             const text = entryLabel(entry.kind) + '生成中… 已等待 ' + sec + ' 秒';
-            if (entry.kind === 'portrait') {
-              const badge = document.querySelector('.char[data-id="' + entry.id + '"] .char-status');
-              if (badge) badge.textContent = text;
-            } else {
+if (entry.kind === 'portrait' || entry.kind === 'trait') {
+            const badge = document.querySelector('.char[data-id="' + entry.id + '"] .char-status');
+            if (badge) badge.textContent = text;
+          } else {
               const line = document.querySelector('.shot[data-id="' + entry.id + '"] .shot-status');
               if (line) line.textContent = text;
               const st = document.querySelector('.shot[data-id="' + entry.id + '"] .st');
@@ -1006,9 +1451,12 @@
             return;
           }
           const body = Object.assign({
-            target: entry.kind === 'portrait' ? 'char' : 'shot',
+            target: (entry.kind === 'portrait' || entry.kind === 'trait') ? 'char' : 'shot',
             id: entry.id, kind: entry.kind,
           }, payload);
+          if (res.p.usage && typeof res.p.usage.cost === 'number' && res.p.usage.cost > 0) {
+            body.cost = res.p.usage.cost;   // 成本透明化:随素材落盘累计到镜头
+          }
           dPOST('/' + CUR.id + '/asset', body).then(function (up) {
             if (!up.ok || !up.p.ok) { settle(tid, null, '素材落盘失败:' + (up.p.error || '')); return; }
             settle(tid, up.p.project, null);
@@ -1021,8 +1469,10 @@
   // ---------- 成片 ----------
   function playAll() {
     if (!CUR) return;
-    const clips = CUR.shots.filter(function (s) { return s.clip; });
-    if (!clips.length) { status('还没有任何镜头成片,先生成视频', true); return; }
+    const ep = curEp();
+    if (!ep) return;
+    const clips = ep.shots.filter(function (s) { return s.clip; });
+    if (!clips.length) { status('本集还没有镜头成片,先生成视频', true); return; }
     const box = $('#playBox');
     box.textContent = '';
     const v = document.createElement('video');
@@ -1094,12 +1544,37 @@
   function genTts(shot) {
     if (!CUR) return;
     if (!shot.lines.trim()) { status('先在台词区写对白(一行一句「角色名:台词」)', true); return; }
-    status('正在生成配音…(Windows 本机 TTS,秒级)');
     dPOST('/' + CUR.id + '/shots/' + shot.id + '/tts', {}).then(function (res) {
       if (!res.ok || !res.p.ok) { status('配音失败:' + (res.p.error || ''), true); return; }
       CUR = res.p.project;
       safeRender();
-      status('配音已生成,合成时会自动混入;「合成成片」现在也会烧字幕');
+      status('配音任务已提交,后台合成中(完成后该镜状态更新);「合成成片」现在也会烧字幕');
+    });
+  }
+
+  // 单镜异步 TTS 任务:提交→轮询 ttsJob 到终态(串跑用,超时 120s)
+  function runTtsJob(shot) {
+    return new Promise(function (resolve) {
+      const fail = function (msg) { if (msg) status(msg, true); resolve(false); };
+      dPOST('/' + CUR.id + '/shots/' + shot.id + '/tts', {}).then(function (res) {
+        if (!res.ok || !res.p.ok) { fail('配音提交失败:' + (res.p.error || '')); return; }
+        CUR = res.p.project;
+        const started = Date.now();
+        const timer = setInterval(function () {
+          if (Date.now() - started > 120000) { clearInterval(timer); fail(); return; }
+          dGET('/' + CUR.id).then(function (r2) {
+            if (!r2.ok || !r2.p.ok) return;
+            CUR = r2.p.project;
+            const cur = findShotEverywhere(shot.id).shot;
+            const job = cur && cur.ttsJob;
+            if (cur && (cur.tts || (job && (job.state === 'done' || job.state === 'error')))) {
+              clearInterval(timer);
+              if (job && job.state === 'error') fail('配音失败:' + job.error);
+              else resolve(true);
+            }
+          });
+        }, 2500);
+      }).catch(function () { fail('配音提交网络中断'); });
     });
   }
 
@@ -1132,22 +1607,21 @@
     try {
       let pass = 0;
       const fails = [];
-      // 对白先行:有台词没配音的镜先生成配音(TTS 会自动把镜头时长校准到 ≥ 台词时长);
+      // 对白先行:有台词没配音的镜先生成配音(TTS 异步任务,这里轮询到 done/error);
       // 失败不再静默吞:记录并在结尾汇报(否则用户以为"有台词就该有配音",合成时才发现缺)
-      for (const s of CUR.shots) {
+      const epRun = curEp();
+      for (const s of epRun.shots) {
         if (s.lines && s.lines.trim() && !s.tts) {
-          status('串跑:生成第 ' + (CUR.shots.indexOf(s) + 1) + ' 镜配音(对白先行)…');
-          await dPOST('/' + CUR.id + '/shots/' + s.id + '/tts', {}).then(function (res) {
-            if (res.ok && res.p.ok) { CUR = res.p.project; pass++; }
-            else fails.push('第' + (CUR.shots.indexOf(s) + 1) + '镜配音:' + (res.p.error || '失败'));
-          }).catch(function () {
-            fails.push('第' + (CUR.shots.indexOf(s) + 1) + '镜配音:网络中断');
+          status('串跑:生成第 ' + (epRun.shots.indexOf(s) + 1) + ' 镜配音(对白先行)…');
+          await runTtsJob(s).then(function (ok) {
+            if (ok) pass++;
+            else fails.push('第' + (epRun.shots.indexOf(s) + 1) + '镜配音:失败/超时');
           });
         }
       }
       // 并行生成首帧(受上游并发限制,这里用 Promise.all 让所有缺首帧的镜同时提交)
       const firstFramePromises = [];
-      CUR.shots.forEach((s) => {
+      epRun.shots.forEach((s) => {
         if (!s.firstFrame) {
           firstFramePromises.push(genFirstFrameAwait(s));
         }
@@ -1156,20 +1630,51 @@
       await Promise.all(firstFramePromises);
       pass += firstFramePromises.length;
 
-      // 首帧全部就绪后,并行生成成片
+      // 首帧全部就绪后,并行生成成片(自动续跑:next 镜首帧链依赖已满足)
       const clipPromises = [];
-      CUR.shots.forEach((s) => {
+      epRun.shots.forEach((s) => {
         if (s.firstFrame && !s.clip) {
           clipPromises.push(genClipAwait(s));
         }
       });
-      if (clipPromises.length) status('串跑:并行生成 ' + clipPromises.length + ' 镜成片…');
+      if (clipPromises.length) status('一键成片:并行生成 ' + clipPromises.length + ' 镜成片…');
       await Promise.all(clipPromises);
       pass += clipPromises.length;
-      if (fails.length) status('串跑完成,但有失败(其余 ' + pass + ' 个任务正常):' + fails.join(';'), true);
-      else status('串跑完成:' + pass + ' 个任务已提交/完成(限额每分钟 3 次,排队自动等)');
+
+      // 关键镜抽卡(P1.2):⭐镜已有 1 候选时自动再抽一条,成片后到候片墙择优
+      const keyShots = [];
+      const epNow = curEp();
+      epNow.shots.forEach(function (s) {
+        const clipTakes = (s.takes || []).filter(function (t) { return t.kind === 'clip'; });
+        if (s.key && s.clip && clipTakes.length < 2) keyShots.push(s);
+      });
+      if (keyShots.length) {
+        status('一键成片:为 ' + keyShots.length + ' 个 ⭐关键镜再抽一条候选…');
+        for (const s of keyShots) {
+          await genClipAwait(s);
+          pass++;
+        }
+      }
+
+      // 自动合成(两道卡点之间全自动;终片审在合成后手动做)
+      if (!fails.length) {
+        const epFinal = curEp();
+        const pending = epFinal.shots.filter(function (s) { return !s.clip; }).length;
+        if (!pending) {
+          status('一键成片:全部镜头就绪,自动开始本集合成…');
+          await dPOST('/' + CUR.id + '/compose', { burnSubs: $('#pBurnSubs').checked, eid: epFinal.id })
+            .then(function (res) {
+              if (res.ok && res.p.ok) { CUR = res.p.project; pollDramaJobs(); }
+              return null;
+            });
+        } else {
+          fails.push(pending + ' 镜仍无成片,跳过自动合成');
+        }
+      }
+      if (fails.length) status('一键成片完成,但有失败(其余 ' + pass + ' 个任务正常):' + fails.join(';'), true);
+      else status('一键成片完成:' + pass + ' 个任务已执行,合成在后台跑;完成后在「成片」区终审,可到候片墙换候选');
     } catch (e) {
-      status('串跑中断:' + (e && e.message ? e.message : '网络错误') + '。已生成的部分保留,再点一次会从缺的地方继续', true);
+      status('一键成片中断:' + (e && e.message ? e.message : '网络错误') + '。已生成的部分保留,再点一次会从缺的地方继续', true);
     } finally {
       setBusy(false);
     }
@@ -1186,7 +1691,7 @@
         dGET('/' + CUR.id).then(res => {
           if (res.ok && res.p.ok) {
             CUR = res.p.project;
-            const cur = CUR.shots.find(x => x.id === shot.id);
+            const cur = findShotEverywhere(shot.id).shot;
             if (cur && (cur.firstFrame || (!cur.firstTaskId && !cur.firstFrame))) {
               clearInterval(timer);
               resolve();
@@ -1206,7 +1711,7 @@
         dGET('/' + CUR.id).then(res => {
           if (res.ok && res.p.ok) {
             CUR = res.p.project;
-            const cur = CUR.shots.find(x => x.id === shot.id);
+            const cur = findShotEverywhere(shot.id).shot;
             if (cur && (cur.clip || (!cur.clipTaskId && !cur.clip))) {
               clearInterval(timer);
               resolve();
@@ -1252,15 +1757,31 @@
 
   $('#btnClearShots').addEventListener('click', function () {
     if (!CUR) return;
-    if (!CUR.shots.length) { status('当前没有镜头'); return; }
-    if (!confirm('一键清空全部 ' + CUR.shots.length + ' 个镜头(连同首帧/成片/配音素材)?\n角色与定妆照保留。不可恢复!')) return;
+    const ep = curEp();
+    if (!ep || !ep.shots.length) { status('本集没有镜头'); return; }
+    if (!confirm('清空「' + (ep.title || '本集') + '」全部 ' + ep.shots.length + ' 个镜头(连同首帧/成片/配音素材)?\n角色库与其它集保留。不可恢复!')) return;
     COLLAPSED.clear();
-    dPOST('/' + CUR.id + '/shots/clear').then(function (res) {
+    dPOST('/' + CUR.id + '/shots/clear', { eid: ep.id }).then(function (res) {
       if (!res.ok || !res.p.ok) { status('清空失败:' + (res.p.error || ''), true); return; }
       CUR = res.p.project;
       safeRender();
-      status('已清空全部分镜:改好故事梗概后点「✨ 生成分镜」重新起草');
+      status('已清空本集分镜:改好本集梗概后点「✨ 生成分镜」重新起草');
     });
+  });
+
+  // 本集梗概:失焦即保存(分镜起草时注入;改动不打断编辑流)
+  $('#epSynopsis').addEventListener('change', function () {
+    if (!CUR) return;
+    const ep = curEp();
+    if (!ep) return;
+    const v = this.value;
+    if (v.trim() === (ep.synopsis || '')) return;
+    dPOST('/' + CUR.id + '/eps/' + ep.id + '/update', { synopsis: v })
+      .then(function (res) {
+        if (!res.ok || !res.p.ok) { status('本集梗概保存失败:' + (res.p.error || ''), true); return; }
+        CUR = res.p.project;
+        status('本集梗概已保存;生成分镜时会自动注入衔接全剧');
+      });
   });
 
   $('#pAdvanced').addEventListener('change', function () {
@@ -1285,8 +1806,9 @@
     if (!CUR || BUSY) return;
     if (!$('#pLogline').value.trim()) { status('先填一句话故事', true); return; }
     // 查重:90 秒内刚成功加过分镜,提醒防止上次"网络错误"但实际成功造成的重复
+    const epSb = curEp();
     const recent = (CUR.updatedAt && (Date.now() - new Date(CUR.updatedAt).getTime()) < 90000
-      && CUR.shots.length > 0);
+      && epSb && epSb.shots.length > 0);
     if (recent && !confirm('这个项目 90 秒内刚更新过(上次分镜可能已成功生成)。再点会追加新镜头,继续吗?(不确定就先刷新页面看看镜头数)')) return;
     const withLines = $('#pWithLines').checked;
     setBusy(true, '保存项目信息并起草分镜…(约 10~30 秒' + (withLines ? ',带台词' : '') + ')');
@@ -1327,28 +1849,49 @@
 
   $('#btnCompose').addEventListener('click', function () {
     if (!CUR) return;
+    const ep = curEp();
+    if (!ep) return;
     $('#btnCompose').disabled = true;
     const burn = $('#pBurnSubs').checked;
-    status('ffmpeg 合成中…(镜头越多越久' + (burn ? ';烧录字幕' : ';不烧字幕') + ')');
-    dPOST('/' + CUR.id + '/compose', { burnSubs: burn }).then(function (res) {
+    status('已提交合成任务…(ffmpeg 后台运行,镜头越多越久' + (burn ? ';烧录字幕' : ';不烧字幕') + ')');
+    dPOST('/' + CUR.id + '/compose', { burnSubs: burn, eid: ep.id }).then(function (res) {
       $('#btnCompose').disabled = false;
-      if (!res.ok || !res.p.ok) { status('合成失败:' + (res.p.error || ''), true); return; }
+      if (!res.ok || !res.p.ok) { status('合成提交失败:' + (res.p.error || ''), true); return; }
       CUR = res.p.project;
       safeRender();
-      syncSelTitle();
-      const w = res.p.warnings || [];
-      status('合成完成,可在「成片」区预览与下载'
-        + (w.length ? ';⚠ ' + w.length + ' 镜台词可能被截断(配音 ' + w.map(function (x) { return x.scene + ' ' + x.ttsDur + 's>片' + x.clipDur + 's'; }).join(';') + '),建议拉长该镜时长后重roll' : ''));
+      // 拉取合成前预警(台词比成片长的镜头,合成时会被截断)
+      dGET('/' + CUR.id + '/warnings?eid=' + ep.id).then(function (wres) {
+        if (!wres.ok || !wres.p.ok) return;
+        const w = wres.p.warnings || [];
+        if (w.length) {
+          status('合成进行中;⚠ ' + w.length + ' 镜台词比画面长,会被截断:' +
+            w.map(function (x) { return x.scene; }).join('、'), true);
+        }
+      });
     }).catch(function () {
       $('#btnCompose').disabled = false;
-      status('合成请求失败:网络错误', true);
+      status('合成提交网络中断;后台可能已在跑,稍后刷新页面看「成片」区', true);
+    });
+  });
+
+  $('#btnRemix').addEventListener('click', function () {
+    if (!CUR) return;
+    const eps = (CUR.episodes || []).filter(function (e) { return e.composed; });
+    if (!eps.length) { status('还没有任何集成片:先逐集(或一键成片)合成', true); return; }
+    if (!confirm('全剧重混:对 ' + eps.length + ' 个已合成集逐集响度归一(loudnorm),再拼成 series.mp4(含片头片尾字卡)?\nffmpeg 后台运行,时长约等于全部成片总长。')) return;
+    dPOST('/' + CUR.id + '/remix', {}).then(function (res) {
+      if (!res.ok || !res.p.ok) { status('重混提交失败:' + (res.p.error || ''), true); return; }
+      CUR = res.p.project;
+      safeRender();
+      pollDramaJobs();
+      status('全剧重混已提交,后台运行中…');
     });
   });
 
   $('#btnPlayAll').addEventListener('click', playAll);
   $('#btnRunAll').addEventListener('click', function () {
     if (!CUR || BUSY) return;
-    if (!confirm('一键串跑:自动为全部缺首帧的镜头生成首帧,再为全部缺成片的镜头生成视频?\n将按限额排队(每分钟 3 次),期间请勿手动提交任务。')) return;
+    if (!confirm('一键成片:自动为全部缺首帧/成片的镜头生成,⭐关键镜自动再抽一条候选,最后自动合成出本集成片。\n全程按限额排队(约每 22 秒一单),期间请勿手动提交任务。')) return;
     runAll();
   });
   $('#playModal').addEventListener('click', function (e) { if (e.target === this) this.style.display = 'none'; });

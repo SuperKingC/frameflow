@@ -171,7 +171,28 @@ def ground(phrase):
         elif boxes:
             out.append({"label": label, "bbox": boxes, "task": "ground"})
     out = _clean_gen(out)
+    out = _drop_supersets(out)
     return {"ok": True, "phrase": phrase, "instances": out[:20]}
+
+
+def _drop_supersets(insts):
+    """同一查询返回多个框时,丢弃"几乎完全包住更小框"的大框
+    (Florence 习惯先给全局大框、再给精确部件框;拆件只要后者)。"""
+    def _area(b):
+        return max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+
+    def _contained(inner, outer):
+        ix = max(0, min(inner[2], outer[2]) - max(inner[0], outer[0]))
+        iy = max(0, min(inner[3], outer[3]) - max(inner[1], outer[1]))
+        return (ix * iy) / max(_area(inner), 1)
+
+    keep = []
+    for i, a in enumerate(insts):
+        smaller = [b for j, b in enumerate(insts) if j != i and _area(b["bbox"]) < _area(a["bbox"])]
+        if any(_contained(b["bbox"], a["bbox"]) > 0.85 for b in smaller):
+            continue  # a 几乎完全包住某个更小框 → 丢大留小
+        keep.append(a)
+    return keep
 
 
 def _clean_gen(instances):
@@ -198,7 +219,7 @@ def main():
             req = json.loads(line)
             cmd = req.get("cmd")
             if cmd == "ping":
-                resp = {"ok": True, "device": DEVICE, "model": "Florence-2-base"}
+                resp = {"ok": True, "device": DEVICE, "model": Path(MD).name}
             elif cmd == "load_image":
                 resp = load_image(req["image_b64"])
             elif cmd == "instances":
