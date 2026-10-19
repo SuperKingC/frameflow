@@ -176,9 +176,12 @@ try:
     st, r = call("POST", f"/api/drama/projects/{pid}/asset",
                  {"target": "shot", "id": s1, "kind": "clip",
                   "dataUrl": "data:video/mp4;base64," + b64(tmp / "c1.mp4")})
-    check("asset clip s1", st == 200 and next(
-        s for e in r["project"]["episodes"] if e["id"] == e1
-        for s in e["shots"] if s["id"] == s1)["clip"] == f"shots/{s1}_clip.mp4", r)
+    # P1.2 抽卡后 clip 命名为 shots/{sid}_clip_{n}_{uuid}.mp4(不覆盖旧 take)
+    shot1 = next(s for e in r["project"]["episodes"] if e["id"] == e1
+                 for s in e["shots"] if s["id"] == s1)
+    check("asset clip s1", st == 200 and shot1["clip"].startswith(f"shots/{s1}_clip")
+          and shot1["clip"].endswith(".mp4")
+          and len(shot1.get("takes") or []) == 1, shot1.get("clip"))
     st, r = call("POST", f"/api/drama/projects/{pid}/asset",
                  {"target": "shot", "id": s2, "kind": "clip",
                   "dataUrl": "data:video/mp4;base64," + b64(tmp / "c2.mp4")})

@@ -234,3 +234,11 @@
 @media (max-width: 900px) {
   .shot-media video { max-width: none; }
 }
+/* P2 封面候选墙:合成后自动抽 3 帧展示(点击放大;右键保存发平台) */
+.cover-wall { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 2px; }
+.cover-thumb {
+  width: 84px; height: 150px; object-fit: cover; /* 9:16 竖屏缩略 */
+  border-radius: 8px; border: 1px solid var(--line-strong); display: block;
+  cursor: pointer; transition: border-color .15s ease;
+}
+.cover-thumb:hover { border-color: rgba(52, 211, 153, .5); }

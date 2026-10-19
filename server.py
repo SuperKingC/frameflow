@@ -1542,9 +1542,16 @@ DRAMA_PID_RE = re.compile(r"^[a-f0-9]{12}$")
 DRAMA_EID_RE = re.compile(r"^e[a-f0-9]{11}$")
 DRAMA_REL_RE = re.compile(
     r"^(?:composed(?:_[A-Za-z0-9]+)?\.mp4|mixed_[A-Za-z0-9]+\.mp4|series\.mp4|"
+    r"bgm\.(?:mp3|m4a|wav)|cover_[A-Za-z0-9_]+\.(?:jpg|png)|"
     r"(?:chars|shots)/[A-Za-z0-9_-]+\.(?:png|jpg|jpeg|webp|mp4|wav))$")
-DRAMA_DATAURL_RE = re.compile(r"^data:(image/(?:png|jpeg|webp)|video/mp4);base64,([A-Za-z0-9+/=]+)$")
-DRAMA_MIME_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "video/mp4": "mp4"}
+DRAMA_DATAURL_RE = re.compile(
+    r"^data:((?:image/(?:png|jpeg|webp)|video/mp4|audio/(?:mpeg|mp4|wav)));base64,([A-Za-z0-9+/=]+)$")
+DRAMA_MIME_EXT = {
+    "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "video/mp4": "mp4",
+    "audio/mpeg": "mp3", "audio/mp4": "m4a", "audio/wav": "wav", "audio/x-wav": "wav",
+}
+DRAMA_AUDIO_MIMES = ("audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav")
+DRAMA_BGM_GAIN = 0.25  # BGM 垫底音量(-12dB),压在原声/配音之下
 _DRAMA_LOCK = threading.Lock()  # project.json 读改写全程持锁,避免并发丢更新(项目量小,文件 IO 快)
 
 # 风格快选(填进项目「画面风格」,仍可手改;会经 styleSuffix 进所有镜头/定妆提示词)
@@ -3024,6 +3031,39 @@ def _drama_asset_store(pid, params):
     return _drama_mutate(pid, apply)
 
 
+def _drama_bgm_store(pid, params):
+    """BGM 音轨(P2):dataURL/file/url 落盘为 bgm.<ext> 并记 project.bgm;clear=true 清除。
+    合成时把 BGM 混成 -12dB 底噪垫底(_drama_compose),原声/配音在其上。"""
+    data = _drama_read(pid)
+    if params.get("clear") is True:
+        old = data.get("bgm")
+
+        def apply_clear(d):
+            d.pop("bgm", None)
+        if old:
+            try:
+                (DRAMA_DIR / pid / old).unlink()
+            except OSError:
+                pass
+        return _drama_mutate(pid, apply_clear)
+    raw, ext = _drama_asset_bytes(params)
+    if ext not in ("mp3", "m4a", "wav"):
+        raise RuntimeError("BGM 仅支持 mp3/m4a/wav 音频")
+    rel = f"bgm.{ext}"
+    (DRAMA_DIR / pid / rel).parent.mkdir(parents=True, exist_ok=True)
+    (DRAMA_DIR / pid / rel).write_bytes(raw)
+    old = data.get("bgm")
+    if old and old != rel:
+        try:
+            (DRAMA_DIR / pid / old).unlink()
+        except OSError:
+            pass
+
+    def apply(d):
+        d["bgm"] = rel
+    return _drama_mutate(pid, apply)
+
+
 def _drama_char_refs_add(pid, cid, params):
     """角色参考图上传:dataURL 存储(≤5 张、单张 ≤2MB,jpg/png/webp);命名 <cid>_ref<i>.<ext>。"""
     data_url = params.get("dataUrl") if isinstance(params.get("dataUrl"), str) else ""
@@ -3121,7 +3161,28 @@ def _ffprobe_has_audio(path):
         return False
 
 
-def _drama_compose(pid, eid, burn_subs=False):
+def _drama_extract_covers(pid, eid, video):
+    """P2-3 封面抽取:按 10%/40%/70% 时长点各抽 1 帧存 cover_<eid>_<1..3>.jpg。
+    返回相对路径列表(按序);单帧失败跳过不阻塞合成;全失败返回 []。"""
+    proj_dir = DRAMA_DIR / pid
+    dur = _ffprobe_duration(video)
+    if dur <= 0:
+        return []
+    rels = []
+    for i, frac in enumerate((0.1, 0.4, 0.7), 1):
+        name = f"cover_{eid}_{i}.jpg"
+        p = proj_dir / name
+        r = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                            "-ss", f"{max(0.0, dur * frac - 0.1):.3f}",
+                            "-i", video.as_posix(),
+                            "-frames:v", "1", "-q:v", "3", p.as_posix()],
+                           timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if r.returncode == 0 and p.exists() and p.stat().st_size > 1000:
+            rels.append(name)
+    return rels
+
+
+def _drama_compose(pid, eid, burn_subs=False, use_bgm=True):
     """拼接本集全部已生成镜头成片(输出 composed_<eid>.mp4,按集归档)。
     1) 无配音需求时:流复制(-c copy)秒拼零转码——但 concat demuxer 拼部分 H.264 流
        (实测可灵成片,B 帧/访问单元边界问题)会把视频流拼坏:包数缺失、pts 拉长
@@ -3129,7 +3190,10 @@ def _drama_compose(pid, eid, burn_subs=False):
     2) 校验不过退级 concat filter 重编码:统一缩放/加黑边到首镜画幅,音轨齐就连音一起拼;
     3) 有镜头生成过配音(tts wav)或要烧字幕时:走逐镜 amix 重编码——每镜先把配音
        (adelay 起始 0.5s)混入原音轨(视频够长就截断配音、不够则音频延到片尾淡出),
-       再 concat;burn_subs 同时把该镜 lines 烧成底部字幕。"""
+       再 concat;burn_subs 同时把该镜 lines 烧成底部字幕;
+    4) 项目挂了 BGM(bgm.mp3/m4a/wav)且 use_bgm:拼完后 amix 一条 -12dB 循环垫底
+       音轨(片尾 1.5s 淡出),随后抽 10%/40%/70% 三帧存 cover_<eid>_<1..3>.jpg
+       直通 ops 素材库(封面发布,无需先入库)。"""
     data = _drama_read(pid)
     shots = [s for s in _drama_ep_by_id(data, eid).get("shots", []) if s.get("clip")]
     clips = [DRAMA_DIR / pid / s["clip"] for s in shots]
@@ -3141,9 +3205,12 @@ def _drama_compose(pid, eid, burn_subs=False):
     tts_list = [DRAMA_DIR / pid / s["tts"] for s in shots if s.get("tts")]
     tts_list = [p for p in tts_list if p.exists()]
     need_mix = bool(tts_list) or burn_subs
+    bgm_rel = data.get("bgm")
+    bgm_path = (proj_dir / bgm_rel) if bgm_rel else None
+    use_bgm = bool(use_bgm) and bool(bgm_path and bgm_path.exists())
     expect = sum(_ffprobe_duration(p) for p in clips)
     ok = False
-    if not need_mix and len(clips) > 1:
+    if not need_mix and not use_bgm and len(clips) > 1:
         lst = proj_dir / f"concat_{eid}.txt"
         lst.write_text("".join(f"file '{p.as_posix()}'\n" for p in clips), encoding="utf-8")
         base = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
@@ -3158,7 +3225,7 @@ def _drama_compose(pid, eid, burn_subs=False):
     if not ok:
         if _ffprobe_duration(clips[0]) <= 0:
             raise RuntimeError("成片文件无法读取(可能已损坏),请重roll该镜")
-        if len(clips) == 1 and not need_mix:
+        if len(clips) == 1 and not need_mix and not use_bgm:
             shutil.copyfile(clips[0], out)  # 单镜直接取该镜成片
         else:
             w, h = _ffprobe_size(clips[0])
@@ -3249,6 +3316,22 @@ def _drama_compose(pid, eid, burn_subs=False):
                 graph = graph.replace("[vc][a]", f"[vc][a];[vc]subtitles={srt_rel}[vout]", 1) \
                     if graph.endswith("[vc][a]") else graph + f";[vc]subtitles={srt_rel}[vout]"
                 maps = [m if m != "[v]" else "[vout]" for m in maps]
+            # P2 BGM:重编码分支挂一条循环垫底音轨,与 concat 音轨 amix(-12dB,片尾 1.5s 淡出)
+            if use_bgm:
+                # ffmpeg 输入序号 = 视频流 n + 台词 wav 数;inputs 是参数对列表,不能拿长度当序号
+                bgm_in = n + len(tts_inputs)
+                inputs += ["-stream_loop", "-1", "-i", bgm_path.as_posix()]
+                fade_at = max(0.0, expect - 1.5)
+                bg_chain = (f"[{bgm_in}:a]aformat=sample_rates=44100:channel_layouts=stereo,"
+                            f"volume={DRAMA_BGM_GAIN},"
+                            f"afade=t=out:st={fade_at:.3f}:d=1.5[bg]")
+                if any(m == "[a]" for m in maps):
+                    graph += f";{bg_chain};[a][bg]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[am]"
+                    maps = [m if m != "[a]" else "[am]" for m in maps]
+                else:
+                    # 无原声 concat([v] 单输出):BGM 音轨直接作为成片唯一音轨
+                    graph += f";{bg_chain}"
+                    maps = maps + ["-map", "[bg]", "-c:a", "aac", "-b:a", "160k"]
             cmd = (["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"] + inputs
                    + ["-filter_complex", graph] + maps
                    + ["-c:v", "libx264", "-crf", "20", "-preset", "medium", out.as_posix()])
@@ -3262,9 +3345,12 @@ def _drama_compose(pid, eid, burn_subs=False):
         if expect > 0 and abs(_ffprobe_duration(out) - expect) >= 0.8:
             raise RuntimeError("合成结果时长异常,请检查各镜成片是否可播")
     rel = f"composed_{eid}.mp4"
+    covers = _drama_extract_covers(pid, eid, out)
 
     def apply(d):
-        _drama_ep_by_id(d, eid)["composed"] = rel
+        ep = _drama_ep_by_id(d, eid)
+        ep["composed"] = rel
+        ep["covers"] = covers
     return _drama_mutate(pid, apply)
 
 
@@ -3411,7 +3497,7 @@ _DRAMA_JOB_LOCK = threading.Lock()
 _DRAMA_JOB_KINDS = ("compose", "tts")
 
 
-def _drama_job_start(pid, kind, eid=None, sid=None, burn_subs=True):
+def _drama_job_start(pid, kind, eid=None, sid=None, burn_subs=True, use_bgm=True):
     if kind not in _DRAMA_JOB_KINDS:
         raise RuntimeError("任务类型不合法")
     # 先做前置校验(同步返回错误,不等轮询):缺成片/缺台词立刻反馈
@@ -3449,7 +3535,7 @@ def _drama_job_start(pid, kind, eid=None, sid=None, burn_subs=True):
     if kind == "tts":
         target, fn = ("shot", lambda: _drama_shot_tts(pid, eid, sid))
     else:
-        target, fn = ("episode", lambda: _drama_compose(pid, eid, burn_subs))
+        target, fn = ("episode", lambda: _drama_compose(pid, eid, burn_subs, use_bgm))
 
     def run():
         try:
@@ -3945,7 +4031,8 @@ def _ops_optimize(params):
     return out[:5]
 
 # 素材库:现成小多利资产的只读白名单(按目录扫描,新文件自动出现);P2 起开放视频
-# (mp4/webp 动画)并把短剧工作台的成片/镜头成片挂进来(name = drama-<pid>-composed|shot-<sid>.mp4)
+# (mp4/webp 动画)并把短剧工作台的成片/镜头成片挂进来(name = drama-<pid>-composed|shot-<sid>.mp4);
+# P2 封面直通:drama-<pid>-cover-<eid>-<n>.jpg(composed_<eid> 合成时自动抽 3 帧)
 _OPS_LIBRARY_DIRS = (
     ("姿势图", GENWORK / "duoli_final"),
     ("风格图", GENWORK / "duoli_refs"),
@@ -3955,7 +4042,9 @@ _OPS_LIBRARY_DIRS = (
     ("真狗实拍", ROOT / "testdata" / "duoli_ref"),
 )
 _OPS_LIB_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4")
-_OPS_DRAMA_LIB_RE = re.compile(r"^drama-([a-f0-9]{12})-(composed|shot-([a-f0-9]{12}))\.mp4$")
+_OPS_DRAMA_LIB_RE = re.compile(
+    r"^drama-([a-f0-9]{12})-(composed|shot-([a-f0-9]{12}))\.mp4$|"
+    r"^drama-([a-f0-9]{12})-cover-(e[a-f0-9]{11})-([1-3])\.jpg$")
 
 
 def _ops_library_scan():
@@ -3984,6 +4073,11 @@ def _ops_library_scan():
             composed = pd / "composed.mp4"
             if composed.is_file():
                 add(f"drama-{pd.name}-composed.mp4", "短剧成片", composed)
+            # P2-3 封面直通:cover_<eid>_<1..3>.jpg(compose 成功时自动抽取)
+            for f in sorted(pd.glob("cover_*.jpg")):
+                m = re.fullmatch(r"cover_(e[a-f0-9]{11})_([1-3])\.jpg", f.name)
+                if m:
+                    add(f"drama-{pd.name}-cover-{m.group(1)}-{m.group(2)}.jpg", "短剧封面", f)
             shots = pd / "shots"
             if shots.is_dir():
                 for f in sorted(shots.glob("*_clip.mp4")):
@@ -3998,8 +4092,11 @@ def _ops_library_file(name):
         raise RuntimeError("文件名不合法")
     m = _OPS_DRAMA_LIB_RE.fullmatch(name or "")
     if m:  # 短剧挂接:名字→drama 项目内真实路径(均带正则校验,无穿越面)
-        p = DRAMA_DIR / m.group(1) / (
-            "composed.mp4" if m.group(2) == "composed" else f"shots/{m.group(3)}_clip.mp4")
+        if m.group(4):  # 封面分支:drama-<pid>-cover-<eid>-<n>.jpg
+            p = DRAMA_DIR / m.group(4) / f"cover_{m.group(5)}_{m.group(6)}.jpg"
+        else:
+            p = DRAMA_DIR / m.group(1) / (
+                "composed.mp4" if m.group(2) == "composed" else f"shots/{m.group(3)}_clip.mp4")
         if p.is_file():
             return p
         raise RuntimeError("素材不存在")
@@ -4397,7 +4494,8 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
             if sub == "compose":
                 # 异步合成:立即返回任务状态,前端轮询 GET 项目(composeJob);burnSubs=false 时不烧字幕
                 project = _drama_job_start(pid, "compose", _need_eid(),
-                                           burn_subs=(params.get("burnSubs") is not False))
+                                           burn_subs=(params.get("burnSubs") is not False),
+                                           use_bgm=(params.get("bgm") is not False))
                 self._json({"ok": True, "project": project})
                 return
             if sub == "remix":
@@ -4423,6 +4521,9 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                 self._json({"ok": True, "project": _drama_recap(pid, _need_eid(), params)})
             elif sub == "asset":
                 self._json({"ok": True, "project": _drama_asset_store(pid, params)})
+            elif sub == "bgm":
+                # P2 BGM 音轨:上传 mp3/m4a/wav 存 bgm.<ext>;clear=true 清除。合成时 -12dB 垫底混入
+                self._json({"ok": True, "project": _drama_bgm_store(pid, params)})
             elif sub == "shots/add":
                 self._json({"ok": True, "project": _drama_shot_add(pid, _need_eid(), params)})
             elif sub == "shots/reorder":
@@ -4441,7 +4542,8 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
                     return
                 if m3.group(2) == "compose":
                     project = _drama_job_start(pid, "compose", m3.group(1),
-                                               burn_subs=(params.get("burnSubs") is not False))
+                                               burn_subs=(params.get("burnSubs") is not False),
+                                               use_bgm=(params.get("bgm") is not False))
                 elif m3.group(2) == "update":
                     project = _drama_episode_update(pid, m3.group(1), params)
                 elif m3.group(2) == "delete":

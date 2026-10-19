@@ -79,8 +79,15 @@
       <h3 style="margin-top:16px">成片</h3>
       <button class="btn primary wide" id="btnCompose" hidden>合成成片(有配音的镜自动混音)</button>
       <label class="row" style="margin-top:8px"><input type="checkbox" id="pBurnSubs" checked> 烧录台词字幕(底部;勾选才加)</label>
+      <div class="row" id="bgmRow" hidden style="margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <label style="display:flex;gap:4px;align-items:center"><input type="checkbox" id="pBgm" checked> BGM 垫底混音</label>
+        <button class="btn" id="btnBgmPick">🎵 挂 BGM</button>
+        <button class="btn" id="btnBgmClear" hidden>🗑 取消</button>
+        <span class="hint" id="bgmName"></span>
+      </div>
       <button class="btn wide" id="btnPlayAll" hidden style="margin-top:8px">▶ 连播预览</button>
       <button class="btn wide" id="btnRunAll" hidden style="margin-top:8px">🚀 一键成片(配音→首帧→视频→自动合成,⭐镜自动抽卡)</button>
+      <button class="btn wide" id="btnSeasonRun" hidden style="margin-top:8px">📺 整季串跑(逐集一键成片,跳过已完成集,额度耗尽自动暂停)</button>
       <button class="btn wide" id="btnRemix" hidden style="margin-top:8px">🎬 全剧重混(统一响度+跨集拼成 series.mp4)</button>
       <div id="composedBox"></div>
       <div id="remixBox"></div>

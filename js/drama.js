@@ -13,7 +13,7 @@
 
   function setBusy(on, msg) {
     BUSY = on;
-    ['btnStoryboard', 'btnRunAll', 'btnCompose', 'btnNew', 'btnDelProj', 'btnAddShot', 'btnAddChar',
+    ['btnStoryboard', 'btnRunAll', 'btnSeasonRun', 'btnCompose', 'btnBgmPick', 'btnBgmClear', 'btnNew', 'btnDelProj', 'btnAddShot', 'btnAddChar',
      'btnIdea', 'btnBrainstorm', 'btnClearShots', 'projSel']
       .forEach(function (id) {
         const elx = $('#' + id);
@@ -35,6 +35,8 @@
   let LOG_OPEN = false;          // 展开态(localStorage 记忆)
   let pendingRender = false;
   let jobTimer = null;           // 服务端后台任务(compose/tts)轮询定时器
+  let jobSig = '';               // 上次整树渲染对应的项目内容签名(轮询防抖:没变不重渲染)
+  let hadRunning = false;        // 上一轮轮询是否有后台任务在跑(落地时只报一次完成)
   const SUB_TIMES = [];          // 提交时间戳(串跑滑窗限流:opt 池 3 次/分钟)
   let charRefTarget = null;   // 文件选择器当前服务的角色 id
   let charRefInput = null;    // 由 init 创建(drama.html 中声明)
@@ -287,11 +289,16 @@
   let ADVANCED = true;
   try { ADVANCED = localStorage.getItem('ffDramaAdvanced') !== '0'; } catch (e) { /* 无痕模式 */ }
 
+  // P2: BGM 垫底混音勾选状态(本地记忆;默认开——合成时 -12dB 垫底,不抢原声/配音)
+  function pBgmOn() {
+    try { return localStorage.getItem('ffDramaBgm') !== '0'; } catch (e) { return true; }
+  }
+
   // ---------- 渲染 ----------
   function renderAll() {
     const has = !!CUR;
     $('#projForm').hidden = !has;
-    ['btnAddChar', 'btnCompose', 'btnPlayAll', 'btnAddShot', 'btnStoryboard', 'btnDelProj', 'btnIdea', 'btnRunAll', 'btnClearShots', 'btnRemix']
+    ['btnAddChar', 'btnCompose', 'btnPlayAll', 'btnAddShot', 'btnStoryboard', 'btnDelProj', 'btnIdea', 'btnRunAll', 'btnSeasonRun', 'btnClearShots', 'btnRemix', 'bgmRow']
       .forEach(function (id) { $('#' + id).hidden = !has; });
     $('#epTabs').hidden = !has;
     $('#epSynRow').hidden = !has;
@@ -340,6 +347,15 @@
         rc.hidden = true;
       }
     }
+    // P2: BGM 状态渲染(勾选状态本地记忆;挂了文件显示文件名,可取消)
+    if (has) {
+      const bgmCheck = $('#pBgm');
+      if (bgmCheck) bgmCheck.checked = pBgmOn();
+      const nm = $('#bgmName');
+      if (nm) nm.textContent = CUR.bgm ? '当前:' + CUR.bgm : '';
+      const clr = $('#btnBgmClear');
+      if (clr) clr.hidden = !CUR.bgm;
+    }
     empty.hidden = !!(ep && ep.shots.length > 0);
     empty.textContent = '本集还没有镜头:填好左侧「一句话故事/本集梗概」后点「✨ 生成分镜」,或「+ 手动加镜」。';
     renderStyleChips();
@@ -361,6 +377,11 @@
       if (c.traitTaskId && !poll[c.traitTaskId]) poll[c.traitTaskId] = { kind: 'trait', id: c.id, startedAt: Date.now() };
     });
     // 恢复服务端后台任务轮询(compose/tts 现在异步,状态在 project.json 里)
+    jobSig = dramaSig(CUR);   // 刚整树渲染完,签名与当前内容对齐:轮询没变就不重渲染
+    if ((CUR.episodes || []).some(function (e) {
+      const st = (e.composeJob || {}).state;
+      return st === 'running' || st === 'queued';
+    }) || (CUR.remixJob || {}).state === 'running') hadRunning = true;
     pollDramaJobs();
   }
 
@@ -1033,6 +1054,41 @@
     }).catch(function () { /* 现编失败静默:通用灵感仍可用 */ });
   }
 
+  // 影响整树渲染的最小内容签名:轮询对比用。签名没变就不重渲染——
+  // 旧实现每 2s 无条件 safeRender,renderAll 又会重启轮询,形成「每 2 秒整树重建」空转:
+  // img/video 反复重建=生成中闪烁+框跳动,完成提示还会每次空转都重报。
+  function dramaSig(p) {
+    const shotSig = function (s) {
+      return [s.id, s.scene, s.desc, s.firstPrompt, s.motionPrompt, s.lines, s.shotType, s.videoModel,
+        s.key, s.chain, s.nativeDialog, s.duration, s.firstTaskId, s.firstFrame, s.clipTaskId, s.clip,
+        s.tts, (s.ttsJob || {}).state, s.cost, s.takes, s.firstTakeSel, s.clipTakeSel];
+    };
+    return JSON.stringify([
+      p.title, p.logline, p.style, p.aspect, p.beat,
+      (p.chars || []).map(function (c) {
+        return [c.id, c.name, c.desc, c.voice, c.asset, c.refs, c.traits, c.portraitTaskId, c.traitTaskId];
+      }),
+      (p.episodes || []).map(function (e) {
+        return [e.id, e.title, e.synopsis, e.recap, e.composed, (e.composeJob || {}).state,
+          (e.shots || []).map(shotSig)];
+      }),
+      (p.remixJob || {}).state,
+    ]);
+  }
+
+  // 运行中只刷进度区:合成提示的「已 X 秒」就地改文本,不重建节点(重渲染会闪)
+  function tickProgress() {
+    const ep = curEp();
+    const job = (ep && ep.composeJob) || {};
+    if (job.state !== 'running' && job.state !== 'queued') return;
+    const hint = document.querySelector('#composedBox .hint');
+    if (!hint) return;
+    const t = Date.now();
+    if (!renderComposed._t0 || renderComposed._ep !== ep.id) { renderComposed._t0 = t; renderComposed._ep = ep.id; }
+    hint.textContent = (job.state === 'queued' ? '合成排队中' : 'ffmpeg 合成中…')
+      + '(已 ' + Math.round((t - renderComposed._t0) / 1000) + ' 秒;镜头越多越久,可先编辑其他集)';
+  }
+
   // 服务端后台任务(compose/tts)轮询:project.json 里的 composeJob/ttsJob 有 running 时每 2s 拉一次
   function pollDramaJobs() {
     if (jobTimer) return;   // 已有轮询在跑
@@ -1040,40 +1096,48 @@
       if (!CUR) { clearInterval(jobTimer); jobTimer = null; return; }
       dGET('/' + CUR.id).then(function (res) {
         if (!res.ok || !res.p.ok) return;
-        const before = CUR;
-        CUR = res.p.project;
+        const fresh = res.p.project;
         const running = [];
-        (CUR.episodes || []).forEach(function (e) {
+        (fresh.episodes || []).forEach(function (e) {
           const j = e.composeJob || {};
           if (j.state === 'running' || j.state === 'queued') running.push(e.id);
           (e.shots || []).forEach(function (s) {
-            const tj = s.ttsJob || {};
-            if (tj.state === 'running') running.push('tts:' + s.id);
+            if ((s.ttsJob || {}).state === 'running') running.push('tts:' + s.id);
           });
         });
-        const rj = CUR.remixJob || {};
-        if (rj.state === 'running') running.push('remix');
-        if (!running.length) {
-          clearInterval(jobTimer);
-          jobTimer = null;
-          if (before !== CUR) {
-            // 某个 job 落地:如果是本集 compose,顺带报结果
-            const ep = curEp();
-            const rjNow = CUR.remixJob || {};
-            const j = ep && ep.composeJob;
-            if (rjNow.state === 'done') status('全剧重混完成!series.mp4 已可在「全剧重混」区预览/下载');
-            else if (rjNow.state === 'error') status('全剧重混失败:' + (rjNow.error || ''), true);
-            else if (j && j.state === 'done') status('合成完成!「成片」区已可预览/下载本集成片');
-            else if (j && j.state === 'error') status('合成失败:' + (j.error || ''), true);
-            else status('后台任务已完成');
-            if (ep && ep.composeJob && ep.composeJob.state === 'done') {
-              dGET('/' + CUR.id + '/warnings?eid=' + ep.id).then(function (wres) {
-                if (!wres.ok || !wres.p.ok) return;
-                const w = wres.p.warnings || [];
-                if (w.length) status('合成完成;⚠ ' + w.length + ' 镜台词比画面长被截断:'
-                  + w.map(function (x) { return x.scene; }).join('、'), true);
-              });
-            }
+        if ((fresh.remixJob || {}).state === 'running') running.push('remix');
+        if (running.length) {
+          hadRunning = true;
+          CUR = fresh;
+          tickProgress();   // 运行中:只更新进度区,不整树重渲染(重渲染会闪)
+          return;
+        }
+        const sig = dramaSig(fresh);
+        if (sig === jobSig && !hadRunning) {
+          clearInterval(jobTimer); jobTimer = null;   // 无任务且内容没变:停表(下次渲染再起)
+          return;
+        }
+        const wasRunning = hadRunning;
+        hadRunning = false;
+        CUR = fresh;
+        jobSig = sig;
+        if (wasRunning) {
+          // 任务刚落地:完成提示只在这一刻报一次(不再是每次空转都报)
+          const ep = curEp();
+          const rjNow = CUR.remixJob || {};
+          const j = ep && ep.composeJob;
+          if (rjNow.state === 'done') status('全剧重混完成!series.mp4 已可在「全剧重混」区预览/下载');
+          else if (rjNow.state === 'error') status('全剧重混失败:' + (rjNow.error || ''), true);
+          else if (j && j.state === 'done') status('合成完成!「成片」区已可预览/下载本集成片');
+          else if (j && j.state === 'error') status('合成失败:' + (j.error || ''), true);
+          else status('后台任务已完成');
+          if (ep && ep.composeJob && ep.composeJob.state === 'done') {
+            dGET('/' + CUR.id + '/warnings?eid=' + ep.id).then(function (wres) {
+              if (!wres.ok || !wres.p.ok) return;
+              const w = wres.p.warnings || [];
+              if (w.length) status('合成完成;⚠ ' + w.length + ' 镜台词比画面长被截断:'
+                + w.map(function (x) { return x.scene; }).join('、'), true);
+            });
           }
         }
         safeRender();
@@ -1110,6 +1174,30 @@
     a.href = assetURL(ep.composed);
     a.download = ((CUR.title || 'drama') + '-' + (ep.title || 'ep') + '.mp4');
     box.appendChild(a);
+    // P2-3 封面候选墙:合成时自动抽 3 帧(10%/40%/70%),点击放大,下载发平台封面
+    const covers = ep.covers || [];
+    if (covers.length) {
+      box.appendChild(el('p', 'hint', '封面候选(合成时自动抽取;点图放大,右键/长按保存发平台):'));
+      const wall = el('div', 'cover-wall');
+      covers.forEach(function (rel) {
+        const img = document.createElement('img');
+        img.className = 'cover-thumb';
+        img.src = assetURL(rel);
+        img.alt = '封面候选';
+        img.addEventListener('click', function () {
+          const lb = $('#lightbox');
+          lb.innerHTML = '';
+          const big = document.createElement('img');
+          big.src = assetURL(rel);
+          big.style.maxWidth = '92vw';
+          big.style.maxHeight = '92vh';
+          lb.appendChild(big);
+          lb.style.display = 'flex';
+        });
+        wall.appendChild(img);
+      });
+      box.appendChild(wall);
+    }
   }
 
   // 全剧重混(P2.6):remixJob 状态轮询 + series.mp4 播放
@@ -1158,6 +1246,7 @@
     dPOST('/' + CUR.id + '/shots/' + sid + '/update', fields).then(function (res) {
       if (!res.ok || !res.p.ok) { status('保存失败:' + (res.p.error || ''), true); return; }
       CUR = res.p.project;
+      jobSig = dramaSig(CUR);   // 内容已变但刻意不整树重渲染:同步签名,免得轮询替用户重画
       const s = findShotEverywhere(sid).shot;
       const badge = document.querySelector('.shot[data-id="' + sid + '"] .st');
       if (badge && s) badge.textContent = shotBadge(s);
@@ -1310,6 +1399,30 @@
     return out;
   }
 
+  // 无定妆参考的登场角色:把外观设定写进首帧提示词,保住跨镜形象一致。
+  // 有定妆照/三视图的角色由参考图保脸(hint 里已声明),不重复注入;
+  // 登场判定:台词里点名的角色 > 画面描述/提示词里提及的角色;单角色剧兜底注入唯一角色。
+  function charLookText(shot) {
+    const chars = (CUR.chars || []).filter(function (c) {
+      return (c.name || '').trim() && (c.desc || '').trim() && !c.asset && !(c.traits || []).length;
+    });
+    if (!chars.length) return '';
+    const speakers = (shot.lines || '').split('\n').map(function (l) {
+      const i = l.indexOf(':');
+      return i > 0 ? l.slice(0, i).trim() : '';
+    }).filter(Boolean);
+    const named = [];
+    const add = function (c) { if (named.length < 2 && named.indexOf(c) < 0) named.push(c); };
+    chars.forEach(function (c) { if (speakers.indexOf(c.name.trim()) >= 0) add(c); });
+    const body = ((shot.desc || '') + ' ' + (shot.firstPrompt || ''));
+    chars.forEach(function (c) { if (body.indexOf(c.name.trim()) >= 0) add(c); });
+    if (!named.length && chars.length === 1) add(chars[0]);
+    if (!named.length) return '';
+    return '登场角色外观(务必保持全剧一致):' + named.map(function (c) {
+      return c.name + '(' + c.desc.trim() + ')';
+    }).join(';') + '。';
+  }
+
   // 提交首帧生成。返回 Promise<{ok, error?}> 供串跑判断;手动按钮同样可用。
   // 滑窗限流(P2.5):分钟池 3 次/分钟,自留 1 次余量给灵感/分镜等 LLM 调用;
   // 提交间隔 <22s 时等待,保证串跑/一键成片不会瞬间撞 429。
@@ -1355,8 +1468,10 @@
     } else if (refs.length) {
       hint = '参考图为角色定妆照:严格保持长相一致。';
     }
-    const prompt = hint + shot.firstPrompt.trim() + styleSuffix();
-    status('正在提交首帧生成…' + (hasPrev ? '(已锚定上一镜画面)' : ''));
+    const look = charLookText(shot);
+    const prompt = look + hint + shot.firstPrompt.trim() + styleSuffix();
+    status('正在提交首帧生成…' + (hasPrev ? '(已锚定上一镜画面)' : '')
+      + (look ? '(无定妆照,已把登场角色外观写进提示词)' : ''));
     return Promise.all(refs.map(function (r) { return fileToDataURL(r.rel, 1024); }))
       .catch(function () { return []; })   // 参考图取不到就不带,别挡生成
       .then(function (frames) {
@@ -1814,6 +1929,85 @@ if (entry.kind === 'portrait' || entry.kind === 'trait') {
     }).catch(function () { /* 静默失败:不影响主流程 */ });
   }
 
+  // ---------- P1-2: 整季串跑队列 ----------
+  // 逐集调 runAll(每集内部:配音→首帧→成片→抽卡→合成),跳过已合成集;
+  // 额度感知:每集开跑前查 /api/studio/quota,视频额度 < 3 或分钟额度 = 0 时暂停
+  // (可断点续跑:再点一次从第一集未完成的继续)。
+  function seasonQuotaOK(q) {
+    if (!q || q.error) return true;   // 查不到额度就不拦(避免误停)
+    const video = typeof q.videoRemaining === 'number' ? q.videoRemaining : Infinity;
+    const minute = typeof q.minuteRemaining === 'number' ? q.minuteRemaining : Infinity;
+    return video >= 3 && minute > 0;
+  }
+  function seasonReady(ep) {
+    const shots = ep.shots || [];
+    const needFirst = shots.filter(function (s) { return !s.firstFrame; }).length;
+    const needClip = shots.filter(function (s) { return s.firstFrame && !s.clip; }).length;
+    const needTts = shots.filter(function (s) { return s.lines && s.lines.trim() && !s.tts && !s.nativeDialog; }).length;
+    return { needFirst: needFirst, needClip: needClip, needTts: needTts, pending: needFirst + needClip + needTts };
+  }
+  async function seasonRun() {
+    if (!CUR || BUSY) return;
+    const eps = (CUR.episodes || []).slice().sort(function (a, b) {
+      const ia = parseInt((a.id || '').replace(/\D/g, ''), 10) || 0;
+      const ib = parseInt((b.id || '').replace(/\D/g, ''), 10) || 0;
+      return ia - ib;
+    });
+    if (!eps.length) { status('还没有分集:先「⚡ 生成分集大纲」或手动建集', true); return; }
+    const undone = eps.filter(function (e) { return !e.composed && (e.shots || []).length > 0; });
+    if (!undone.length) {
+      status('整季串跑:所有已建集都已合成或还没有分镜,无需串跑');
+      return;
+    }
+    const plan = undone.map(function (e) {
+      const st = seasonReady(e);
+      return '第' + (eps.indexOf(e) + 1) + '集(缺' + st.pending + '项)';
+    }).join('、');
+    if (!confirm('整季串跑:对 ' + undone.length + ' 个未完成集逐集执行一键成片(' + plan + ')。\n'
+      + '跳过已合成集;每集开跑前检查额度,视频额度 < 3 时自动暂停(再点按钮断点续跑)。\n'
+      + '期间请勿手动提交任务。')) return;
+    setBusy(true, '整季串跑执行中');
+    try {
+      let done = 0;
+      let paused = false;
+      for (const ep of undone) {
+        CUR = await dGET('/' + CUR.id).then(function (res) {
+          return (res.ok && res.p.ok) ? res.p.project : CUR;
+        });
+        const cur = (CUR.episodes || []).find(function (x) { return x.id === ep.id; });
+        if (!cur || cur.composed) { done++; continue; }
+        const st = seasonReady(cur);
+        if (!st.pending) {
+          // 分镜齐但还没合成:直接合成
+          await dPOST('/' + CUR.id + '/compose', { burnSubs: $('#pBurnSubs').checked, eid: cur.id });
+          done++;
+          continue;
+        }
+        // 额度感知:开跑前查一次(主要是视频额度)
+        const q = await fetch('/api/studio/quota', { headers: AUTH() })
+          .then(function (r) { return r.json(); }).catch(function () { return null; });
+        if (!seasonQuotaOK(q)) {
+          status('整季串跑:额度不足(视频 ' + (q ? q.videoRemaining : '?') + ' / 本分钟 '
+            + (q ? q.minuteRemaining : '?') + '),已暂停在 ' + plan + ';\n明天额度刷新或等待窗口后,再点一次按钮从断点继续', true);
+          paused = true;
+          break;
+        }
+        CUR_EP = cur.id;
+        rememberEp();
+        safeRender();
+        status('整季串跑:第 ' + (eps.indexOf(ep) + 1) + '/' + eps.length + ' 集开始一键成片…');
+        await runAll();
+        done++;
+      }
+      if (!paused) status('整季串跑完成:处理 ' + done + '/' + undone.length + ' 集。到「成片」区逐集终审,然后「全剧重混」拼 series.mp4');
+      refreshQuota();
+    } catch (e) {
+      status('整季串跑中断:' + (e && e.message ? e.message : '网络错误') + '。已完成的集保留,再点一次从断点继续', true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function genFirstFrameAwait(shot) {
     return new Promise(function (resolve) {
       const orig = settle;
@@ -2022,11 +2216,56 @@ if (entry.kind === 'portrait' || entry.kind === 'trait') {
     });
   });
 
+  // P2: BGM 上传/清除/勾选(合成时 -12dB 垫底混入;勾选状态本地记忆)
+  $('#btnBgmPick').addEventListener('click', function () {
+    if (!CUR) return;
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = '.mp3,.m4a,.wav,audio/mpeg,audio/mp4,audio/wav';
+    inp.onchange = function () {
+      const f = inp.files && inp.files[0];
+      if (!f) return;
+      if (f.size > 20 * 1024 * 1024) { status('BGM 文件太大(>20MB),请先压缩', true); return; }
+      const reader = new FileReader();
+      reader.onload = function () {
+        status('BGM 上传中…');
+        dPOST('/' + CUR.id + '/bgm', { dataUrl: String(reader.result) }).then(function (res) {
+          if (!res.ok || !res.p.ok) { status('BGM 上传失败:' + (res.p.error || ''), true); return; }
+          CUR = res.p.project;
+          safeRender();
+          status('BGM 已挂上:合成成片时自动 -12dB 垫底混入(片尾 1.5s 淡出)');
+        }).catch(function () { status('BGM 上传网络中断,请重试', true); });
+      };
+      reader.readAsDataURL(f);
+    };
+    inp.click();
+  });
+
+  $('#btnBgmClear').addEventListener('click', function () {
+    if (!CUR) return;
+    dPOST('/' + CUR.id + '/bgm', { clear: true }).then(function (res) {
+      if (!res.ok || !res.p.ok) { status('BGM 清除失败:' + (res.p.error || ''), true); return; }
+      CUR = res.p.project;
+      safeRender();
+      status('BGM 已取消:之后合成不再混入垫底音轨');
+    }).catch(function () { status('BGM 清除网络中断,请重试', true); });
+  });
+
+  $('#pBgm').addEventListener('change', function () {
+    try { localStorage.setItem('ffDramaBgm', this.checked ? '1' : '0'); } catch (e) { /* 无痕模式 */ }
+    status(this.checked ? '合成时混入 BGM 垫底音轨(-12dB)'
+                        : '合成时不混 BGM(只保留原声/配音)');
+  });
+
   $('#btnPlayAll').addEventListener('click', playAll);
   $('#btnRunAll').addEventListener('click', function () {
     if (!CUR || BUSY) return;
     if (!confirm('一键成片:自动为全部缺首帧/成片的镜头生成,⭐关键镜自动再抽一条候选,最后自动合成出本集成片。\n全程按限额排队(约每 22 秒一单),期间请勿手动提交任务。')) return;
     runAll();
+  });
+  $('#btnSeasonRun').addEventListener('click', function () {
+    if (!CUR || BUSY) return;
+    seasonRun();
   });
   $('#playModal').addEventListener('click', function (e) { if (e.target === this) this.style.display = 'none'; });
   $('#ideaModal').addEventListener('click', function (e) { if (e.target === this) this.style.display = 'none'; });
